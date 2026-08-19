@@ -18,7 +18,7 @@ pub fn indexJson(
     var prev_in_string = false;
     var prev_ends_in_backslash = false;
     var prev_backslash_run_odd = false;
-    var prev_atom_candidate = false;
+    var prev_in_atom = false;
 
     while (base_offset < input.len) {
         const chunk = windows.next().?;
@@ -52,10 +52,12 @@ pub fn indexJson(
 
         const structural = simd.matchAny4(64, chunk, '{', '}', '[', ']') |
             simd.matchAny2(64, chunk, ':', ',');
+        const whitespace = simd.matchAny4(64, chunk, ' ', '\t', '\n', '\r');
         const atom_candidates = simd.matchRange(64, chunk, '0', '9') |
             simd.matchAny4(64, chunk, '-', 't', 'f', 'n');
-        const atom_starts = atom_candidates &
-            ~((atom_candidates << 1) | if (prev_atom_candidate) @as(u64, 1) else 0);
+        const atom_active = outside_string & ~(structural | whitespace | quotes);
+        const atom_starts = atom_candidates & atom_active &
+            ~((atom_active << 1) | if (prev_in_atom) @as(u64, 1) else 0);
         const structural_indexes = (structural | atom_starts) & outside_string;
 
         indexes.count += simd.extractBitIndexes(
@@ -72,9 +74,8 @@ pub fn indexJson(
             valid_count,
             prev_backslash_run_odd,
         );
-        prev_atom_candidate = valid_count != 0 and
-            (atom_candidates & (@as(u64, 1) << @as(u6, @intCast(valid_count - 1)))) != 0 and
-            (outside_string & (@as(u64, 1) << @as(u6, @intCast(valid_count - 1)))) != 0;
+        prev_in_atom = valid_count != 0 and
+            (atom_active & (@as(u64, 1) << @as(u6, @intCast(valid_count - 1)))) != 0;
         base_offset += 64;
     }
 
@@ -120,7 +121,7 @@ fn scalarIndexJson(
 
     var in_string = false;
     var backslash_run_length: usize = 0;
-    var prev_atom_candidate = false;
+    var prev_in_atom = false;
     for (input, 0..) |byte, index| {
         if (byte == '"' and backslash_run_length % 2 == 0) {
             in_string = !in_string;
@@ -130,13 +131,14 @@ fn scalarIndexJson(
             if (isStructuralByte(byte)) {
                 result.indexes[result.count] = @intCast(index);
                 result.count += 1;
-            } else if (isAtomByte(byte) and !prev_atom_candidate) {
+            } else if (isAtomByte(byte) and !prev_in_atom) {
                 result.indexes[result.count] = @intCast(index);
                 result.count += 1;
             }
         }
 
-        prev_atom_candidate = !in_string and isAtomByte(byte);
+        prev_in_atom = !in_string and byte != '"' and
+            !isStructuralByte(byte) and !isWhitespaceByte(byte);
         if (byte == '\\') {
             backslash_run_length += 1;
         } else {
@@ -145,6 +147,13 @@ fn scalarIndexJson(
     }
 
     return result;
+}
+
+fn isWhitespaceByte(byte: u8) bool {
+    return switch (byte) {
+        ' ', '\t', '\n', '\r' => true,
+        else => false,
+    };
 }
 
 fn isStructuralByte(byte: u8) bool {
@@ -161,14 +170,27 @@ fn isAtomByte(byte: u8) bool {
     };
 }
 
+fn expectValidIndexes(input_length: usize, indexes: []const u32) !void {
+    try testing.expect(indexes.len <= input_length);
+    for (indexes, 0..) |index, position| {
+        const index_usize: usize = @intCast(index);
+        try testing.expect(index_usize < input_length);
+        if (position > 0) {
+            try testing.expect(indexes[position - 1] < index);
+        }
+    }
+}
+
 fn expectMatchesScalar(input: []const u8) !void {
     var expected = try scalarIndexJson(testing.allocator, input);
     defer expected.deinit(testing.allocator);
+    try expectValidIndexes(input.len, expected.slice());
 
     var actual = try indexJson(testing.allocator, input);
     defer actual.deinit(testing.allocator);
 
     try testing.expectEqualSlices(u32, expected.slice(), actual.slice());
+    try expectValidIndexes(input.len, actual.slice());
 }
 
 test "indexJson matches scalar structural indexes" {
@@ -189,6 +211,16 @@ test "indexJson matches scalar structural indexes" {
 test "indexJson emits one start per atom" {
     const input = "true false 123 -45";
     const expected = [_]u32{ 0, 5, 11, 15 };
+
+    var index = try indexJson(testing.allocator, input);
+    defer index.deinit(testing.allocator);
+
+    try testing.expectEqualSlices(u32, &expected, index.slice());
+}
+
+test "indexJson emits one start for decimal and exponent atoms" {
+    const input = "1.2 3e4 -5.6e-7";
+    const expected = [_]u32{ 0, 4, 8 };
 
     var index = try indexJson(testing.allocator, input);
     defer index.deinit(testing.allocator);
@@ -254,6 +286,138 @@ test "indexJson ignores padded bytes at final chunk boundaries" {
     var input_65: [65]u8 = @splat(' ');
     input_65[64] = 'n';
     try expectMatchesScalar(&input_65);
+}
+
+test "indexJson handles empty degenerate and unterminated documents" {
+    const cases = [_][]const u8{
+        "",
+        "\"\"",
+        " ",
+        "\t\r\n",
+        "\"",
+        "'",
+        "{",
+        "}",
+        "[",
+        "]",
+        ":",
+        ",",
+        "\"unterminated",
+        "\"{[:]}:,-123.45e+6",
+    };
+
+    for (cases) |input| {
+        try expectMatchesScalar(input);
+    }
+}
+
+test "indexJson excludes structural bytes inside strings" {
+    const outside = "{[:]}:,";
+    const expected = [_]u32{ 0, 1, 2, 3, 4, 5, 6 };
+
+    var index = try indexJson(testing.allocator, outside);
+    defer index.deinit(testing.allocator);
+    try testing.expectEqualSlices(u32, &expected, index.slice());
+    try expectValidIndexes(outside.len, index.slice());
+
+    try expectMatchesScalar("\"{[:]}:,\"");
+    try expectMatchesScalar("{\"inside\":\"{[:]}:,\",\"outside\":[0]}");
+}
+
+test "indexJson indexes complete numeric atoms once" {
+    const input = "-123.45e+6 0 -0 1E10";
+    const expected = [_]u32{ 0, 11, 13, 16 };
+
+    var index = try indexJson(testing.allocator, input);
+    defer index.deinit(testing.allocator);
+    try testing.expectEqualSlices(u32, &expected, index.slice());
+    try expectValidIndexes(input.len, index.slice());
+    try expectMatchesScalar(input);
+}
+
+test "indexJson handles alternating backslash runs around chunk boundaries" {
+    const boundary_offsets = [_]usize{ 62, 63, 64, 65 };
+
+    for (boundary_offsets) |run_start| {
+        for (1..130) |run_length| {
+            var input: [260]u8 = @splat(' ');
+            input[0] = '[';
+            input[1] = '"';
+            for (run_start..run_start + run_length) |offset| {
+                input[offset] = '\\';
+            }
+
+            const quote_offset = run_start + run_length;
+            input[quote_offset] = '"';
+            var next_offset = quote_offset + 1;
+            if (run_length % 2 != 0) {
+                input[next_offset] = '"';
+                next_offset += 1;
+            }
+            input[next_offset] = '0';
+            input[next_offset + 1] = ']';
+            try expectMatchesScalar(input[0 .. next_offset + 2]);
+        }
+    }
+
+    for (boundary_offsets) |quote_offset| {
+        for (0..10) |run_length| {
+            var input: [96]u8 = @splat(' ');
+            input[0] = '[';
+            input[1] = '"';
+            const run_start = quote_offset - run_length;
+            for (run_start..quote_offset) |offset| {
+                input[offset] = '\\';
+            }
+
+            input[quote_offset] = '"';
+            var next_offset = quote_offset + 1;
+            if (run_length % 2 != 0) {
+                input[next_offset] = '"';
+                next_offset += 1;
+            }
+            input[next_offset] = '0';
+            input[next_offset + 1] = ']';
+            try expectMatchesScalar(input[0 .. next_offset + 2]);
+        }
+    }
+}
+
+test "indexJson preserves unterminated string state at boundary EOFs" {
+    const lengths = [_]usize{ 62, 63, 64, 65, 66 };
+    for (lengths) |length| {
+        var input: [66]u8 = @splat(' ');
+        input[0] = '"';
+        input[length - 1] = '{';
+        try expectMatchesScalar(input[0..length]);
+    }
+}
+
+test "indexJson differential adversarial byte matrix" {
+    const alphabet = [_]u8{
+        '{',  '}',  '[', ']', ':', ',', '"', '\\', '-', 't', 'f', 'n',
+        '0',  '1',  '2', '3', '4', '5', '6', '7',  '8', '9', ' ', '\t',
+        '\r', '\n', '.', '+', '/', 'a', 'x',
+    };
+    const boundary_lengths = [_]usize{
+        0, 1, 2, 61, 62, 63, 64, 65, 66, 127, 128, 129, 191, 192, 193, 255, 256, 257,
+    };
+    var state: u64 = 0x6a09e667f3bcc909;
+    var input: [257]u8 = undefined;
+
+    for (0..512) |case_index| {
+        const length = if (case_index < boundary_lengths.len)
+            boundary_lengths[case_index]
+        else
+            @as(usize, @intCast(state % 258));
+
+        for (0..length) |offset| {
+            state = state *% 0x9e3779b97f4a7c15 +% 0x6a09e667f3bcc909;
+            const alphabet_index: usize = @intCast(state % @as(u64, alphabet.len));
+            input[offset] = alphabet[alphabet_index];
+        }
+        try expectMatchesScalar(input[0..length]);
+    }
 }
 
 test "refAllDecls" {

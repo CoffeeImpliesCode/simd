@@ -138,7 +138,12 @@ pub fn indexJson5(
                 continue;
             }
 
-            const is_atom_candidate = (atom_mask & bit) != 0;
+            const is_atom_candidate = (atom_mask & bit) != 0 or isJson5AtomByte(
+                byte,
+                previous_atom_candidate,
+                input,
+                absolute_offset,
+            );
             if (is_atom_candidate) {
                 if (!previous_atom_candidate) {
                     visible_mask |= bit;
@@ -181,6 +186,160 @@ fn leadingRunEndMask(backslashes: u64, valid_count: usize) u64 {
     const run_length = @ctz(non_backslashes);
     if (run_length >= valid_count) return 0;
     return @as(u64, 1) << @as(u6, @intCast(run_length));
+}
+
+fn isJson5AtomByte(
+    byte: u8,
+    previous_atom_candidate: bool,
+    input: []const u8,
+    byte_offset: usize,
+) bool {
+    return switch (byte) {
+        '-', '0'...'9', 'a'...'z', 'A'...'Z', '_', '$' => true,
+        0x80...0xbf => previous_atom_candidate,
+        0xc0...0xff => !isJson5UnicodeWhitespace(input, byte_offset),
+        else => false,
+    };
+}
+
+fn isJson5UnicodeWhitespace(input: []const u8, byte_offset: usize) bool {
+    const byte = input[byte_offset];
+    if (byte == 0xc2) {
+        return byte_offset + 1 < input.len and input[byte_offset + 1] == 0xa0;
+    }
+    if (byte == 0xe1) {
+        return byte_offset + 2 < input.len and input[byte_offset + 1] == 0x9a and
+            input[byte_offset + 2] == 0x80;
+    }
+    if (byte == 0xe2 and byte_offset + 2 < input.len) {
+        const second_byte = input[byte_offset + 1];
+        const third_byte = input[byte_offset + 2];
+        if (second_byte == 0x80) {
+            return third_byte >= 0x80 and third_byte <= 0x8a or third_byte == 0xa8 or
+                third_byte == 0xa9 or third_byte == 0xaf;
+        }
+        return second_byte == 0x81 and third_byte == 0x9f;
+    }
+    if (byte == 0xe3) {
+        return byte_offset + 2 < input.len and input[byte_offset + 1] == 0x80 and
+            input[byte_offset + 2] == 0x80;
+    }
+    if (byte == 0xef) {
+        return byte_offset + 2 < input.len and input[byte_offset + 1] == 0xbb and
+            input[byte_offset + 2] == 0xbf;
+    }
+    return false;
+}
+
+fn scalarIndexJson5(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+) !stage1.StructuralIndex {
+    var result = try stage1.StructuralIndex.init(allocator, input.len);
+    errdefer result.deinit(allocator);
+
+    var in_string = false;
+    var string_quote: u8 = 0;
+    var in_single_comment = false;
+    var in_multi_comment = false;
+    var skip_after_multi_comment = false;
+    var previous_atom_candidate = false;
+    var backslash_run_length: usize = 0;
+
+    for (input, 0..) |byte, byte_offset| {
+        const unescaped_double_quote = byte == '"' and backslash_run_length % 2 == 0;
+        const unescaped_single_quote = byte == '\'' and backslash_run_length % 2 == 0;
+
+        if (skip_after_multi_comment) {
+            skip_after_multi_comment = false;
+        } else if (in_string) {
+            const closes_string = if (string_quote == '\'')
+                unescaped_single_quote
+            else
+                unescaped_double_quote;
+            if (closes_string) {
+                in_string = false;
+                string_quote = 0;
+                previous_atom_candidate = false;
+            }
+        } else if (in_single_comment) {
+            if (byte == '\n' or byte == '\r') {
+                in_single_comment = false;
+                previous_atom_candidate = false;
+            }
+        } else if (in_multi_comment) {
+            if (byte == '*' and byte_offset + 1 < input.len and
+                input[byte_offset + 1] == '/')
+            {
+                in_multi_comment = false;
+                previous_atom_candidate = false;
+                skip_after_multi_comment = true;
+            }
+        } else if (unescaped_double_quote or unescaped_single_quote) {
+            in_string = true;
+            string_quote = byte;
+            previous_atom_candidate = false;
+        } else if (byte == '/' and byte_offset + 1 < input.len) {
+            const next_byte = input[byte_offset + 1];
+            if (next_byte == '/') {
+                in_single_comment = true;
+                previous_atom_candidate = false;
+            } else if (next_byte == '*') {
+                in_multi_comment = true;
+                previous_atom_candidate = false;
+            } else {
+                previous_atom_candidate = false;
+            }
+        } else if (isJson5StructuralByte(byte)) {
+            result.indexes[result.count] = @intCast(byte_offset);
+            result.count += 1;
+            previous_atom_candidate = false;
+        } else if (isJson5AtomByte(
+            byte,
+            previous_atom_candidate,
+            input,
+            byte_offset,
+        )) {
+            if (!previous_atom_candidate) {
+                result.indexes[result.count] = @intCast(byte_offset);
+                result.count += 1;
+            }
+            previous_atom_candidate = true;
+        } else {
+            previous_atom_candidate = false;
+        }
+
+        if (byte == '\\') {
+            backslash_run_length += 1;
+        } else {
+            backslash_run_length = 0;
+        }
+    }
+
+    return result;
+}
+
+fn isJson5StructuralByte(byte: u8) bool {
+    return switch (byte) {
+        '{', '}', '[', ']', ':', ',' => true,
+        else => false,
+    };
+}
+
+fn expectJson5MatchesScalar(input: []const u8) !void {
+    var expected = try scalarIndexJson5(testing.allocator, input);
+    defer expected.deinit(testing.allocator);
+
+    var actual = try indexJson5(testing.allocator, input);
+    defer actual.deinit(testing.allocator);
+
+    try testing.expectEqualSlices(u32, expected.slice(), actual.slice());
+    for (actual.slice(), 0..) |index, index_offset| {
+        try testing.expect(index < input.len);
+        if (index_offset > 0) {
+            try testing.expect(actual.slice()[index_offset - 1] < index);
+        }
+    }
 }
 
 test "refAllDecls" {
@@ -313,4 +472,147 @@ test "indexJson5 carries block comment starts across chunks" {
     defer index.deinit(testing.allocator);
 
     try testing.expectEqualSlices(u32, &expected, index.slice());
+}
+
+test "indexJson5 indexes unicode-leading unquoted keys" {
+    const input = "{é:1, $ok:0x1A, _n:-0x2b,}";
+    const expected = [_]u32{ 0, 1, 3, 4, 5, 7, 10, 11, 15, 17, 19, 20, 25, 26 };
+
+    var index = try indexJson5(testing.allocator, input);
+    defer index.deinit(testing.allocator);
+
+    try testing.expectEqualSlices(u32, &expected, index.slice());
+}
+
+test "indexJson5 does not index Unicode whitespace as an atom" {
+    const input = [_]u8{
+        '{', 'a', ':', 0xc2, 0xa0, '1', ',', 0xe2, 0x80, 0xa8, 'b', ':', '2', '}',
+    };
+    const expected = [_]u32{ 0, 1, 2, 5, 6, 10, 11, 12, 13 };
+
+    var index = try indexJson5(testing.allocator, &input);
+    defer index.deinit(testing.allocator);
+
+    try testing.expectEqualSlices(u32, &expected, index.slice());
+}
+
+test "indexJson5 matches scalar for adversarial lexical forms" {
+    // The scalar implementation defines lexical precedence for conflicting delimiters.
+    const cases = [_][]const u8{
+        "",
+        "{}",
+        "[]",
+        "{a:1,}",
+        "[0x1A,]",
+        "{'url':'http://foo/*bar*/','tail':'*/ // /*'}",
+        "{// \" /* */ [ ] { } : , false\nnext:'it\\'s'}",
+        "{/* \" // [ ] { } : , false */real:0x1A}",
+        "{/* unterminated ' // [ ] { } : , false",
+        "{é:1,名字:-0x2b,}",
+        "['escaped \\' quote',\"double // /*\",-0X2b,]",
+    };
+
+    for (cases) |input| {
+        try expectJson5MatchesScalar(input);
+    }
+}
+
+test "indexJson5 carries block comments across both SIMD boundaries" {
+    var input: [136]u8 = @splat(' ');
+    for (62..64) |comment_start| {
+        for (126..128) |comment_end| {
+            input = @splat(' ');
+            input[0] = '[';
+            input[comment_start] = '/';
+            input[comment_start + 1] = '*';
+            input[80] = '\'';
+            input[81] = '{';
+            input[82] = '"';
+            input[comment_end] = '*';
+            input[comment_end + 1] = '/';
+            input[comment_end + 2] = '0';
+            input[comment_end + 3] = ']';
+            try expectJson5MatchesScalar(&input);
+        }
+    }
+}
+
+test "indexJson5 carries escaped single quotes across a SIMD boundary" {
+    var input: [130]u8 = @splat(' ');
+    input[0] = '[';
+    input[62] = '\'';
+    input[63] = '\\';
+    input[64] = '\'';
+    input[65] = '/';
+    input[66] = '/';
+    input[67] = '*';
+    input[68] = '*';
+    input[69] = '/';
+    input[126] = '\'';
+
+    input[127] = ',';
+    input[128] = '0';
+    input[129] = ']';
+
+    try expectJson5MatchesScalar(&input);
+}
+
+test "indexJson5 indexes a unicode key across a SIMD boundary" {
+    var input: [70]u8 = @splat(' ');
+    input[0] = '{';
+    input[62] = 0xc3;
+    input[63] = 0xa9;
+    input[64] = ':';
+    input[65] = '1';
+    input[66] = ',';
+    input[67] = '}';
+
+    try expectJson5MatchesScalar(&input);
+}
+
+test "indexJson5 handles unterminated comments and every final chunk length" {
+    var input: [130]u8 = @splat(' ');
+    input[0] = '[';
+    input[62..64].* = "/*".*;
+    input[64] = '\'';
+    input[65] = '{';
+    input[126] = '*';
+    input[127] = '/';
+    input[128] = '0';
+    input[129] = ']';
+
+    for (0..input.len + 1) |input_length| {
+        try expectJson5MatchesScalar(input[0..input_length]);
+    }
+}
+
+test "indexJson5 matches scalar for every backslash run crossing byte 64" {
+    var input: [70]u8 = @splat(' ');
+    for (0..64) |run_length| {
+        input = @splat(' ');
+        input[0] = '[';
+        input[1] = '\'';
+        const run_start = 65 - run_length;
+        for (run_start..65) |byte_offset| {
+            input[byte_offset] = '\\';
+        }
+        input[65] = '\'';
+        if (run_length % 2 == 0) {
+            input[66] = '1';
+            input[67] = ']';
+        } else {
+            input[66] = '\'';
+            input[67] = '1';
+            input[68] = ']';
+        }
+        try expectJson5MatchesScalar(&input);
+    }
+}
+
+test "indexJson5 matches scalar for every byte value" {
+    var input: [512]u8 = undefined;
+    for (0..input.len) |byte_offset| {
+        input[byte_offset] = @as(u8, @truncate(byte_offset));
+    }
+    try expectJson5MatchesScalar(&input);
 }

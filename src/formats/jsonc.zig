@@ -165,6 +165,111 @@ fn leadingRunEndMask(backslashes: u64, valid_count: usize) u64 {
     return @as(u64, 1) << @as(u6, @intCast(run_length));
 }
 
+fn scalarIndexJsonc(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+) !stage1.StructuralIndex {
+    var result = try stage1.StructuralIndex.init(allocator, input.len);
+    errdefer result.deinit(allocator);
+
+    var in_string = false;
+    var in_single_comment = false;
+    var in_multi_comment = false;
+    var skip_after_multi_comment = false;
+    var previous_atom_candidate = false;
+    var backslash_run_length: usize = 0;
+
+    for (input, 0..) |byte, byte_offset| {
+        const unescaped_quote = byte == '"' and backslash_run_length % 2 == 0;
+
+        if (skip_after_multi_comment) {
+            skip_after_multi_comment = false;
+        } else if (in_string) {
+            if (unescaped_quote) {
+                in_string = false;
+                previous_atom_candidate = false;
+            }
+        } else if (in_single_comment) {
+            if (byte == '\n' or byte == '\r') {
+                in_single_comment = false;
+                previous_atom_candidate = false;
+            }
+        } else if (in_multi_comment) {
+            if (byte == '*' and byte_offset + 1 < input.len and
+                input[byte_offset + 1] == '/')
+            {
+                in_multi_comment = false;
+                previous_atom_candidate = false;
+                skip_after_multi_comment = true;
+            }
+        } else if (unescaped_quote) {
+            in_string = true;
+            previous_atom_candidate = false;
+        } else if (byte == '/' and byte_offset + 1 < input.len) {
+            const next_byte = input[byte_offset + 1];
+            if (next_byte == '/') {
+                in_single_comment = true;
+                previous_atom_candidate = false;
+            } else if (next_byte == '*') {
+                in_multi_comment = true;
+                previous_atom_candidate = false;
+            } else {
+                previous_atom_candidate = false;
+            }
+        } else if (isJsoncStructuralByte(byte)) {
+            result.indexes[result.count] = @intCast(byte_offset);
+            result.count += 1;
+            previous_atom_candidate = false;
+        } else if (isJsoncAtomByte(byte)) {
+            if (!previous_atom_candidate) {
+                result.indexes[result.count] = @intCast(byte_offset);
+                result.count += 1;
+            }
+            previous_atom_candidate = true;
+        } else {
+            previous_atom_candidate = false;
+        }
+
+        if (byte == '\\') {
+            backslash_run_length += 1;
+        } else {
+            backslash_run_length = 0;
+        }
+    }
+
+    return result;
+}
+
+fn isJsoncStructuralByte(byte: u8) bool {
+    return switch (byte) {
+        '{', '}', '[', ']', ':', ',' => true,
+        else => false,
+    };
+}
+
+fn isJsoncAtomByte(byte: u8) bool {
+    return switch (byte) {
+        '-', 't', 'f', 'n', '0'...'9' => true,
+        else => false,
+    };
+}
+
+fn expectJsoncMatchesScalar(input: []const u8) !void {
+    var expected = try scalarIndexJsonc(testing.allocator, input);
+    defer expected.deinit(testing.allocator);
+
+    var actual = try indexJsonc(testing.allocator, input);
+    defer actual.deinit(testing.allocator);
+
+    try testing.expectEqualSlices(u32, expected.slice(), actual.slice());
+    for (actual.slice(), 0..) |index, index_offset| {
+        try testing.expect(index < input.len);
+        if (index_offset > 0) {
+            try testing.expect(actual.slice()[index_offset - 1] < index);
+        }
+    }
+}
+
 test "refAllDecls" {
     testing.refAllDecls(@This());
 }
@@ -311,4 +416,103 @@ test "indexJsonc carries block comment starts across chunks" {
     defer index.deinit(testing.allocator);
 
     try testing.expectEqualSlices(u32, &expected, index.slice());
+}
+
+test "indexJsonc matches scalar for adversarial strings and comments" {
+    // The scalar implementation defines lexical precedence for conflicting delimiters.
+    const cases = [_][]const u8{
+        "",
+        "\"http://foo/*bar*/ and */ // /*\"",
+        "{\"url\":\"http://foo/*bar*/\",\"tail\":\"*/ // /*\"}",
+        "{// \" /* */ [ ] { } : , false\n\"value\":1}",
+        "{/* \" // [ ] { } : , false */\"value\":1}",
+        "{/* unterminated \" // [ ] { } : , false",
+        "[\"escaped quote: \\\" // still string\",0]",
+        "[\"even slash run: \\\\\"/* comment */1]",
+    };
+
+    for (cases) |input| {
+        try expectJsoncMatchesScalar(input);
+    }
+}
+
+test "indexJsonc carries a block comment across two exact SIMD boundaries" {
+    var input: [132]u8 = @splat(' ');
+    input[0] = '[';
+    input[62] = '/';
+    input[63] = '*';
+    input[64] = '"';
+    input[65] = '{';
+    input[100] = '"';
+    input[126] = '*';
+    input[127] = '/';
+    input[128] = ',';
+    input[129] = 'n';
+    input[130] = 'u';
+    input[131] = ']';
+
+    try expectJsoncMatchesScalar(&input);
+}
+
+test "indexJsonc matches scalar around every adjacent chunk boundary offset" {
+    // Each delimiter begins on both sides of a 64-byte boundary.
+    var input: [136]u8 = @splat(' ');
+    for (62..66) |comment_start| {
+        for (126..130) |comment_end| {
+            input = @splat(' ');
+            input[0] = '[';
+            input[comment_start] = '/';
+            input[comment_start + 1] = '*';
+            input[96] = '"';
+            input[97] = '{';
+            input[comment_end] = '*';
+            input[comment_end + 1] = '/';
+            input[comment_end + 2] = '1';
+            input[135] = ']';
+            try expectJsoncMatchesScalar(&input);
+        }
+    }
+}
+
+test "indexJsonc handles unterminated comments and all final chunk lengths" {
+    var input: [130]u8 = @splat(' ');
+    for (0..input.len + 1) |input_length| {
+        input = @splat(' ');
+        if (input_length > 0) input[0] = '[';
+        if (input_length > 63) input[62..64].* = "/*".*;
+        if (input_length > 64) input[64] = '"';
+        if (input_length > 65) input[65] = '{';
+        try expectJsoncMatchesScalar(input[0..input_length]);
+    }
+}
+
+test "indexJsonc matches scalar for every backslash run crossing byte 64" {
+    var input: [70]u8 = @splat(' ');
+    for (0..64) |run_length| {
+        input = @splat(' ');
+        input[0] = '[';
+        input[1] = '"';
+        const run_start = 65 - run_length;
+        for (run_start..65) |byte_offset| {
+            input[byte_offset] = '\\';
+        }
+        input[65] = '"';
+        if (run_length % 2 == 0) {
+            input[66] = '1';
+            input[67] = ']';
+        } else {
+            input[66] = '"';
+            input[67] = '1';
+            input[68] = ']';
+        }
+        try expectJsoncMatchesScalar(&input);
+    }
+}
+
+test "indexJsonc matches scalar for every byte value" {
+    var input: [512]u8 = undefined;
+    for (0..input.len) |byte_offset| {
+        input[byte_offset] = @as(u8, @truncate(byte_offset));
+    }
+    try expectJsoncMatchesScalar(&input);
 }

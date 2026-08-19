@@ -31,6 +31,7 @@ pub const XmlStructuralIndex = struct {
 };
 
 pub fn indexXml(allocator: std.mem.Allocator, input: []const u8) !XmlStructuralIndex {
+    if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
     const indexes = try allocator.alloc(u32, input.len);
     errdefer allocator.free(indexes);
     const kinds = try allocator.alloc(XmlTokenKind, input.len);
@@ -42,11 +43,12 @@ pub fn indexXml(allocator: std.mem.Allocator, input: []const u8) !XmlStructuralI
         .count = 0,
     };
     var in_comment = false;
+    var comment_start_offset: usize = 0;
     var in_cdata = false;
     var in_tag = false;
     var in_attr_quote: ?u8 = null;
-    var window_iterator = simd.windows(u8, 64, input, 0);
     var base_offset: usize = 0;
+    var window_iterator = simd.windows(u8, 64, input, 0);
 
     while (window_iterator.next()) |vector| {
         const punctuation_mask = simd.matchAny4(64, vector, '<', '>', '=', '"') |
@@ -63,9 +65,7 @@ pub fn indexXml(allocator: std.mem.Allocator, input: []const u8) !XmlStructuralI
             const byte = input[input_index];
 
             if (in_comment) {
-                if (byte == '>' and input_index >= 2 and input[input_index - 2] == '-' and
-                    input[input_index - 1] == '-')
-                {
+                if (isCommentTerminatorAt(input, input_index, comment_start_offset)) {
                     in_comment = false;
                 }
                 continue;
@@ -92,6 +92,7 @@ pub fn indexXml(allocator: std.mem.Allocator, input: []const u8) !XmlStructuralI
                 if (startsWithAt(input, input_index, "<!--")) {
                     appendToken(&result, input_index, .tag_open);
                     in_comment = true;
+                    comment_start_offset = input_index;
                     in_tag = false;
                     continue;
                 }
@@ -157,7 +158,21 @@ fn startsWithAt(input: []const u8, offset: usize, literal: []const u8) bool {
     return std.mem.eql(u8, input[offset..][0..literal.len], literal);
 }
 
+fn isCommentTerminatorAt(
+    input: []const u8,
+    input_index: usize,
+    comment_start_offset: usize,
+) bool {
+    if (input_index < comment_start_offset) return false;
+    if (input_index - comment_start_offset < 6) return false;
+    if (input[input_index] != '>') return false;
+    if (input[input_index - 2] != '-') return false;
+    if (input[input_index - 1] != '-') return false;
+    return true;
+}
+
 fn scalarIndexXml(allocator: std.mem.Allocator, input: []const u8) !XmlStructuralIndex {
+    if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
     const indexes = try allocator.alloc(u32, input.len);
     errdefer allocator.free(indexes);
     const kinds = try allocator.alloc(XmlTokenKind, input.len);
@@ -165,6 +180,7 @@ fn scalarIndexXml(allocator: std.mem.Allocator, input: []const u8) !XmlStructura
 
     var count: usize = 0;
     var in_comment = false;
+    var comment_start_offset: usize = 0;
     var in_cdata = false;
     var in_tag = false;
     var in_attr_quote: ?u8 = null;
@@ -174,9 +190,7 @@ fn scalarIndexXml(allocator: std.mem.Allocator, input: []const u8) !XmlStructura
         const byte = input[input_index];
 
         if (in_comment) {
-            if (byte == '>' and input_index >= 2 and input[input_index - 2] == '-' and
-                input[input_index - 1] == '-')
-            {
+            if (isCommentTerminatorAt(input, input_index, comment_start_offset)) {
                 in_comment = false;
             }
             continue;
@@ -208,6 +222,7 @@ fn scalarIndexXml(allocator: std.mem.Allocator, input: []const u8) !XmlStructura
             if (std.mem.startsWith(u8, input[input_index..], "<!--")) {
                 kinds[count - 1] = .tag_open;
                 in_comment = true;
+                comment_start_offset = input_index;
                 in_tag = false;
             } else if (std.mem.startsWith(u8, input[input_index..], "<![CDATA[")) {
                 kinds[count - 1] = .tag_open;
@@ -264,6 +279,17 @@ fn scalarIndexXml(allocator: std.mem.Allocator, input: []const u8) !XmlStructura
     };
 }
 
+fn expectIndexInvariants(index: *const XmlStructuralIndex, input_len: usize) !void {
+    var previous_index: ?u32 = null;
+    for (index.indexes[0..index.count]) |current_index| {
+        try testing.expect(@as(usize, current_index) < input_len);
+        if (previous_index) |previous| {
+            try testing.expect(previous < current_index);
+        }
+        previous_index = current_index;
+    }
+}
+
 fn expectMatchesScalar(input: []const u8) !void {
     var expected = try scalarIndexXml(testing.allocator, input);
     defer expected.deinit(testing.allocator);
@@ -271,12 +297,54 @@ fn expectMatchesScalar(input: []const u8) !void {
     defer actual.deinit(testing.allocator);
 
     try testing.expectEqual(expected.count, actual.count);
-    try testing.expectEqualSlices(u32, expected.indexes[0..expected.count], actual.indexes[0..actual.count]);
+    try testing.expectEqualSlices(
+        u32,
+        expected.indexes[0..expected.count],
+        actual.indexes[0..actual.count],
+    );
     try testing.expectEqualSlices(
         XmlTokenKind,
         expected.kinds[0..expected.count],
         actual.kinds[0..actual.count],
     );
+    try expectIndexInvariants(&expected, input.len);
+    try expectIndexInvariants(&actual, input.len);
+}
+
+fn expectTokens(
+    input: []const u8,
+    expected_indexes: []const u32,
+    expected_kinds: []const XmlTokenKind,
+) !void {
+    var actual = try indexXml(testing.allocator, input);
+    defer actual.deinit(testing.allocator);
+
+    try testing.expectEqual(expected_indexes.len, expected_kinds.len);
+    try testing.expectEqual(expected_indexes.len, actual.count);
+    try testing.expectEqualSlices(u32, expected_indexes, actual.indexes[0..actual.count]);
+    try testing.expectEqualSlices(
+        XmlTokenKind,
+        expected_kinds,
+        actual.kinds[0..actual.count],
+    );
+    try expectIndexInvariants(&actual, input.len);
+}
+
+fn expectFragmentAnchorAtChunkBoundaries(
+    fragment: []const u8,
+    anchor_in_fragment: usize,
+) !void {
+    const boundary_offsets = [_]usize{ 62, 63, 64, 65 };
+    std.debug.assert(anchor_in_fragment < fragment.len);
+
+    for (boundary_offsets) |boundary_offset| {
+        std.debug.assert(anchor_in_fragment <= boundary_offset);
+        const fragment_offset = boundary_offset - anchor_in_fragment;
+        var input: [160]u8 = @splat('x');
+        std.debug.assert(fragment_offset + fragment.len <= input.len);
+        @memcpy(input[fragment_offset..][0..fragment.len], fragment);
+        try expectMatchesScalar(&input);
+    }
 }
 
 test "indexXml identifies tag and attribute structures" {
@@ -316,21 +384,172 @@ test "indexXml matches scalar oracle for XML constructs" {
     }
 }
 
-test "indexXml matches scalar oracle across SIMD boundaries" {
-    const fragments = [_][]const u8{
-        "<node a='v'/>",
-        "<!-- <ignored/> -->",
-        "<![CDATA[<ignored/>]]>",
-        "<?target key=\"value\"?>",
+test "indexXml suppresses CDATA and comment contents" {
+    // Only the markup that surrounds each opaque section remains structural.
+    const cdata = "<root><![CDATA[ <not-a-tag attr='x'> &amp; ]]><child/></root>";
+    const cdata_indexes = [_]u32{ 0, 5, 6, 46, 52, 54, 60 };
+    const cdata_kinds = [_]XmlTokenKind{
+        .tag_open,
+        .tag_close,
+        .tag_open,
+        .tag_open,
+        .self_close,
+        .closing_tag_open,
+        .tag_close,
     };
+    try expectTokens(cdata, &cdata_indexes, &cdata_kinds);
 
-    for (fragments) |fragment| {
-        for (60..69) |offset| {
-            var input: [192]u8 = @splat('x');
-            @memcpy(input[offset..][0..fragment.len], fragment);
-            try expectMatchesScalar(&input);
-        }
+    const comment = "<root><!-- <foo a=\"b\"> &amp; --><child/></root>";
+    const comment_indexes = [_]u32{ 0, 5, 6, 32, 38, 40, 46 };
+    const comment_kinds = [_]XmlTokenKind{
+        .tag_open,
+        .tag_close,
+        .tag_open,
+        .tag_open,
+        .self_close,
+        .closing_tag_open,
+        .tag_close,
+    };
+    try expectTokens(comment, &comment_indexes, &comment_kinds);
+}
+
+test "indexXml does not close comments inside their opener" {
+    // The opener's two hyphens are not a comment terminator.
+    const input = "<!--><fake/>";
+    const expected_indexes = [_]u32{0};
+    const expected_kinds = [_]XmlTokenKind{.tag_open};
+    try expectTokens(input, &expected_indexes, &expected_kinds);
+}
+
+test "indexXml handles quoted attributes and self-closing whitespace" {
+    // Attribute punctuation in values is opaque, and both quote styles are structural.
+    const input = "<tag first = 'one' second=\"two\"   />";
+    const expected_indexes = [_]u32{ 0, 11, 13, 17, 25, 26, 30, 34 };
+    const expected_kinds = [_]XmlTokenKind{
+        .tag_open,
+        .attr_equals,
+        .attr_quote,
+        .attr_quote,
+        .attr_equals,
+        .attr_quote,
+        .attr_quote,
+        .self_close,
+    };
+    try expectTokens(input, &expected_indexes, &expected_kinds);
+
+    const compact = "<tag/>";
+    const compact_indexes = [_]u32{ 0, 4 };
+    const compact_kinds = [_]XmlTokenKind{ .tag_open, .self_close };
+    try expectTokens(compact, &compact_indexes, &compact_kinds);
+}
+
+test "indexXml handles processing instructions and entities" {
+    // Entity references never create structural indexes inside or outside attributes.
+    const instruction = "<?xml version=\"1.0\" encoding = 'UTF-8'?>";
+    const instruction_indexes = [_]u32{ 0, 13, 14, 18, 29, 31, 37, 38 };
+    const instruction_kinds = [_]XmlTokenKind{
+        .proc_inst_open,
+        .attr_equals,
+        .attr_quote,
+        .attr_quote,
+        .attr_equals,
+        .attr_quote,
+        .attr_quote,
+        .proc_inst_close,
+    };
+    try expectTokens(instruction, &instruction_indexes, &instruction_kinds);
+
+    const entities = "&amp;<tag value='&amp;' other=\"x&amp;y\">&amp;</tag>";
+    const entity_indexes = [_]u32{ 5, 15, 16, 22, 29, 30, 38, 39, 45, 50 };
+    const entity_kinds = [_]XmlTokenKind{
+        .tag_open,
+        .attr_equals,
+        .attr_quote,
+        .attr_quote,
+        .attr_equals,
+        .attr_quote,
+        .attr_quote,
+        .tag_close,
+        .closing_tag_open,
+        .tag_close,
+    };
+    try expectTokens(entities, &entity_indexes, &entity_kinds);
+}
+
+test "indexXml tolerates unclosed and malformed fragments" {
+    // EOF leaves incomplete state suppressed without adding a synthetic closing index.
+    const unclosed_quote = "<root a='unterminated > <fake/> &amp;";
+    const quote_indexes = [_]u32{ 0, 7, 8 };
+    const quote_kinds = [_]XmlTokenKind{ .tag_open, .attr_equals, .attr_quote };
+    try expectTokens(unclosed_quote, &quote_indexes, &quote_kinds);
+
+    const unclosed_tag = "<root><child";
+    const tag_indexes = [_]u32{ 0, 5, 6 };
+    const tag_kinds = [_]XmlTokenKind{ .tag_open, .tag_close, .tag_open };
+    try expectTokens(unclosed_tag, &tag_indexes, &tag_kinds);
+
+    const malformed_sections = [_][]const u8{
+        "<!-- <fake/>",
+        "<![CDATA[ <fake/>",
+        "<?xml version='1.0'",
+        "<tag a = \"mismatched'",
+        "<",
+        "</",
+        "<?",
+    };
+    for (malformed_sections) |fragment| {
+        try expectMatchesScalar(fragment);
     }
+}
+
+test "indexXml matches scalar oracle at exact SIMD boundary offsets" {
+    // Each opener, terminator, and closing delimiter is placed at offsets 62 through 65.
+    const comment = "<!-- <foo a='x'> -->";
+    try expectFragmentAnchorAtChunkBoundaries(comment, 0);
+    try expectFragmentAnchorAtChunkBoundaries(comment, comment.len - 3);
+
+    const malformed_comment = "<!--><fake/>";
+    for ([_]usize{ 62, 63, 64, 65 }) |comment_offset| {
+        var input: [128]u8 = @splat('x');
+        @memcpy(input[comment_offset..][0..malformed_comment.len], malformed_comment);
+        const expected_indexes = [_]u32{@intCast(comment_offset)};
+        const expected_kinds = [_]XmlTokenKind{.tag_open};
+        try expectTokens(&input, &expected_indexes, &expected_kinds);
+    }
+
+    const cdata = "<![CDATA[ <not-a-tag> ]]>";
+    try expectFragmentAnchorAtChunkBoundaries(cdata, 0);
+    try expectFragmentAnchorAtChunkBoundaries(cdata, cdata.len - 3);
+
+    const attributes = "<tag first = 'one' second=\"two\"   />";
+    try expectFragmentAnchorAtChunkBoundaries(attributes, 11);
+    try expectFragmentAnchorAtChunkBoundaries(attributes, 13);
+    try expectFragmentAnchorAtChunkBoundaries(attributes, attributes.len - 2);
+
+    const instruction = "<?xml version=\"1.0\" encoding = 'UTF-8'?>";
+    try expectFragmentAnchorAtChunkBoundaries(instruction, 0);
+    try expectFragmentAnchorAtChunkBoundaries(instruction, instruction.len - 2);
+}
+
+test "indexXml preserves invariants for adversarial bytes and tails" {
+    // Deterministic high-entropy bytes exercise every tail length across two SIMD chunks.
+    var input: [130]u8 = undefined;
+    for (&input, 0..) |*byte, index| {
+        byte.* = @truncate(index *% 131 +% index *% index *% 17 +% 37);
+    }
+    for (0..input.len + 1) |input_len| {
+        try expectMatchesScalar(input[0..input_len]);
+    }
+}
+
+test "indexXml rejects inputs whose indexes cannot fit u32" {
+    const oversized_len = @as(usize, std.math.maxInt(u32)) + 1;
+    const oversized_input: []const u8 =
+        @as([*]const u8, @ptrFromInt(1))[0..oversized_len];
+    try testing.expectError(
+        error.InputTooLarge,
+        indexXml(testing.allocator, oversized_input),
+    );
 }
 
 test "refAllDecls" {

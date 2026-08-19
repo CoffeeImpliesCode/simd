@@ -41,6 +41,8 @@ pub fn indexMarkdown(
     var state = MarkdownScanState{
         .in_code_fence = false,
         .in_inline_code = false,
+        .inline_code_length = 0,
+        .inline_code_run_remaining = 0,
         .fence_character = 0,
         .fence_length = 0,
         .line_marker_pending = true,
@@ -81,6 +83,8 @@ pub fn indexMarkdown(
 const MarkdownScanState = struct {
     in_code_fence: bool,
     in_inline_code: bool,
+    inline_code_length: usize,
+    inline_code_run_remaining: usize,
     fence_character: u8,
     fence_length: usize,
     line_marker_pending: bool,
@@ -93,8 +97,10 @@ fn markdownCandidateMask(vector: simd.Vec(64, u8)) u64 {
     const lists_and_inline = simd.matchAny4(64, vector, '+', '`', '[', ']');
     const links_and_fences = simd.matchAny4(64, vector, '(', ')', '~', '\n');
     const carriage_returns = simd.matchByte(64, vector, '\r');
+    const thematic_underscores = simd.matchByte(64, vector, '_');
     const digits = simd.matchRange(64, vector, '0', '9');
-    return line_and_blocks | lists_and_inline | links_and_fences | carriage_returns | digits;
+    return line_and_blocks | lists_and_inline | links_and_fences | carriage_returns |
+        thematic_underscores | digits;
 }
 
 fn markdownValidMask(valid_length: usize) u64 {
@@ -147,14 +153,29 @@ fn processMarkdownCandidate(
         return;
     }
 
-    if (state.line_marker_pending) {
+    if (state.inline_code_run_remaining > 0) {
+        appendToken(indexes, kinds, offset, .inline_code);
+        state.inline_code_run_remaining -= 1;
+        return;
+    }
+    if (state.line_marker_pending and !state.in_inline_code) {
         if (processLineMarker(input, offset, state, indexes, kinds)) return;
     }
 
     state.line_marker_pending = false;
     if (character == '`') {
+        const run_length = scalarRunLength(input, offset, input.len, '`');
         appendToken(indexes, kinds, offset, .inline_code);
-        state.in_inline_code = !state.in_inline_code;
+        state.inline_code_run_remaining = run_length - 1;
+        if (state.in_inline_code) {
+            if (run_length == state.inline_code_length) {
+                state.in_inline_code = false;
+                state.inline_code_length = 0;
+            }
+        } else {
+            state.in_inline_code = true;
+            state.inline_code_length = run_length;
+        }
         return;
     }
     if (state.in_inline_code) return;
@@ -213,6 +234,8 @@ fn processLineMarker(
             appendToken(indexes, kinds, offset, .code_fence);
             state.in_code_fence = true;
             state.in_inline_code = false;
+            state.inline_code_length = 0;
+            state.inline_code_run_remaining = 0;
             state.fence_character = character;
             state.fence_length = run_length;
             state.line_marker_pending = false;
@@ -221,7 +244,7 @@ fn processLineMarker(
         }
     }
 
-    if ((character == '-' or character == '*') and
+    if ((character == '-' or character == '*' or character == '_') and
         scalarIsThematicBreak(input, offset, line_end, character))
     {
         appendToken(indexes, kinds, offset, .thematic_break);
@@ -264,6 +287,7 @@ fn scalarIndexMarkdown(
 
     var in_code_fence = false;
     var in_inline_code = false;
+    var inline_code_length: usize = 0;
     var fence_character: u8 = 0;
     var fence_length: usize = 0;
     var line_start: usize = 0;
@@ -292,7 +316,7 @@ fn scalarIndexMarkdown(
             }
         } else {
             var is_fence_line = false;
-            if (indentation <= 3 and content_start < line_end) {
+            if (!in_inline_code and indentation <= 3 and content_start < line_end) {
                 const character = input[content_start];
                 if (character == '`' or character == '~') {
                     const run_length = scalarRunLength(input, content_start, line_end, character);
@@ -300,6 +324,7 @@ fn scalarIndexMarkdown(
                         appendToken(&indexes, kinds, content_start, .code_fence);
                         in_code_fence = true;
                         in_inline_code = false;
+                        inline_code_length = 0;
                         fence_character = character;
                         fence_length = run_length;
                         is_fence_line = true;
@@ -308,7 +333,7 @@ fn scalarIndexMarkdown(
             }
 
             if (!is_fence_line) {
-                if (indentation <= 3 and content_start < line_end) {
+                if (!in_inline_code and indentation <= 3 and content_start < line_end) {
                     scalarAppendLineMarker(
                         input,
                         content_start,
@@ -319,17 +344,34 @@ fn scalarIndexMarkdown(
                 }
 
                 var offset = line_start;
-                while (offset < line_end) : (offset += 1) {
+                while (offset < line_end) {
                     const character = input[offset];
                     if (character == '`') {
-                        appendToken(&indexes, kinds, offset, .inline_code);
-                        in_inline_code = !in_inline_code;
-                    } else if (!in_inline_code) {
-                        switch (character) {
-                            '[', '(' => appendToken(&indexes, kinds, offset, .link_open),
-                            ']', ')' => appendToken(&indexes, kinds, offset, .link_close),
-                            else => {},
+                        const run_length = scalarRunLength(input, offset, line_end, '`');
+                        const run_end = offset + run_length;
+                        var run_offset = offset;
+                        while (run_offset < run_end) : (run_offset += 1) {
+                            appendToken(&indexes, kinds, run_offset, .inline_code);
                         }
+                        if (in_inline_code) {
+                            if (run_length == inline_code_length) {
+                                in_inline_code = false;
+                                inline_code_length = 0;
+                            }
+                        } else {
+                            in_inline_code = true;
+                            inline_code_length = run_length;
+                        }
+                        offset = run_end;
+                    } else {
+                        if (!in_inline_code) {
+                            switch (character) {
+                                '[', '(' => appendToken(&indexes, kinds, offset, .link_open),
+                                ']', ')' => appendToken(&indexes, kinds, offset, .link_close),
+                                else => {},
+                            }
+                        }
+                        offset += 1;
                     }
                 }
             }
@@ -353,7 +395,7 @@ fn scalarAppendLineMarker(
     kinds: []MarkdownTokenKind,
 ) void {
     const character = input[content_start];
-    if ((character == '-' or character == '*') and
+    if ((character == '-' or character == '*' or character == '_') and
         scalarIsThematicBreak(input, content_start, line_end, character))
     {
         appendToken(indexes, kinds, content_start, .thematic_break);
@@ -446,12 +488,24 @@ fn appendToken(
     indexes.count += 1;
 }
 
+fn expectIndexInvariants(input: []const u8, index: *const MarkdownStructuralIndex) !void {
+    try testing.expect(index.count <= input.len);
+    for (index.indexes[0..index.count], 0..) |value, offset| {
+        try testing.expect(@as(usize, @intCast(value)) < input.len);
+        if (offset > 0) {
+            try testing.expect(index.indexes[offset - 1] < value);
+        }
+    }
+}
+
 fn expectMatchesScalarOracle(input: []const u8) !void {
     var expected = try scalarIndexMarkdown(testing.allocator, input);
     defer expected.deinit(testing.allocator);
     var actual = try indexMarkdown(testing.allocator, input);
     defer actual.deinit(testing.allocator);
 
+    try expectIndexInvariants(input, &expected);
+    try expectIndexInvariants(input, &actual);
     try testing.expectEqual(expected.count, actual.count);
     try testing.expectEqualSlices(
         u32,
@@ -461,6 +515,23 @@ fn expectMatchesScalarOracle(input: []const u8) !void {
     try testing.expectEqualSlices(
         MarkdownTokenKind,
         expected.kinds[0..expected.count],
+        actual.kinds[0..actual.count],
+    );
+}
+
+fn expectExactTokens(
+    input: []const u8,
+    expected_indexes: []const u32,
+    expected_kinds: []const MarkdownTokenKind,
+) !void {
+    var actual = try indexMarkdown(testing.allocator, input);
+    defer actual.deinit(testing.allocator);
+
+    try expectIndexInvariants(input, &actual);
+    try testing.expectEqualSlices(u32, expected_indexes, actual.indexes[0..actual.count]);
+    try testing.expectEqualSlices(
+        MarkdownTokenKind,
+        expected_kinds,
         actual.kinds[0..actual.count],
     );
 }
@@ -544,4 +615,202 @@ test "Markdown fence and line state cross SIMD window boundaries" {
         &.{ .code_fence, .code_fence },
         index.kinds[0..index.count],
     );
+}
+
+test "Markdown fences accept info strings and suppress fenced candidates" {
+    const input =
+        "```zig\n# hidden [x](y)\n```\n" ++
+        "~~~rust\n## hidden ![img](url)\n~~~\n# visible\n";
+    try expectMatchesScalarOracle(input);
+    try expectExactTokens(
+        input,
+        &.{ 0, 23, 27, 57, 61 },
+        &.{ .code_fence, .code_fence, .code_fence, .code_fence, .heading },
+    );
+}
+
+test "Markdown unclosed fences suppress candidates through EOF" {
+    const inputs = [_][]const u8{
+        "~~~python\n# hidden [x](y)\n",
+        "```zig\n# hidden [x](y)",
+    };
+    for (inputs) |input| {
+        try expectMatchesScalarOracle(input);
+        try expectExactTokens(input, &.{0}, &.{.code_fence});
+    }
+}
+
+test "Markdown headings allow at most three leading spaces" {
+    const input = "   # one\n  ## two\n    # code\n# root\n";
+    try expectMatchesScalarOracle(input);
+    try expectExactTokens(input, &.{ 3, 11, 29 }, &.{ .heading, .heading, .heading });
+}
+
+test "Markdown thematic breaks accept all markers and spacing" {
+    const input = "- - -\n* * *\n_ _ _\n___\n";
+    try expectMatchesScalarOracle(input);
+    try expectExactTokens(
+        input,
+        &.{ 0, 6, 12, 18 },
+        &.{ .thematic_break, .thematic_break, .thematic_break, .thematic_break },
+    );
+}
+
+test "Markdown inline code suppresses links inside matching backtick runs" {
+    const input = "``code [x](y)``\n# visible\n";
+    try expectMatchesScalarOracle(input);
+    try expectExactTokens(
+        input,
+        &.{ 0, 1, 13, 14, 16 },
+        &.{ .inline_code, .inline_code, .inline_code, .inline_code, .heading },
+    );
+}
+
+test "Markdown inline code keeps unmatched backtick runs inside code" {
+    const input = "``code ` [x](y)``\n# visible\n";
+    try expectMatchesScalarOracle(input);
+    try expectExactTokens(
+        input,
+        &.{ 0, 1, 7, 15, 16, 18 },
+        &.{
+            .inline_code,
+            .inline_code,
+            .inline_code,
+            .inline_code,
+            .inline_code,
+            .heading,
+        },
+    );
+}
+
+test "Markdown multiline inline code suppresses line markers" {
+    const input = "`# [x]\n`\n# visible\n";
+    try expectMatchesScalarOracle(input);
+    try expectExactTokens(
+        input,
+        &.{ 0, 7, 9 },
+        &.{ .inline_code, .inline_code, .heading },
+    );
+}
+
+test "Markdown inline-code run state resets at newline" {
+    const input = "``\n```\n# hidden [x](y)\n``\n# visible\n";
+    try expectMatchesScalarOracle(input);
+}
+
+test "Markdown multiline code spans hide block markers on content lines" {
+    const input = "``\n# [x]\n``\n# visible\n";
+    try expectMatchesScalarOracle(input);
+    try expectExactTokens(
+        input,
+        &.{ 0, 1, 9, 10, 12 },
+        &.{ .inline_code, .inline_code, .inline_code, .inline_code, .heading },
+    );
+}
+
+test "Markdown inline code takes precedence over fence-like content" {
+    const input = "``\n```\n# hidden\n``\n# visible\n";
+    try expectMatchesScalarOracle(input);
+    try expectExactTokens(
+        input,
+        &.{ 0, 1, 3, 4, 5, 16, 17, 19 },
+        &.{
+            .inline_code,
+            .inline_code,
+            .inline_code,
+            .inline_code,
+            .inline_code,
+            .inline_code,
+            .inline_code,
+            .heading,
+        },
+    );
+}
+
+test "Markdown nested links, images, and reference links index delimiters" {
+    const input = "![alt](url \"title\") [text][ref] [[nested](u)]\n[ref]: /url\n";
+    try expectMatchesScalarOracle(input);
+    try expectExactTokens(
+        input,
+        &.{ 1, 5, 6, 18, 20, 25, 26, 30, 32, 33, 40, 41, 43, 44, 46, 50 },
+        &.{
+            .link_open,
+            .link_close,
+            .link_open,
+            .link_close,
+            .link_open,
+            .link_close,
+            .link_open,
+            .link_close,
+            .link_open,
+            .link_open,
+            .link_close,
+            .link_open,
+            .link_close,
+            .link_close,
+            .link_open,
+            .link_close,
+        },
+    );
+}
+
+test "Markdown fences retain state for every SIMD chunk boundary" {
+    const opening_offsets = [_]usize{ 62, 63, 64, 65 };
+    for (opening_offsets) |opening_offset| {
+        var input: [256]u8 = undefined;
+        @memset(input[0..], 'x');
+        input[opening_offset - 1] = '\n';
+        input[opening_offset] = '`';
+        input[opening_offset + 1] = '`';
+        input[opening_offset + 2] = '`';
+        input[opening_offset + 3] = '\n';
+        input[opening_offset + 4] = '#';
+        input[opening_offset + 5] = ' ';
+        input[opening_offset + 6] = '[';
+        input[opening_offset + 7] = ']';
+        input[opening_offset + 8] = '\n';
+
+        const closing_offset = 190;
+        input[closing_offset - 1] = '\n';
+        input[closing_offset] = '`';
+        input[closing_offset + 1] = '`';
+        input[closing_offset + 2] = '`';
+        input[closing_offset + 3] = '\n';
+
+        try expectMatchesScalarOracle(&input);
+        try expectExactTokens(
+            &input,
+            &.{ @intCast(opening_offset), closing_offset },
+            &.{ .code_fence, .code_fence },
+        );
+    }
+}
+
+test "Markdown SIMD and scalar parity survives adversarial candidate streams" {
+    const alphabet = "#>-*+`[]()~\n\r0123456789_ x";
+    var input: [1024]u8 = undefined;
+    var seed: u64 = 0x9e3779b97f4a7c15;
+    for (&input) |*character| {
+        seed ^= seed << 7;
+        seed ^= seed >> 9;
+        seed ^= seed << 8;
+        character.* = alphabet[@intCast(seed % alphabet.len)];
+    }
+
+    const lengths = [_]usize{
+        0,   1,   2,   3,    61,   62, 63, 64, 65, 66, 127, 128, 129, 190, 191, 192, 193, 255, 256,
+        511, 512, 513, 1023, 1024,
+    };
+    for (lengths) |length| {
+        try expectMatchesScalarOracle(input[0..length]);
+    }
+
+    var all_bytes: [512]u8 = undefined;
+    for (&all_bytes, 0..) |*character, offset| {
+        character.* = @truncate(offset);
+    }
+    const all_byte_lengths = [_]usize{ 0, 1, 63, 64, 65, 127, 128, 255, 256, 511, 512 };
+    for (all_byte_lengths) |length| {
+        try expectMatchesScalarOracle(all_bytes[0..length]);
+    }
 }

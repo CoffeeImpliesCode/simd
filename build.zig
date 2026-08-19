@@ -33,6 +33,13 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
+    const fuzz_test_mod = b.createModule(.{
+        .root_source_file = b.path("test/fuzz_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    fuzz_test_mod.addImport("simd_lib", lib_mod);
     lib_test_mod.addImport("simd_lib", lib_mod);
 
     // We will also create a module for our other entry point, 'main.zig'.
@@ -114,10 +121,20 @@ pub fn build(b: *std.Build) void {
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 
+    const smith_fuzz_tests = b.addTest(.{
+        .root_module = fuzz_test_mod,
+    });
+
+    const run_smith_fuzz_tests = b.addRunArtifact(smith_fuzz_tests);
+
+    const fuzz_step = b.step("fuzz", "Run deterministic Smith fuzz tests");
+    fuzz_step.dependOn(&run_smith_fuzz_tests.step);
+
     // Similar to creating the run step earlier, this exposes a `test` step to
     // the `zig build --help` menu, providing a way for the user to request
     // running the unit tests.
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_exe_unit_tests.step);
+    test_step.dependOn(&run_smith_fuzz_tests.step);
 }
