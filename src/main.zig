@@ -6,137 +6,7 @@ const assert = std.debug.assert;
 const vector_len = lib.default_vector_len;
 const ByteVector = lib.Vec(vector_len, u8);
 const BitMask = lib.Mask(vector_len);
-
-pub const Mode = enum {
-    compact_char,
-    char,
-    num,
-    marker,
-};
-
-fn valueToByte(comptime S: type, value: S) u8 {
-    return switch (S) {
-        bool => @intFromBool(value),
-        u1, u2, u4, u8 => @intCast(value),
-        else => @compileError("unsupported display element type"),
-    };
-}
-
-fn valueIsSet(comptime S: type, value: S) bool {
-    return switch (S) {
-        bool => value,
-        u1, u2, u4, u8 => value > 0,
-        else => @compileError("unsupported marker element type"),
-    };
-}
-
-fn print(
-    comptime S: type,
-    vector: lib.Vec(vector_len, S),
-    comptime mode: Mode,
-    note: []const u8,
-    writer: anytype,
-) !void {
-    const values: [vector_len]S = vector;
-    switch (mode) {
-        .compact_char => {
-            for (values) |value| {
-                const character = valueToByte(S, value);
-                if (std.ascii.isPrint(character)) {
-                    try writer.print("{c:1}", .{character});
-                } else {
-                    var buffer: [4]u8 = undefined;
-                    const encoded_len = try std.unicode.utf8Encode(
-                        0x2400 + @as(u21, character),
-                        &buffer,
-                    );
-                    try writer.print("{s}", .{buffer[0..encoded_len]});
-                }
-            }
-            try writer.print("  {s}\n", .{note});
-        },
-        .char => {
-            try writer.writeAll("┌");
-            for (0..values.len - 1) |_| {
-                try writer.writeAll("───┬");
-            }
-            try writer.writeAll("───┐\n│");
-
-            for (values) |value| {
-                const character = valueToByte(S, value);
-                if (std.ascii.isPrint(character)) {
-                    try writer.print("{c:2} │", .{character});
-                } else {
-                    try writer.writeAll(" � │");
-                }
-            }
-            try writer.writeAll("\n├");
-            for (0..values.len - 1) |_| {
-                try writer.writeAll("───┼");
-            }
-            try writer.print("───┤  {s}\n│", .{note});
-            for (values) |value| {
-                try writer.print("x{x:02}│", .{valueToByte(S, value)});
-            }
-            try writer.writeAll("\n└");
-            for (0..values.len - 1) |_| {
-                try writer.writeAll("───┴");
-            }
-            try writer.writeAll("───┘\n");
-        },
-        .num => {
-            for (values) |value| {
-                try writer.print("{d:3} ", .{value});
-            }
-            try writer.print("  {s}\n", .{note});
-        },
-        .marker => {
-            for (values) |value| {
-                if (valueIsSet(S, value)) {
-                    try writer.writeAll("  ↑ ");
-                } else {
-                    try writer.writeAll("    ");
-                }
-            }
-            try writer.print("  {s}\n", .{note});
-        },
-    }
-}
-
-fn printAscii(character: u8, writer: anytype) !void {
-    if (std.ascii.isPrint(character)) {
-        try writer.writeByte(character);
-    } else {
-        var buffer: [4]u8 = undefined;
-        const encoded_len = try std.unicode.utf8Encode(
-            0x2400 + @as(u21, character),
-            &buffer,
-        );
-        try writer.writeAll(buffer[0..encoded_len]);
-    }
-}
-
-fn highlight(
-    bytes: ByteVector,
-    mask: BitMask,
-    note: []const u8,
-    color: u8,
-    writer: anytype,
-) !void {
-    const values: [vector_len]u8 = bytes;
-    var remaining_mask = mask;
-    for (values) |character| {
-        if ((remaining_mask & 1) != 0) {
-            try writer.print("\x1b[48:5:{d}m", .{color});
-        }
-        try printAscii(character, writer);
-        if ((remaining_mask & 1) != 0) {
-            try writer.writeAll("\x1b[0m");
-        }
-        remaining_mask >>= 1;
-    }
-    try writer.print("  {s}\n", .{note});
-}
+const debug = lib.debug;
 
 const text =
     \\{ "Width": 800,
@@ -169,28 +39,67 @@ pub fn main(init: std.process.Init) !void {
     var stdout_writer = std.Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
     const writer = &stdout_writer.interface;
 
-    try writer.print("{s}\n", .{text});
+    try writer.writeAll("\x1b[1m=== SIMD Vector Visualizer (Composite Multi-Mask Orthogonal Styling) ===\x1b[0m\n\n");
+    try writer.print("{s}\n\n", .{text});
 
     var chunk_iterator = lib.windows(u8, vector_len, text, @as(u8, 0));
     var starts_in_string = false;
+    var prev_ends_in_backslash = false;
     const chunk_count = @divFloor(text.len + vector_len - 1, vector_len);
-    for (0..chunk_count) |_| {
+
+    for (0..chunk_count) |chunk_idx| {
         const bytes = chunk_iterator.next() orelse unreachable;
-        try print(u8, bytes, .compact_char, "input", writer);
 
-        const quotes_mask = lib.findQuotes(vector_len, bytes);
-        try highlight(bytes, quotes_mask, "quotes", 27, writer);
+        const backslash_mask = lib.matchByte(vector_len, bytes, '\\');
+        const bs_runs = lib.computeBackslashRuns64(backslash_mask, prev_ends_in_backslash);
+        prev_ends_in_backslash = bs_runs.ends_in_backslash;
 
-        const strings = lib.classifyStrings64(quotes_mask, starts_in_string);
-        starts_in_string = strings.ends_in_string;
-        try highlight(bytes, strings.mask, "strings", 28, writer);
+        const raw_quotes = lib.matchByte(vector_len, bytes, '"');
+        const unescaped_quotes = raw_quotes & ~bs_runs.odd_length_ends;
 
-        const periods_mask = lib.matchByte(vector_len, bytes, '.');
-        const numeric_mask = (lib.findDigits(vector_len, bytes) | periods_mask) & ~strings.mask;
-        try highlight(bytes, numeric_mask, "numeric", 30, writer);
-        try writer.writeByte('\n');
+        const prev_fill: u64 = if (starts_in_string) ~@as(u64, 0) else 0;
+        const inside_without_closing = lib.prefixXor(u64, unescaped_quotes) ^ prev_fill;
+        const string_mask = inside_without_closing | unescaped_quotes;
+        starts_in_string = (inside_without_closing & (@as(u64, 1) << 63)) != 0;
+
+        const digits = lib.matchRange(vector_len, bytes, '0', '9');
+        const periods = lib.matchByte(vector_len, bytes, '.');
+        const minus = lib.matchByte(vector_len, bytes, '-');
+        const numeric_mask = (digits | periods | minus) & ~string_mask;
+
+        const structurals = lib.matchAny4(vector_len, bytes, '{', '}', '[', ']') |
+            lib.matchAny2(vector_len, bytes, ':', ',');
+        const structural_mask = structurals & ~string_mask;
+
+        const layers = [_]debug.HighlightLayer{
+            .{
+                .mask = unescaped_quotes,
+                .style = .{ .bg_color_256 = 220, .fg_color_256 = 16, .bold = true },
+                .name = "quotes",
+            },
+            .{
+                .mask = string_mask & ~unescaped_quotes,
+                .style = .{ .fg_color_256 = 34, .italic = true },
+                .name = "string-content",
+            },
+            .{
+                .mask = numeric_mask,
+                .style = .{ .fg_color_256 = 39, .underline = true, .bold = true },
+                .name = "numeric",
+            },
+            .{
+                .mask = structural_mask,
+                .style = .{ .bg_color_256 = 99, .fg_color_256 = 15, .bold = true },
+                .name = "structural",
+            },
+        };
+
+        var note_buffer: [64]u8 = undefined;
+        const note = try std.fmt.bufPrint(&note_buffer, "chunk [{d}/{d}]", .{ chunk_idx + 1, chunk_count });
+        try debug.highlightMulti(bytes, &layers, note, writer);
     }
     assert(chunk_iterator.next() == null);
+    try writer.writeAll("\n");
     try writer.flush();
 }
 

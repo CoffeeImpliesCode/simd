@@ -1,0 +1,18 @@
+{
+    // Compiler and Toolchain Configuration
+    "name": "simd-parser",
+    /* Multi-line configuration comment
+       specifying target architecture and optimization modes */
+    "target": "x86_64",
+    "version": 1.0,
+    "features": [
+        "avx2", // 256-bit vector operations
+        "neon", /* ARM 128-bit SIMD */
+        "rvv"
+    ],
+    "settings": {
+        "opt_level": 3,
+        "debug_symbols": false,
+        "url": "http://example.com/api?param=1//not-a-comment/*not-a-comment*/"
+    }
+}

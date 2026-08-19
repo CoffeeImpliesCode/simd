@@ -1,0 +1,17 @@
+{
+    // JSON5 allows unquoted keys, single quotes, hex numbers, and trailing commas
+    unquotedKey: 'single quoted value with "nested double quotes"',
+    hexNumber: 0xDEADBEEF,
+    negativeHex: -0x2A,
+    decimalPointLeading: .45,
+    decimalPointTrailing: 42.,
+    trailingCommaList: [
+        'first item',
+        0x10,
+        true,
+    ],
+    nested: {
+        identifier_name: 'valid_identifier',
+        trailingObjectComma: null,
+    },
+}

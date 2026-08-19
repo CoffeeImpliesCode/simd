@@ -29,7 +29,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const lib_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/root_test.zig"),
+        .root_source_file = b.path("test/root_test.zig"),
         .target = target,
         .optimize = optimize,
     });

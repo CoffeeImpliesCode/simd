@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Catalog of benchmark datasets and components -->
+<catalog id="simd-catalog" version="2.0">
+    <description>SIMD Parser benchmark test suite</description>
+    <item id="101" category="json" available="true">
+        <name>Twitter Stream Sample</name>
+        <path>test/corpus/json/twitter.json</path>
+        <attributes format="standard" encoding="utf-8" />
+        <payload><![CDATA[<raw-payload data="contains <tags> & 'quotes'"/>]]></payload>
+    </item>
+    <item id="102" category="xml" available="false">
+        <name>Empty Self-Closing Entry</name>
+        <empty_tag flag="true" />
+    </item>
+</catalog>
