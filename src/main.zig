@@ -1,134 +1,101 @@
 const std = @import("std");
 const lib = @import("simd_lib");
+const testing = std.testing;
 
-const VLEN = 64;
-const U8Vec = @Vector(VLEN, u8);
-const BVec = @Vector(VLEN, bool);
-
-pub fn I(comptime bit_count: u16) type {
-    return std.meta.Int(.signed, bit_count);
-}
-
-pub fn U(comptime bit_count: u16) type {
-    return std.meta.Int(.unsigned, bit_count);
-}
-
-const checker01: U(VLEN) = @bitCast(@as(@Vector(VLEN / 2, u2), @splat(2)));
-const checker10 = ~checker01;
-
-pub fn ChunkIterator(comptime T: type, comptime len: usize, comptime pad: bool) type {
-    return struct {
-        fill: ?T,
-        rest: []const T,
-        pub fn init(data: []const T, fill: ?T) ChunkIterator {
-            return .{ .fill = fill, .rest = data };
-        }
-        pub fn next(self: *@This()) ?@Vector(len, T) {
-            if (self.rest.len < len) {
-                if (self.rest.len == 0 or !pad) return null;
-                var v: @Vector(len, T) = @splat(self.fill.?);
-                for (0..self.rest.len) |j| v[j] = self.rest[j];
-                self.rest = &.{};
-                return v;
-            }
-            const v: @Vector(len, T) = self.rest[0..len].*;
-            self.rest = self.rest[len..];
-            return v;
-        }
-    };
-}
-
-pub fn windows(
-    comptime T: type,
-    comptime len: usize,
-    data: []const T,
-    comptime fill: ?T,
-) ChunkIterator(T, len, fill != null) {
-    return ChunkIterator(T, len, fill != null){
-        .fill = fill,
-        .rest = data,
-    };
-}
+const assert = std.debug.assert;
+const vector_len = lib.default_vector_len;
+const ByteVector = lib.Vec(vector_len, u8);
+const BitMask = lib.Mask(vector_len);
 
 pub const Mode = enum {
     compact_char,
     char,
-    // hex,
     num,
     marker,
 };
 
-pub fn print(comptime S: type, v: @Vector(VLEN, S), comptime mode: Mode, note: []const u8, writer: anytype) !void {
-    const s: [VLEN]S = v;
+fn valueToByte(comptime S: type, value: S) u8 {
+    return switch (S) {
+        bool => @intFromBool(value),
+        u1, u2, u4, u8 => @intCast(value),
+        else => @compileError("unsupported display element type"),
+    };
+}
+
+fn valueIsSet(comptime S: type, value: S) bool {
+    return switch (S) {
+        bool => value,
+        u1, u2, u4, u8 => value > 0,
+        else => @compileError("unsupported marker element type"),
+    };
+}
+
+fn print(
+    comptime S: type,
+    vector: lib.Vec(vector_len, S),
+    comptime mode: Mode,
+    note: []const u8,
+    writer: anytype,
+) !void {
+    const values: [vector_len]S = vector;
     switch (mode) {
         .compact_char => {
-            for (s) |val| {
-                const c: u8 = switch (S) {
-                    bool => @intFromBool(val),
-                    u1, u2, u4, u8 => @intCast(val),
-                    else => @compileError("Unimplemented."),
-                };
-                if (std.ascii.isPrint(c)) {
-                    try writer.print("{c:1}", .{c});
+            for (values) |value| {
+                const character = valueToByte(S, value);
+                if (std.ascii.isPrint(character)) {
+                    try writer.print("{c:1}", .{character});
                 } else {
-                    var buf = std.mem.zeroes([4]u8);
-                    const len = try std.unicode.utf8Encode(0x2400 + @as(u21, c), &buf);
-                    // try writer.print("�\u{2424}", .{});
-                    try writer.print("{s}", .{buf[0..len]});
+                    var buffer: [4]u8 = undefined;
+                    const encoded_len = try std.unicode.utf8Encode(
+                        0x2400 + @as(u21, character),
+                        &buffer,
+                    );
+                    try writer.print("{s}", .{buffer[0..encoded_len]});
                 }
             }
-
             try writer.print("  {s}\n", .{note});
-            // for (0..s.len - 1) |_| try writer.print("───┼", .{});
-            // try writer.print("───┤  {s}\n│", .{note});
-            // for (s) |val| try writer.print("x{x:02}│", .{val});
-            // try writer.print("\n└", .{});
-            // for (0..s.len - 1) |_| try writer.print("───┴", .{});
-            // try writer.print("───┘\n", .{});
-
         },
         .char => {
-            try writer.print("┌", .{});
-            for (0..s.len - 1) |_| try writer.print("───┬", .{});
-            try writer.print("───┐\n│", .{});
+            try writer.writeAll("┌");
+            for (0..values.len - 1) |_| {
+                try writer.writeAll("───┬");
+            }
+            try writer.writeAll("───┐\n│");
 
-            for (s) |val| {
-                const c: u8 = switch (S) {
-                    bool => @intFromBool(val),
-                    u1, u2, u4, u8 => @intCast(val),
-                    else => @compileError("Unimplemented."),
-                };
-                if (std.ascii.isPrint(c)) {
-                    try writer.print("{c:2} │", .{c});
+            for (values) |value| {
+                const character = valueToByte(S, value);
+                if (std.ascii.isPrint(character)) {
+                    try writer.print("{c:2} │", .{character});
                 } else {
-                    try writer.print(" � │", .{});
+                    try writer.writeAll(" � │");
                 }
             }
-            try writer.print("\n├", .{});
-            for (0..s.len - 1) |_| try writer.print("───┼", .{});
+            try writer.writeAll("\n├");
+            for (0..values.len - 1) |_| {
+                try writer.writeAll("───┼");
+            }
             try writer.print("───┤  {s}\n│", .{note});
-            for (s) |val| try writer.print("x{x:02}│", .{val});
-            try writer.print("\n└", .{});
-            for (0..s.len - 1) |_| try writer.print("───┴", .{});
-            try writer.print("───┘\n", .{});
+            for (values) |value| {
+                try writer.print("x{x:02}│", .{valueToByte(S, value)});
+            }
+            try writer.writeAll("\n└");
+            for (0..values.len - 1) |_| {
+                try writer.writeAll("───┴");
+            }
+            try writer.writeAll("───┘\n");
         },
         .num => {
-            for (s) |val| {
-                try writer.print("{d:3} ", .{val});
+            for (values) |value| {
+                try writer.print("{d:3} ", .{value});
             }
             try writer.print("  {s}\n", .{note});
         },
         .marker => {
-            for (s) |val| {
-                const m = switch (S) {
-                    bool => val,
-                    u1, u2, u4, u8 => val > 0,
-                    else => @compileError("Unimplemented."),
-                };
-                if (m) {
-                    try writer.print("  ↑ ", .{});
+            for (values) |value| {
+                if (valueIsSet(S, value)) {
+                    try writer.writeAll("  ↑ ");
                 } else {
-                    try writer.print("    ", .{});
+                    try writer.writeAll("    ");
                 }
             }
             try writer.print("  {s}\n", .{note});
@@ -136,52 +103,39 @@ pub fn print(comptime S: type, v: @Vector(VLEN, S), comptime mode: Mode, note: [
     }
 }
 
-pub fn printAscii(c: u8, writer: anytype) !void {
-    if (std.ascii.isPrint(c)) try writer.writeByte(c) else {
-        var buf = std.mem.zeroes([4]u8);
-        const len = try std.unicode.utf8Encode(0x2400 + @as(u21, c), &buf);
-        try writer.writeAll(buf[0..len]);
+fn printAscii(character: u8, writer: anytype) !void {
+    if (std.ascii.isPrint(character)) {
+        try writer.writeByte(character);
+    } else {
+        var buffer: [4]u8 = undefined;
+        const encoded_len = try std.unicode.utf8Encode(
+            0x2400 + @as(u21, character),
+            &buffer,
+        );
+        try writer.writeAll(buffer[0..encoded_len]);
     }
 }
 
-pub fn highlight(bytes: @Vector(VLEN, u8), j: anytype, note: []const u8, col: u8, w: anytype) !void {
-    var k = j;
-    for (0..VLEN) |idx| {
-        if (k & 1 == 1) {
-            try w.print("\x1b[48:5:{d}m", .{col});
-        }
-        try printAscii(bytes[idx], w);
-        if (k & 1 == 1) {
-            try w.print("\x1b[0m", .{});
-        }
-        k >>= 1;
-    }
-    try w.print("  {s}\n", .{note});
-}
-
-pub fn printInt(
-    /// the vector to print
-    j: anytype,
+fn highlight(
+    bytes: ByteVector,
+    mask: BitMask,
     note: []const u8,
-    /// `w`: instance of `std.io.GenericWriter`
-    w: anytype,
+    color: u8,
+    writer: anytype,
 ) !void {
-    const len = @typeInfo(@TypeOf(j)).int.bits;
-    var k = j;
-    for (0..len) |_| {
-        const s: []const u8 = if (k & 1 != 0) "1" else "_";
-        // try w.print("__{c}_", .{c});
-        try w.print("{s}", .{s});
-        k = k >> 1;
+    const values: [vector_len]u8 = bytes;
+    var remaining_mask = mask;
+    for (values) |character| {
+        if ((remaining_mask & 1) != 0) {
+            try writer.print("\x1b[48:5:{d}m", .{color});
+        }
+        try printAscii(character, writer);
+        if ((remaining_mask & 1) != 0) {
+            try writer.writeAll("\x1b[0m");
+        }
+        remaining_mask >>= 1;
     }
-    try w.print("  {s}\n", .{note});
-}
-
-fn prefixXor(bitmask: anytype) @TypeOf(bitmask) {
-    var x = bitmask;
-    inline for (0..(@typeInfo(std.math.Log2Int(@TypeOf(bitmask))).int.bits)) |j|
-        x ^= x << comptime (1 << j);
-    return x;
+    try writer.print("  {s}\n", .{note});
 }
 
 const text =
@@ -207,52 +161,39 @@ const text =
     \\}
 ;
 
-pub fn matchStart(
-    v: U8Vec,
-    comptime s: []const u8,
-) U(VLEN) {
-    const m: U(VLEN) = ((1 << VLEN - 1) - 1) | (1 << VLEN - 1);
-    inline for (s, 0..) |c, shift| {
-        _ = v;
-        _ = c;
-        _ = shift;
-        _ = m;
+pub fn main(init: std.process.Init) !void {
+    comptime assert(vector_len == 64);
+    comptime assert(text.len > 0);
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
+    const writer = &stdout_writer.interface;
+
+    try writer.print("{s}\n", .{text});
+
+    var chunk_iterator = lib.windows(u8, vector_len, text, @as(u8, 0));
+    var starts_in_string = false;
+    const chunk_count = @divFloor(text.len + vector_len - 1, vector_len);
+    for (0..chunk_count) |_| {
+        const bytes = chunk_iterator.next() orelse unreachable;
+        try print(u8, bytes, .compact_char, "input", writer);
+
+        const quotes_mask = lib.findQuotes(vector_len, bytes);
+        try highlight(bytes, quotes_mask, "quotes", 27, writer);
+
+        const strings = lib.classifyStrings64(quotes_mask, starts_in_string);
+        starts_in_string = strings.ends_in_string;
+        try highlight(bytes, strings.mask, "strings", 28, writer);
+
+        const periods_mask = lib.matchByte(vector_len, bytes, '.');
+        const numeric_mask = (lib.findDigits(vector_len, bytes) | periods_mask) & ~strings.mask;
+        try highlight(bytes, numeric_mask, "numeric", 30, writer);
+        try writer.writeByte('\n');
     }
+    assert(chunk_iterator.next() == null);
+    try writer.flush();
 }
 
-pub fn main() !void {
-    std.debug.print("{s}\n", .{text});
-    const w = std.io.getStdOut().writer();
-    var ci = windows(u8, VLEN, text, 0);
-    const quote: U8Vec = @splat('"');
-    var prev_q: U(VLEN) = 0;
-    while (ci.next()) |c| {
-        try print(u8, c, .compact_char, "input", w);
-        var q: U(VLEN) = @bitCast(c == quote);
-        // try print_int(q, "quotes", w);
-        try highlight(c, q, "quotes", 27, w);
-        const od: U(VLEN) = 0;
-        q &= ~od;
-        q = (prefixXor(q) ^ prev_q | q);
-        prev_q = if (q & (1 << (VLEN - 1)) != 0) (~@as(U(VLEN), 0)) else 0;
-        try highlight(c, q, "strings", 28, w);
-
-        const zero: U8Vec = @splat('0');
-        const nine: U8Vec = @splat('9');
-        const period: U8Vec = @splat('.');
-        const gezero: U(VLEN) = @bitCast(c >= zero);
-        const lenine: U(VLEN) = @bitCast(c <= nine);
-        const p: U(VLEN) = @bitCast(c == period);
-        const numeric = (gezero & lenine | p) & ~q;
-        try highlight(c, numeric, "numeric", 30, w);
-
-        // const true0 = "truetruetruetruetruetruetruetrue"[0..VLEN];
-        // const true1 = "ruetruetruetruetruetruetruetruet"[0..VLEN];
-        // const true2 = "uetruetruetruetruetruetruetruetr"[0..VLEN];
-        // const true3 = "etruetruetruetruetruetruetruetru"[0..VLEN];
-
-        // try print_int(m_, "is `o`", w);
-        // std.debug.print("{c:2}\n\n", .{_1_0});
-        try w.writeAll("\n");
-    }
+test "refAllDecls" {
+    testing.refAllDecls(@This());
 }
