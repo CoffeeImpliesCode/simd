@@ -83,6 +83,7 @@ pub fn indexMarkdownImpl(
             scan_offset = offset + 1;
         }
     }
+    try indexes.finish(input.len);
 
     return .{
         .indexes = indexes.indexes,
@@ -396,6 +397,7 @@ fn scalarIndexMarkdown(
 
         line_start = scalarNextLineStart(input, line_end);
     }
+    try indexes.finish(input.len);
 
     return .{
         .indexes = indexes.indexes,

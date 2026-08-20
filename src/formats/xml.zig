@@ -45,8 +45,9 @@ pub fn indexXmlImpl(
     const Mask = simd.Mask(VLEN);
 
     if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
-    const indexes = try allocator.alloc(u32, input.len);
-    errdefer allocator.free(indexes);
+    var structural_indexes = try stage1.StructuralIndex.init(allocator, input.len);
+    errdefer structural_indexes.deinit(allocator);
+    const indexes = structural_indexes.indexes;
     const kinds = try allocator.alloc(XmlTokenKind, input.len);
     errdefer allocator.free(kinds);
 
@@ -157,6 +158,8 @@ pub fn indexXmlImpl(
         base_offset += VLEN;
     }
 
+    structural_indexes.count = result.count;
+    try structural_indexes.finish(input.len);
     return result;
 }
 
@@ -188,8 +191,9 @@ fn isCommentTerminatorAt(
 
 fn scalarIndexXml(allocator: std.mem.Allocator, input: []const u8) !XmlStructuralIndex {
     if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
-    const indexes = try allocator.alloc(u32, input.len);
-    errdefer allocator.free(indexes);
+    var structural_indexes = try stage1.StructuralIndex.init(allocator, input.len);
+    errdefer structural_indexes.deinit(allocator);
+    const indexes = structural_indexes.indexes;
     const kinds = try allocator.alloc(XmlTokenKind, input.len);
     errdefer allocator.free(kinds);
 
@@ -287,6 +291,8 @@ fn scalarIndexXml(allocator: std.mem.Allocator, input: []const u8) !XmlStructura
         }
     }
 
+    structural_indexes.count = count;
+    try structural_indexes.finish(input.len);
     return .{
         .indexes = indexes,
         .kinds = kinds,

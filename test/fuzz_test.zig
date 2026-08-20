@@ -60,7 +60,7 @@ fn testFuzzJson(_: void, smith: *testing.Smith) !void {
     const input = buffer[0..len];
 
     var idx = lib.formats.json.indexJson(testing.allocator, input) catch |err| switch (err) {
-        error.OutOfMemory, error.InputTooLarge => return,
+        error.OutOfMemory, error.InputTooLarge, error.CapacityOverflow => return,
     };
     defer idx.deinit(testing.allocator);
 
@@ -81,7 +81,7 @@ fn testFuzzJsonl(_: void, smith: *testing.Smith) !void {
     const input = buffer[0..len];
 
     var idx = lib.formats.jsonl.indexJsonl(testing.allocator, input) catch |err| switch (err) {
-        error.OutOfMemory, error.InputTooLarge => return,
+        error.OutOfMemory, error.InputTooLarge, error.CapacityOverflow => return,
     };
     defer idx.deinit(testing.allocator);
 
@@ -102,7 +102,7 @@ fn testFuzzJsonc(_: void, smith: *testing.Smith) !void {
     const input = buffer[0..len];
 
     var idx = lib.formats.jsonc.indexJsonc(testing.allocator, input) catch |err| switch (err) {
-        error.OutOfMemory, error.InputTooLarge => return,
+        error.OutOfMemory, error.InputTooLarge, error.CapacityOverflow => return,
     };
     defer idx.deinit(testing.allocator);
 
@@ -123,7 +123,7 @@ fn testFuzzJson5(_: void, smith: *testing.Smith) !void {
     const input = buffer[0..len];
 
     var idx = lib.formats.json5.indexJson5(testing.allocator, input) catch |err| switch (err) {
-        error.OutOfMemory, error.InputTooLarge => return,
+        error.OutOfMemory, error.InputTooLarge, error.CapacityOverflow => return,
     };
     defer idx.deinit(testing.allocator);
 
@@ -144,7 +144,7 @@ fn testFuzzMarkdown(_: void, smith: *testing.Smith) !void {
     const input = buffer[0..len];
 
     var idx = lib.formats.markdown.indexMarkdown(testing.allocator, input) catch |err| switch (err) {
-        error.OutOfMemory, error.InputTooLarge => return,
+        error.OutOfMemory, error.InputTooLarge, error.CapacityOverflow => return,
     };
     defer idx.deinit(testing.allocator);
 
@@ -167,7 +167,7 @@ fn testFuzzXml(_: void, smith: *testing.Smith) !void {
     const input = buffer[0..len];
 
     var idx = lib.formats.xml.indexXml(testing.allocator, input) catch |err| switch (err) {
-        error.OutOfMemory, error.InputTooLarge => return,
+        error.OutOfMemory, error.InputTooLarge, error.CapacityOverflow => return,
     };
     defer idx.deinit(testing.allocator);
 

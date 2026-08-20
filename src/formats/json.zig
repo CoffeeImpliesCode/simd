@@ -60,6 +60,7 @@ pub fn indexJsonImpl(
         const unescaped_quotes = quotes & ~odd_backslash_ends;
         const inside_without_closing = simd.prefixXor(Mask, unescaped_quotes) ^
             if (prev_in_string) ~@as(Mask, 0) else 0;
+        const opening_quotes = unescaped_quotes & inside_without_closing;
         const string_mask = inside_without_closing | unescaped_quotes;
         const outside_string = ~string_mask & valid_mask;
 
@@ -72,7 +73,8 @@ pub fn indexJsonImpl(
         const atom_starts = atom_candidates & atom_active &
             ~((atom_active << @as(Shift, 1)) |
                 if (prev_in_atom) @as(Mask, 1) else 0);
-        const structural_indexes = (structural | atom_starts) & outside_string;
+        const structural_indexes = ((structural | atom_starts) & outside_string) |
+            opening_quotes;
         var candidate_indexes: [VLEN]u32 = undefined;
         const candidate_count = simd.extractBitIndexes(
             Mask,
@@ -101,6 +103,7 @@ pub fn indexJsonImpl(
         base_offset += VLEN;
     }
 
+    try indexes.finish(input.len);
     return indexes;
 }
 
@@ -157,10 +160,12 @@ fn scalarIndexJson(
     var prev_in_atom = false;
     for (input, 0..) |byte, index| {
         if (byte == '"' and backslash_run_length % 2 == 0) {
+            if (!in_string) {
+                result.indexes[result.count] = @intCast(index);
+                result.count += 1;
+            }
             in_string = !in_string;
-        }
-
-        if (!in_string) {
+        } else if (!in_string) {
             if (isStructuralByte(byte)) {
                 result.indexes[result.count] = @intCast(index);
                 result.count += 1;
@@ -179,6 +184,7 @@ fn scalarIndexJson(
         }
     }
 
+    try result.finish(input.len);
     return result;
 }
 
@@ -383,14 +389,21 @@ test "indexJson handles empty degenerate and unterminated documents" {
     }
 }
 
-test "indexJson excludes structural bytes inside strings" {
+test "indexJson emits opening quotes and excludes string contents and closing quotes" {
     const outside = "{[:]}:,";
-    const expected = [_]u32{ 0, 1, 2, 3, 4, 5, 6 };
+    const outside_expected = [_]u32{ 0, 1, 2, 3, 4, 5, 6 };
 
-    var index = try indexJson(testing.allocator, outside);
-    defer index.deinit(testing.allocator);
-    try testing.expectEqualSlices(u32, &expected, index.slice());
-    try expectValidIndexes(outside.len, index.slice());
+    var outside_index = try indexJson(testing.allocator, outside);
+    defer outside_index.deinit(testing.allocator);
+    try testing.expectEqualSlices(u32, &outside_expected, outside_index.slice());
+    try expectValidIndexes(outside.len, outside_index.slice());
+
+    const quoted = "[\"x\",\"\"]";
+    const quoted_expected = [_]u32{ 0, 1, 4, 5, 7 };
+    var quoted_index = try indexJson(testing.allocator, quoted);
+    defer quoted_index.deinit(testing.allocator);
+    try testing.expectEqualSlices(u32, &quoted_expected, quoted_index.slice());
+    try expectValidIndexes(quoted.len, quoted_index.slice());
 
     try expectMatchesScalar("\"{[:]}:,\"");
     try expectMatchesScalar("{\"inside\":\"{[:]}:,\",\"outside\":[0]}");

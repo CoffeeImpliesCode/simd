@@ -59,6 +59,7 @@ pub fn indexJsonlImpl(
         const unescaped_quotes = quotes & ~odd_backslash_ends;
         const inside_without_closing = simd.prefixXor(Mask, unescaped_quotes) ^
             if (prev_in_string) ~@as(Mask, 0) else 0;
+        const opening_quotes = unescaped_quotes & inside_without_closing;
         const string_mask = inside_without_closing | unescaped_quotes;
         const outside_string = ~string_mask & valid_mask;
 
@@ -72,7 +73,8 @@ pub fn indexJsonlImpl(
             ~((atom_active << 1) | if (prev_in_atom) @as(Mask, 1) else 0);
         const record_boundaries = simd.matchByte(VLEN, chunk, '\n');
         const structural_indexes =
-            (structural | atom_starts | record_boundaries) & outside_string;
+            ((structural | atom_starts | record_boundaries) & outside_string) |
+            opening_quotes;
 
         var candidate_indexes: [VLEN]u32 = undefined;
         const candidate_count = simd.extractBitIndexes(
@@ -103,6 +105,7 @@ pub fn indexJsonlImpl(
         base_offset += VLEN;
     }
 
+    try indexes.finish(input.len);
     return indexes;
 }
 
@@ -156,7 +159,12 @@ fn scalarIndexJsonl(
     var backslash_run_length: usize = 0;
     var prev_in_atom = false;
     for (input, 0..) |byte, index| {
-        if (byte == '"' and backslash_run_length % 2 == 0) {
+        const unescaped_quote = byte == '"' and backslash_run_length % 2 == 0;
+        if (unescaped_quote) {
+            if (!in_string) {
+                result.indexes[result.count] = @intCast(index);
+                result.count += 1;
+            }
             in_string = !in_string;
         }
 
@@ -179,6 +187,7 @@ fn scalarIndexJsonl(
         }
     }
 
+    try result.finish(input.len);
     return result;
 }
 
@@ -360,7 +369,7 @@ test "indexJsonl distinguishes newlines inside and outside strings" {
     defer index.deinit(testing.allocator);
     try expectValidIndexes(input.len, index.slice());
 
-    const expected = [_]u32{ 0, 7, 29, 31, 32, 33, 37, 38, 39, 40 };
+    const expected = [_]u32{ 0, 1, 7, 8, 29, 31, 32, 33, 34, 37, 38, 39, 40 };
     try testing.expectEqualSlices(u32, &expected, index.slice());
 }
 
@@ -448,9 +457,9 @@ test "indexJsonl preserves unterminated string state at boundary EOFs" {
     }
 }
 
-test "indexJsonl indexes each unquoted record boundary" {
+test "indexJsonl indexes record boundaries and opening quotes" {
     const input = "{\"a\":1}\n{\"b\":2}\n";
-    const expected = [_]u32{ 0, 4, 5, 6, 7, 8, 12, 13, 14, 15 };
+    const expected = [_]u32{ 0, 1, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15 };
 
     var index = try indexJsonl(testing.allocator, input);
     defer index.deinit(testing.allocator);

@@ -163,6 +163,7 @@ pub fn indexJsoncImpl(
         );
         chunk_offset += VLEN;
     }
+    try result.finish(input.len);
 
     return result;
 }
@@ -279,6 +280,7 @@ fn scalarIndexJsonc(
             backslash_run_length = 0;
         }
     }
+    try result.finish(input.len);
 
     return result;
 }

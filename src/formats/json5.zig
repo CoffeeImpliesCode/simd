@@ -207,6 +207,7 @@ pub fn indexJson5Impl(
             (backslash_mask & top_bit) != 0;
         previous_backslash_run_odd = trailing_backslash_parity;
     }
+    try result.finish(input.len);
 
     return result;
 }
@@ -362,6 +363,7 @@ fn scalarIndexJson5(
             backslash_run_length = 0;
         }
     }
+    try result.finish(input.len);
 
     return result;
 }
