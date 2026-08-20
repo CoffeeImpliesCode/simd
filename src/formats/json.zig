@@ -1,9 +1,23 @@
 const std = @import("std");
 const simd = @import("../core/simd.zig");
 const stage1 = @import("../core/stage1.zig");
+const ondemand = @import("../core/ondemand.zig");
 const stage2 = @import("../core/stage2.zig");
 
 const testing = std.testing;
+
+/// Builds an on-demand document backed by parser-owned structural storage.
+///
+/// The input must outlive the returned document.
+pub fn initOnDemandDocument(
+    parser: *ondemand.Parser,
+    allocator: std.mem.Allocator,
+    input: []const u8,
+) !ondemand.Document {
+    var structural_index = try indexJson(allocator, input);
+    defer structural_index.deinit(allocator);
+    return parser.initDocument(input, &structural_index);
+}
 
 /// Builds an owned, validated RFC JSON tape from the Stage1 structural index.
 pub fn buildJsonTape(

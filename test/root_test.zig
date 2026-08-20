@@ -9,6 +9,7 @@ test "refAllDecls" {
     testing.refAllDecls(lib.simd);
     testing.refAllDecls(lib.stage1);
     testing.refAllDecls(lib.stage2);
+    testing.refAllDecls(lib.ondemand);
     testing.refAllDecls(lib.debug);
     testing.refAllDecls(lib.formats);
     testing.refAllDecls(lib.formats.json);
@@ -109,4 +110,84 @@ test "corpus: Markdown indexing on document.md" {
 test "corpus: XML indexing on catalog.xml" {
     const xml_data = @embedFile("corpus/xml/catalog.xml");
     try expectTokenWidths(lib.formats.xml.indexXmlImpl, xml_data);
+}
+
+fn expectOnDemandEvent(
+    expected: lib.ondemand.Event,
+    actual: lib.ondemand.Event,
+) !void {
+    try testing.expectEqual(std.meta.activeTag(expected), std.meta.activeTag(actual));
+    switch (expected) {
+        .key => |raw| switch (actual) {
+            .key => |actual_raw| try testing.expectEqualStrings(raw, actual_raw),
+            else => unreachable,
+        },
+        .string => |raw| switch (actual) {
+            .string => |actual_raw| try testing.expectEqualStrings(raw, actual_raw),
+            else => unreachable,
+        },
+        .number => |raw| switch (actual) {
+            .number => |actual_raw| try testing.expectEqualStrings(raw, actual_raw),
+            else => unreachable,
+        },
+        .bool => |value| switch (actual) {
+            .bool => |actual_value| try testing.expectEqual(value, actual_value),
+            else => unreachable,
+        },
+        else => {},
+    }
+}
+
+test "on-demand Parser emits JSON events from quote-aware indexes" {
+    const input =
+        \\{"syntax{}[],:":"text { [ ] } , :","items":[42,true,false,null]}
+    ;
+    var parser = try lib.ondemand.Parser.init(testing.allocator, input.len);
+    defer parser.deinit();
+
+    var document = document: {
+        var structural_index = try lib.formats.json.indexJson(testing.allocator, input);
+        defer structural_index.deinit(testing.allocator);
+        break :document try parser.iterate(input, &structural_index);
+    };
+    defer document.deinit();
+    var reader = try document.eventReader();
+
+    try expectOnDemandEvent(.object_start, (try reader.next()).?);
+    try expectOnDemandEvent(.{ .key = "syntax{}[],:" }, (try reader.peek()).?);
+    try expectOnDemandEvent(.{ .key = "syntax{}[],:" }, (try reader.next()).?);
+    try expectOnDemandEvent(.{ .string = "text { [ ] } , :" }, (try reader.next()).?);
+    try expectOnDemandEvent(.{ .key = "items" }, (try reader.next()).?);
+    try expectOnDemandEvent(.array_start, (try reader.next()).?);
+    try expectOnDemandEvent(.{ .number = "42" }, (try reader.next()).?);
+    try expectOnDemandEvent(.{ .bool = true }, (try reader.next()).?);
+    try expectOnDemandEvent(.{ .bool = false }, (try reader.next()).?);
+    try expectOnDemandEvent(.null, (try reader.next()).?);
+    try expectOnDemandEvent(.array_end, (try reader.next()).?);
+    try expectOnDemandEvent(.object_end, (try reader.next()).?);
+    try testing.expect((try reader.next()) == null);
+}
+
+test "on-demand EventReader skips one nested JSON value" {
+    const input =
+        \\{"skip":{"quoted":"{ [ , : ] }","nested":[1,{"deep":false}]},"after":null}
+    ;
+    var parser = try lib.ondemand.Parser.init(testing.allocator, input.len);
+    defer parser.deinit();
+
+    var document = document: {
+        var structural_index = try lib.formats.json.indexJson(testing.allocator, input);
+        defer structural_index.deinit(testing.allocator);
+        break :document try parser.initDocument(input, &structural_index);
+    };
+    defer document.deinit();
+    var reader = try document.eventReader();
+
+    try expectOnDemandEvent(.object_start, (try reader.next()).?);
+    try expectOnDemandEvent(.{ .key = "skip" }, (try reader.next()).?);
+    try reader.skip();
+    try expectOnDemandEvent(.{ .key = "after" }, (try reader.next()).?);
+    try expectOnDemandEvent(.null, (try reader.next()).?);
+    try expectOnDemandEvent(.object_end, (try reader.next()).?);
+    try testing.expect((try reader.next()) == null);
 }

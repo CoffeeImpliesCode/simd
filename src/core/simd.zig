@@ -324,10 +324,10 @@ test "computeBackslashRuns handles u64 escaped-run parity" {
 fn expectCtzResultType(comptime T: type) void {
     comptime validateMaskType(T);
     const ctz_result_type = @TypeOf(@ctz(@as(T, 1)));
-    comptime assert(ctz_result_type == std.math.Log2Int(T));
+    comptime assert(ctz_result_type == std.math.Log2IntCeil(T));
 }
 
-test "@ctz returns Log2Int for every mask width" {
+test "@ctz returns Log2IntCeil for every mask width" {
     comptime {
         expectCtzResultType(u16);
         expectCtzResultType(u32);
