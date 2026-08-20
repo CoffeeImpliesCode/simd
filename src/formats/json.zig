@@ -5,18 +5,90 @@ const ondemand = @import("../core/ondemand.zig");
 const stage2 = @import("../core/stage2.zig");
 
 const testing = std.testing;
+const sentinel_count: usize = 3;
 
 /// Builds an on-demand document backed by parser-owned structural storage.
 ///
 /// The input must outlive the returned document.
 pub fn initOnDemandDocument(
     parser: *ondemand.Parser,
-    allocator: std.mem.Allocator,
     input: []const u8,
 ) !ondemand.Document {
-    var structural_index = try indexJson(allocator, input);
-    defer structural_index.deinit(allocator);
-    return parser.initDocument(input, &structural_index);
+    const indexes = try parser.prepareDocument(input);
+    const token_count = try indexJsonInto(simd.default_vector_len, indexes, input);
+    return parser.completeDocument(input, token_count);
+}
+
+test "on-demand JSON reuses parser-owned indexes without scratch allocation" {
+    const input = "{\"a\":[0,1,2,3,4,5,6,7,8,9]}";
+    const index_bytes = (input.len + sentinel_count) * @sizeOf(u32);
+    var storage: [index_bytes + 16]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+
+    var parser = try ondemand.Parser.init(fixed.allocator(), input.len);
+    defer parser.deinit();
+    const indexes_pointer = parser.indexes.ptr;
+
+    {
+        var document = try initOnDemandDocument(&parser, input);
+        defer document.deinit();
+        try testing.expectEqual(@as(u32, @intCast(input.len)), document.indexes[document.token_count]);
+        try testing.expectEqual(
+            @as(u32, @intCast(input.len)),
+            document.indexes[document.token_count + 1],
+        );
+        try testing.expectEqual(@as(u32, 0), document.indexes[document.token_count + 2]);
+    }
+
+    {
+        var document = try initOnDemandDocument(&parser, input);
+        defer document.deinit();
+        try testing.expectEqual(@intFromPtr(indexes_pointer), @intFromPtr(parser.indexes.ptr));
+    }
+}
+
+test "on-demand JSON grows in place without a temporary index" {
+    const input = "[0,1,2,3,4,5,6,7,8,9]";
+    const initial_bytes = sentinel_count * @sizeOf(u32);
+    const grown_bytes = (input.len + sentinel_count) * @sizeOf(u32);
+    var storage: [initial_bytes + grown_bytes + 16]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+
+    var parser = try ondemand.Parser.init(fixed.allocator(), 0);
+    defer parser.deinit();
+    {
+        var document = try initOnDemandDocument(&parser, input);
+        defer document.deinit();
+    }
+    const grown_indexes_pointer = parser.indexes.ptr;
+
+    {
+        var document = try initOnDemandDocument(&parser, input);
+        defer document.deinit();
+    }
+    try testing.expectEqual(@intFromPtr(grown_indexes_pointer), @intFromPtr(parser.indexes.ptr));
+}
+
+test "on-demand JSON grow policy survives parser resize" {
+    const first_input = "[0,1,2]";
+    const second_input = "[0,1,2,3,4,5,6,7,8,9]";
+
+    var parser = try ondemand.Parser.init(testing.allocator, 0);
+    defer parser.deinit();
+
+    {
+        var document = try initOnDemandDocument(&parser, first_input);
+        defer document.deinit();
+    }
+    const first_capacity = parser.capacity;
+
+    {
+        var document = try initOnDemandDocument(&parser, second_input);
+        defer document.deinit();
+    }
+
+    try testing.expect(parser.grow_on_demand);
+    try testing.expect(parser.capacity > first_capacity);
 }
 
 /// Builds an owned, validated RFC JSON tape from the Stage1 structural index.
@@ -49,7 +121,7 @@ pub fn validateJson(
 pub fn indexJson(
     allocator: std.mem.Allocator,
     input: []const u8,
-) !stage1.StructuralIndex {
+) stage1.StructuralIndex.InitError!stage1.StructuralIndex {
     return indexJsonImpl(simd.default_vector_len, allocator, input);
 }
 
@@ -57,17 +129,37 @@ pub fn indexJsonImpl(
     comptime VLEN: usize,
     allocator: std.mem.Allocator,
     input: []const u8,
-) !stage1.StructuralIndex {
-    const Mask = simd.Mask(VLEN);
-    const Shift = std.math.Log2Int(Mask);
-
+) stage1.StructuralIndex.InitError!stage1.StructuralIndex {
     if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
 
     var indexes = try stage1.StructuralIndex.init(allocator, input.len);
     errdefer indexes.deinit(allocator);
 
+    indexes.count = indexJsonInto(
+        VLEN,
+        indexes.indexes[0 .. indexes.indexes.len - sentinel_count],
+        input,
+    ) catch |err| switch (err) {
+        error.CapacityExceeded => unreachable,
+        error.InputTooLarge => return error.InputTooLarge,
+    };
+    try indexes.finish(input.len);
+    return indexes;
+}
+
+fn indexJsonInto(
+    comptime VLEN: usize,
+    indexes: []u32,
+    input: []const u8,
+) !usize {
+    const Mask = simd.Mask(VLEN);
+    const Shift = std.math.Log2Int(Mask);
+
+    if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
+
     var windows = simd.windows(u8, VLEN, input, 0);
     var base_offset: usize = 0;
+    var index_count: usize = 0;
     var prev_in_string = false;
     var prev_ends_in_backslash = false;
     var prev_backslash_run_odd = false;
@@ -124,11 +216,12 @@ pub fn indexJsonImpl(
             base_offset,
             &candidate_indexes,
         );
+        if (candidate_count > indexes.len - index_count) return error.CapacityExceeded;
         @memcpy(
-            indexes.indexes[indexes.count..][0..candidate_count],
+            indexes[index_count..][0..candidate_count],
             candidate_indexes[0..candidate_count],
         );
-        indexes.count += candidate_count;
+        index_count += candidate_count;
 
         prev_in_string = (inside_without_closing & top_bit) != 0;
         prev_ends_in_backslash = valid_count == VLEN and
@@ -145,8 +238,7 @@ pub fn indexJsonImpl(
         base_offset += VLEN;
     }
 
-    try indexes.finish(input.len);
-    return indexes;
+    return index_count;
 }
 
 fn validByteMask(comptime VLEN: usize, valid_count: usize) simd.Mask(VLEN) {

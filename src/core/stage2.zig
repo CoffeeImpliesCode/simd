@@ -353,14 +353,13 @@ const Parser = struct {
             }
         }
 
-        const count_payload = try payloadFromUsize(entry.count);
         const open_index: usize = @intCast(entry.tape_index);
         if (self.tape) |tape| {
-            tape.items[open_index].payload = count_payload;
+            tape.items[open_index].payload = try self.encodeTapePayload(entry.count);
         }
         _ = try self.emit(
             if (is_array) .array_end else .object_end,
-            try payloadFromUsize(open_index),
+            try self.encodeTapePayload(open_index),
             close_offset,
         );
         _ = self.depth.pop();
@@ -406,7 +405,7 @@ const Parser = struct {
             &self.failure_offset,
         );
         self.byte_position = token.end_offset;
-        const payload = try payloadFromUsize(token.content_length);
+        const payload = try self.encodeTapePayload(token.content_length);
 
         if (is_key) {
             _ = try self.emit(.key, payload, quote_offset);
@@ -494,6 +493,15 @@ const Parser = struct {
         };
     }
 
+    fn encodeTapePayload(
+        self: *const Parser,
+        value: usize,
+    ) error{TapeTooLarge}!u24 {
+        if (self.tape == null) return 0;
+        if (value > std.math.maxInt(u24)) return error.TapeTooLarge;
+        return @intCast(value);
+    }
+
     fn emit(
         self: *Parser,
         kind: TapeKind,
@@ -517,6 +525,49 @@ const Parser = struct {
     }
 };
 
+fn firstInvalidUtf8Byte(input: []const u8) ?usize {
+    var index: usize = 0;
+    while (index < input.len) {
+        const first = input[index];
+        if (first < 0x80) {
+            index += 1;
+            continue;
+        }
+
+        const sequence_length: usize = switch (first) {
+            0xC2...0xDF => 2,
+            0xE0...0xEF => 3,
+            0xF0...0xF4 => 4,
+            else => return index,
+        };
+        if (input.len - index < sequence_length) return index;
+
+        if (!isValidUtf8SecondByte(first, input[index + 1])) return index + 1;
+        var continuation_offset: usize = 2;
+        while (continuation_offset < sequence_length) : (continuation_offset += 1) {
+            if (!isUtf8Continuation(input[index + continuation_offset])) {
+                return index + continuation_offset;
+            }
+        }
+        index += sequence_length;
+    }
+    return null;
+}
+
+fn isValidUtf8SecondByte(first: u8, second: u8) bool {
+    return switch (first) {
+        0xE0 => second >= 0xA0 and second <= 0xBF,
+        0xED => second >= 0x80 and second <= 0x9F,
+        0xF0 => second >= 0x90 and second <= 0xBF,
+        0xF4 => second >= 0x80 and second <= 0x8F,
+        else => isUtf8Continuation(second),
+    };
+}
+
+fn isUtf8Continuation(byte: u8) bool {
+    return byte >= 0x80 and byte <= 0xBF;
+}
+
 fn validateString(
     input: []const u8,
     quote_offset: usize,
@@ -532,7 +583,8 @@ fn validateString(
         if (byte == '"') {
             const content = input[content_start..index];
             if (!std.unicode.utf8ValidateSlice(content)) {
-                failure_offset.* = content_start;
+                const invalid_offset = firstInvalidUtf8Byte(content) orelse unreachable;
+                failure_offset.* = content_start + invalid_offset;
                 return error.InvalidUtf8;
             }
             return .{
@@ -681,11 +733,6 @@ fn invalidNumberByte(byte: u8) Error {
     };
 }
 
-fn payloadFromUsize(value: usize) error{TapeTooLarge}!u24 {
-    if (value > std.math.maxInt(u24)) return error.TapeTooLarge;
-    return @intCast(value);
-}
-
 fn classifyUnindexed(byte: u8) Error {
     return switch (byte) {
         '+', '.' => error.InvalidNumber,
@@ -830,6 +877,80 @@ test "validate carries lexical and container diagnostic offsets" {
         "[0 \"\\q\"]",
     );
     try testing.expectEqual(@as(usize, 3), string_without_separator.byte_offset);
+}
+
+test "validate locates the first invalid UTF-8 byte" {
+    const cases = [_]struct {
+        input: []const u8,
+        expected_offset: usize,
+    }{
+        .{
+            .input = &[_]u8{ '[', '"', 'a', 0xFF, '"', ']' },
+            .expected_offset = 3,
+        },
+        .{
+            .input = &[_]u8{ '[', '"', 0xE2, '(', 0xA1, '"', ']' },
+            .expected_offset = 3,
+        },
+        .{
+            .input = &[_]u8{ '[', '"', 0xE2, 0x82, 'A', '"', ']' },
+            .expected_offset = 4,
+        },
+        .{
+            .input = &[_]u8{ '[', '"', 0xF0, 0x90, 0x80, 'A', '"', ']' },
+            .expected_offset = 5,
+        },
+        .{
+            .input = &[_]u8{ '[', '"', 0xE0, 0x9F, 0x80, '"', ']' },
+            .expected_offset = 3,
+        },
+        .{
+            .input = &[_]u8{ '[', '"', 0xED, 0xA0, 0x80, '"', ']' },
+            .expected_offset = 3,
+        },
+        .{
+            .input = &[_]u8{ '[', '"', 0xF4, 0x90, 0x80, 0x80, '"', ']' },
+            .expected_offset = 3,
+        },
+        .{
+            .input = &[_]u8{ '[', '"', 0xE2, '"', ']' },
+            .expected_offset = 2,
+        },
+    };
+
+    for (cases) |case| {
+        const diagnostic = try expectStage2Diagnostic(error.InvalidUtf8, case.input);
+        try testing.expectEqual(case.expected_offset, diagnostic.byte_offset);
+    }
+}
+
+test "TapeWord payload encoding never truncates u24 values" {
+    const payload_max: usize = std.math.maxInt(u24);
+    const payload_too_large = payload_max + 1;
+
+    const validating_parser = Parser{
+        .input = &.{},
+        .indexes = &.{},
+    };
+    try testing.expectEqual(
+        @as(u24, 0),
+        try validating_parser.encodeTapePayload(payload_too_large),
+    );
+
+    var tape: std.ArrayList(TapeWord) = .empty;
+    const building_parser = Parser{
+        .input = &.{},
+        .indexes = &.{},
+        .tape = &tape,
+    };
+    try testing.expectEqual(
+        std.math.maxInt(u24),
+        try building_parser.encodeTapePayload(payload_max),
+    );
+    try testing.expectError(
+        error.TapeTooLarge,
+        building_parser.encodeTapePayload(payload_too_large),
+    );
 }
 
 test "buildTape validates nested JSON and backpatches containers" {

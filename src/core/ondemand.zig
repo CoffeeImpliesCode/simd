@@ -43,8 +43,8 @@ pub const InitError = std.mem.Allocator.Error || error{
 pub const Parser = struct {
     allocator: std.mem.Allocator,
     indexes: []u32,
-    string_buf: []u8,
     capacity: usize,
+    grow_on_demand: bool,
     generation: u64 = 0,
     document_active: bool = false,
 
@@ -57,20 +57,16 @@ pub const Parser = struct {
         ) catch return error.CapacityOverflow;
 
         const indexes = try allocator.alloc(u32, index_capacity);
-        errdefer allocator.free(indexes);
-        const string_buf = try allocator.alloc(u8, max_capacity);
-
         return .{
             .allocator = allocator,
             .indexes = indexes,
-            .string_buf = string_buf,
             .capacity = max_capacity,
+            .grow_on_demand = max_capacity == 0,
         };
     }
 
     pub fn deinit(self: *Parser) void {
         std.debug.assert(!self.document_active);
-        self.allocator.free(self.string_buf);
         self.allocator.free(self.indexes);
         self.* = undefined;
     }
@@ -79,7 +75,7 @@ pub const Parser = struct {
         var required_capacity = input_length;
         if (index_count > required_capacity) required_capacity = index_count;
         if (required_capacity <= self.capacity) return;
-        if (self.capacity != 0) return error.CapacityExceeded;
+        if (!self.grow_on_demand) return error.CapacityExceeded;
 
         const index_capacity = std.math.add(
             usize,
@@ -87,14 +83,33 @@ pub const Parser = struct {
             sentinel_count,
         ) catch return error.CapacityOverflow;
         const indexes = try self.allocator.alloc(u32, index_capacity);
-        errdefer self.allocator.free(indexes);
-        const string_buf = try self.allocator.alloc(u8, required_capacity);
 
         self.allocator.free(self.indexes);
-        self.allocator.free(self.string_buf);
         self.indexes = indexes;
-        self.string_buf = string_buf;
         self.capacity = required_capacity;
+    }
+
+    /// Reserves parser-owned structural storage for one document.
+    ///
+    /// The returned slice excludes the three sentinel slots. Call
+    /// `completeDocument` after filling the slice.
+    pub fn prepareDocument(self: *Parser, input: []const u8) Error![]u32 {
+        if (self.document_active) return error.DocumentActive;
+        if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
+        try self.ensureCapacity(input.len, input.len);
+        return self.indexes[0 .. self.indexes.len - sentinel_count];
+    }
+
+    /// Completes a document whose structural indexes were filled in-place.
+    pub fn completeDocument(
+        self: *Parser,
+        input: []const u8,
+        token_count: usize,
+    ) Error!Document {
+        if (self.document_active) return error.DocumentActive;
+        if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
+        try self.ensureCapacity(input.len, token_count);
+        return self.finishOwnedDocument(input, token_count);
     }
 
     pub fn initDocument(
@@ -107,32 +122,21 @@ pub const Parser = struct {
         if (structural_index.count > input.len) return error.InvalidStructuralIndex;
         try self.ensureCapacity(input.len, structural_index.count);
 
+        try validateStructuralIndex(input, structural_index);
         const source_count = std.math.add(
             usize,
             structural_index.count,
             sentinel_count,
         ) catch return error.InvalidStructuralIndex;
-        if (source_count > structural_index.indexes.len) {
+        if (source_count > self.indexes.len) {
             return error.InvalidStructuralIndex;
         }
-        try validateStructuralIndex(input, structural_index);
 
         @memcpy(
             self.indexes[0..source_count],
             structural_index.indexes[0..source_count],
         );
-        self.generation +%= 1;
-        if (self.generation == 0) self.generation = 1;
-        self.document_active = true;
-
-        return .{
-            .parser = self,
-            .input = input,
-            .indexes = self.indexes[0..source_count],
-            .string_buf = self.string_buf,
-            .token_count = structural_index.count,
-            .generation = self.generation,
-        };
+        return self.finishOwnedDocument(input, structural_index.count);
     }
 
     pub fn iterate(
@@ -141,6 +145,42 @@ pub const Parser = struct {
         structural_index: *const stage1.StructuralIndex,
     ) Error!Document {
         return self.initDocument(input, structural_index);
+    }
+
+    fn finishOwnedDocument(
+        self: *Parser,
+        input: []const u8,
+        token_count: usize,
+    ) Error!Document {
+        if (token_count > input.len) return error.InvalidStructuralIndex;
+        const source_count = std.math.add(
+            usize,
+            token_count,
+            sentinel_count,
+        ) catch return error.InvalidStructuralIndex;
+        if (source_count > self.indexes.len) {
+            return error.InvalidStructuralIndex;
+        }
+
+        const sentinel: u32 = @intCast(input.len);
+        self.indexes[token_count..][0..sentinel_count].* = .{
+            sentinel,
+            sentinel,
+            0,
+        };
+        try validateIndexes(input, self.indexes, token_count);
+
+        self.generation +%= 1;
+        if (self.generation == 0) self.generation = 1;
+        self.document_active = true;
+
+        return .{
+            .parser = self,
+            .input = input,
+            .indexes = self.indexes[0..source_count],
+            .token_count = token_count,
+            .generation = self.generation,
+        };
     }
 };
 
@@ -162,7 +202,6 @@ pub const Document = struct {
     parser: *Parser,
     input: []const u8,
     indexes: []const u32,
-    string_buf: []u8,
     token_count: usize,
     generation: u64,
     position_index: usize = 0,
@@ -651,9 +690,21 @@ fn validateStructuralIndex(
     input: []const u8,
     structural_index: *const stage1.StructuralIndex,
 ) Error!void {
-    const count = structural_index.count;
+    return validateIndexes(input, structural_index.indexes, structural_index.count);
+}
+
+fn validateIndexes(
+    input: []const u8,
+    indexes: []const u32,
+    count: usize,
+) Error!void {
+    const source_count = std.math.add(usize, count, sentinel_count) catch {
+        return error.InvalidStructuralIndex;
+    };
+    if (source_count > indexes.len) return error.InvalidStructuralIndex;
+
     var previous: ?u32 = null;
-    for (structural_index.indexes[0..count]) |offset| {
+    for (indexes[0..count]) |offset| {
         if (offset >= input.len) return error.InvalidStructuralIndex;
         if (previous) |previous_offset| {
             if (offset <= previous_offset) return error.InvalidStructuralIndex;
@@ -662,15 +713,9 @@ fn validateStructuralIndex(
     }
 
     const sentinel: u32 = @intCast(input.len);
-    if (structural_index.indexes[count] != sentinel) {
-        return error.InvalidStructuralIndex;
-    }
-    if (structural_index.indexes[count + 1] != sentinel) {
-        return error.InvalidStructuralIndex;
-    }
-    if (structural_index.indexes[count + 2] != 0) {
-        return error.InvalidStructuralIndex;
-    }
+    if (indexes[count] != sentinel) return error.InvalidStructuralIndex;
+    if (indexes[count + 1] != sentinel) return error.InvalidStructuralIndex;
+    if (indexes[count + 2] != 0) return error.InvalidStructuralIndex;
 }
 
 fn validateString(input: []const u8, quote_offset: u32) Error!StringToken {
@@ -901,7 +946,7 @@ fn expectEvent(expected: Event, actual: Event) !void {
     }
 }
 
-test "Parser owns scratch and enforces one document and focus" {
+test "Parser owns indexes and enforces one document and focus" {
     const input = "[0]";
     var structural_index = try indexForTest(testing.allocator, input);
     defer structural_index.deinit(testing.allocator);
@@ -918,6 +963,38 @@ test "Parser owns scratch and enforces one document and focus" {
     var stale = cursor;
     _ = try cursor.advance();
     try testing.expectError(error.OutOfOrderIteration, stale.advance());
+}
+
+test "Parser preserves grow-on-demand policy across resizes" {
+    const first_input = "[0,1,2]";
+    const second_input = "[0,1,2,3,4,5,6,7,8,9]";
+
+    var parser = try Parser.init(testing.allocator, 0);
+    defer parser.deinit();
+    try testing.expect(parser.grow_on_demand);
+
+    var first_capacity: usize = 0;
+    {
+        const first_indexes = try parser.prepareDocument(first_input);
+        for (first_input, 0..) |_, offset| {
+            first_indexes[offset] = @intCast(offset);
+        }
+        var first_document = try parser.completeDocument(first_input, first_input.len);
+        defer first_document.deinit();
+        first_capacity = parser.capacity;
+        try testing.expect(first_capacity >= first_input.len);
+    }
+
+    const second_indexes = try parser.prepareDocument(second_input);
+    for (second_input, 0..) |_, offset| {
+        second_indexes[offset] = @intCast(offset);
+    }
+    var second_document = try parser.completeDocument(second_input, second_input.len);
+    defer second_document.deinit();
+
+    try testing.expect(parser.grow_on_demand);
+    try testing.expect(parser.capacity >= second_input.len);
+    try testing.expect(parser.capacity > first_capacity);
 }
 
 test "TokenCursor exposes sentinels and skips one nested child" {
