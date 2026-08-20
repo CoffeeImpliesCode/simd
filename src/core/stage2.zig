@@ -1,4 +1,5 @@
 const std = @import("std");
+const simd = @import("simd.zig");
 const stage1 = @import("stage1.zig");
 
 const testing = std.testing;
@@ -1032,46 +1033,42 @@ const Parser = struct {
 };
 
 fn firstInvalidUtf8Byte(input: []const u8) ?usize {
-    var index: usize = 0;
-    while (index < input.len) {
-        const first = input[index];
-        if (first < 0x80) {
-            index += 1;
-            continue;
-        }
-
-        const sequence_length: usize = switch (first) {
-            0xC2...0xDF => 2,
-            0xE0...0xEF => 3,
-            0xF0...0xF4 => 4,
-            else => return index,
-        };
-        if (input.len - index < sequence_length) return index;
-
-        if (!isValidUtf8SecondByte(first, input[index + 1])) return index + 1;
-        var continuation_offset: usize = 2;
-        while (continuation_offset < sequence_length) : (continuation_offset += 1) {
-            if (!isUtf8Continuation(input[index + continuation_offset])) {
-                return index + continuation_offset;
-            }
-        }
-        index += sequence_length;
-    }
-    return null;
-}
-
-fn isValidUtf8SecondByte(first: u8, second: u8) bool {
-    return switch (first) {
-        0xE0 => second >= 0xA0 and second <= 0xBF,
-        0xED => second >= 0x80 and second <= 0x9F,
-        0xF0 => second >= 0x90 and second <= 0xBF,
-        0xF4 => second >= 0x80 and second <= 0x8F,
-        else => isUtf8Continuation(second),
+    return switch (simd.validateUtf8(input)) {
+        .valid => null,
+        .invalid => |error_info| switch (error_info.kind) {
+            .missing_continuation => legacyMissingContinuationOffset(
+                input,
+                error_info.offset,
+            ),
+            else => error_info.offset,
+        },
     };
 }
 
-fn isUtf8Continuation(byte: u8) bool {
-    return byte >= 0x80 and byte <= 0xBF;
+fn legacyMissingContinuationOffset(input: []const u8, missing_offset: usize) usize {
+    if (missing_offset == 0 or missing_offset >= input.len) return missing_offset;
+
+    var sequence_start = missing_offset;
+    while (sequence_start > 0) {
+        const previous = input[sequence_start - 1];
+        if (previous < 0x80 or previous > 0xBF) break;
+        sequence_start -= 1;
+    }
+    if (sequence_start == 0) return missing_offset;
+
+    const header_offset = sequence_start - 1;
+    const sequence_length: usize = switch (input[header_offset]) {
+        0xC0...0xC1 => return header_offset,
+        0xC2...0xDF => 2,
+        0xE0...0xEF => 3,
+        0xF0...0xF4 => 4,
+        else => return missing_offset,
+    };
+
+    // The legacy UTF-8 validator checked total sequence length before
+    // continuation bytes, so an incomplete sequence points at its header.
+    if (input.len - header_offset < sequence_length) return header_offset;
+    return missing_offset;
 }
 
 fn validateString(
@@ -1100,8 +1097,7 @@ fn validateString(
         const byte = input[index];
         if (byte == quote) {
             const content = input[content_start..index];
-            if (!std.unicode.utf8ValidateSlice(content)) {
-                const invalid_offset = firstInvalidUtf8Byte(content) orelse unreachable;
+            if (firstInvalidUtf8Byte(content)) |invalid_offset| {
                 failure_offset.* = content_start + invalid_offset;
                 return error.InvalidUtf8;
             }
@@ -1718,17 +1714,23 @@ fn decodeJson5IdentifierCodepoint(
 ) Error!Json5IdentifierCodepoint {
     const width: usize = @intCast(std.unicode.utf8ByteSequenceLength(input[byte_offset]) catch {
         failure_offset.* = byte_offset;
+        if (firstInvalidUtf8Byte(input[byte_offset .. byte_offset + 1])) |invalid_offset| {
+            failure_offset.* = byte_offset + invalid_offset;
+        }
         return error.InvalidUtf8;
     });
     if (input.len - byte_offset < width) {
         failure_offset.* = byte_offset;
         return error.InvalidUtf8;
     }
-    const codepoint = std.unicode.utf8Decode(input[byte_offset .. byte_offset + width]) catch {
+
+    const sequence = input[byte_offset .. byte_offset + width];
+    if (firstInvalidUtf8Byte(sequence)) |invalid_offset| {
+        failure_offset.* = byte_offset + invalid_offset;
+        return error.InvalidUtf8;
+    }
+    const codepoint = std.unicode.utf8Decode(sequence) catch {
         failure_offset.* = byte_offset;
-        if (firstInvalidUtf8Byte(input[byte_offset .. byte_offset + width])) |invalid_offset| {
-            failure_offset.* = byte_offset + invalid_offset;
-        }
         return error.InvalidUtf8;
     };
     return .{ .codepoint = codepoint, .width = width };

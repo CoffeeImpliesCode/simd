@@ -1393,8 +1393,23 @@ const XmlParser = struct {
     }
 
     fn validateSource(self: *XmlParser) void {
+        const invalid_utf8_offset: ?usize = switch (simd.validateUtf8(self.input)) {
+            .valid => null,
+            .invalid => |error_info| utf8SequenceStart(
+                self.input,
+                error_info.offset,
+            ),
+        };
+
         var source_index: usize = 0;
         while (source_index < self.input.len) {
+            if (invalid_utf8_offset) |offset| {
+                if (source_index >= offset) {
+                    self.source_error = error.InvalidUtf8;
+                    self.source_failure_offset = offset;
+                    return;
+                }
+            }
             const decoded = decodeXml(self.input, source_index) orelse {
                 self.source_error = error.InvalidUtf8;
                 self.source_failure_offset = source_index;
@@ -1837,6 +1852,29 @@ fn skipXmlWhitespace(input: []const u8, start: usize) usize {
     var cursor = start;
     while (cursor < input.len and isXmlWhitespace(input[cursor])) : (cursor += 1) {}
     return cursor;
+}
+
+fn utf8SequenceStart(input: []const u8, invalid_offset: usize) usize {
+    var sequence_start = @min(invalid_offset, input.len);
+    var continuation_count: usize = 0;
+    while (sequence_start > 0 and
+        input[sequence_start - 1] >= 0x80 and
+        input[sequence_start - 1] <= 0xBF)
+    {
+        sequence_start -= 1;
+        continuation_count += 1;
+    }
+    if (sequence_start == 0) return invalid_offset;
+
+    const lead = input[sequence_start - 1];
+    const expected_continuations: usize = switch (lead) {
+        0xC0...0xDF => 1,
+        0xE0...0xEF => 2,
+        0xF0...0xF4 => 3,
+        else => 0,
+    };
+    if (continuation_count < expected_continuations) return sequence_start - 1;
+    return invalid_offset;
 }
 
 fn decodeXml(input: []const u8, index: usize) ?XmlDecoded {

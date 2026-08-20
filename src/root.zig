@@ -30,6 +30,7 @@ pub const formats = struct {
     pub const json5 = @import("formats/json5.zig");
     pub const markdown = @import("formats/markdown.zig");
     pub const xml = @import("formats/xml.zig");
+    pub const yaml = @import("formats/yaml.zig");
 };
 
 test "refAllDecls" {

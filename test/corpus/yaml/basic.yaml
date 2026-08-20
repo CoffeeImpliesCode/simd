@@ -1,0 +1,7 @@
+---
+name: Ada
+items:
+  - one
+  - 'two' # trailing comment
+metadata: {language: "Zig", level: basic}
+...

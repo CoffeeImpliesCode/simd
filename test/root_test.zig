@@ -19,6 +19,7 @@ test "refAllDecls" {
     testing.refAllDecls(lib.formats.json5);
     testing.refAllDecls(lib.formats.markdown);
     testing.refAllDecls(lib.formats.xml);
+    testing.refAllDecls(lib.formats.yaml);
 }
 
 test "core: prefixXor matches mathematical parity" {
@@ -126,6 +127,12 @@ test "upstream corpus manifests pin provenance for offline tests" {
             .revision = "9b61db9f5dbffa545f4b8d78422167083a8568c59bd1129f94138f936cf6fc1f",
             .offline_rule = "Tests must not access the network.",
         },
+        .{
+            .contents = @embedFile("corpus/upstream/yaml/MANIFEST.md"),
+            .source = "https://github.com/yaml/yaml-test-suite",
+            .revision = "6e6c296ae9c9d2d5c4134b4b64d01b29ac19ff6f",
+            .offline_rule = "Tests must read only checked-in corpus files and metadata.",
+        },
     };
 
     for (manifests) |manifest| {
@@ -164,6 +171,11 @@ test "corpus: Markdown indexing on document.md" {
 test "corpus: XML indexing on catalog.xml" {
     const xml_data = @embedFile("corpus/xml/catalog.xml");
     try expectTokenWidths(lib.formats.xml.indexXmlImpl, xml_data);
+}
+
+test "corpus: YAML indexing on basic.yaml" {
+    const yaml_data = @embedFile("corpus/yaml/basic.yaml");
+    try expectStructuralWidths(lib.formats.yaml.indexYamlImpl, yaml_data);
 }
 test "public Stage 2 JSON corpus builds validates and exposes raw spans" {
     const input = @embedFile("corpus/json/example_config.json");
@@ -447,6 +459,114 @@ test "public Stage 2 XML catalog exposes source spans and matching errors" {
     try testing.expectEqual(@as(usize, 8), diagnostic.byte_offset);
     try testing.expectEqual(@as(u32, 1), diagnostic.line);
     try testing.expectEqual(@as(u32, 9), diagnostic.column);
+}
+
+test "public YAML corpus exposes index, tape, diagnostics, and unsupported results" {
+    const input = @embedFile("corpus/yaml/basic.yaml");
+
+    try testing.expect((try lib.formats.yaml.validateYaml(
+        testing.allocator,
+        input,
+    )) == null);
+
+    var index = try lib.formats.yaml.indexYaml(testing.allocator, input);
+    defer index.deinit(testing.allocator);
+    try testing.expect((try lib.formats.yaml.validateYamlIndex(
+        testing.allocator,
+        input,
+        &index,
+    )) == null);
+
+    var document = try lib.formats.yaml.buildYamlTape(testing.allocator, input);
+    defer document.deinit(testing.allocator);
+    try testing.expectEqual(index.count, document.tape.len);
+
+    var cursor = try document.root(input);
+    try testing.expectEqual(
+        lib.formats.yaml.YamlTokenKind.document_start,
+        (try cursor.peek()).tapeKind(),
+    );
+    for (document.tape, 0..) |word, tape_index| {
+        try testing.expectEqual(index.kinds[tape_index], word.tapeKind());
+        try testing.expectEqual(index.indexes[tape_index], word.offset);
+        try testing.expectEqual(
+            @as(usize, index.lengths[tape_index]),
+            word.sourceLength(),
+        );
+        switch (word.tapeKind()) {
+            .key, .scalar => {
+                const span = try cursor.span();
+                try testing.expect(span.ptr == input.ptr + @as(usize, word.offset));
+                try testing.expectEqual(word.sourceLength(), span.len);
+            },
+            else => {},
+        }
+        try cursor.advance();
+    }
+
+    const invalid_input = "name: [Ada,]\n";
+    const invalid = (try lib.formats.yaml.validateYaml(
+        testing.allocator,
+        invalid_input,
+    )).?;
+    try testing.expectEqual(error.Invalid, invalid.err);
+    try testing.expectEqual(
+        lib.formats.yaml.YamlDiagnosticKind.syntax,
+        invalid.kind,
+    );
+    try testing.expectEqual(@as(u32, 1), invalid.line);
+    try testing.expect(invalid.column > 1);
+    try testing.expect(invalid.byte_offset < invalid_input.len);
+    const direct = lib.formats.yaml.yamlDiagnosticAt(
+        invalid_input,
+        error.Invalid,
+        invalid.byte_offset,
+    );
+    try testing.expectEqual(invalid.byte_offset, direct.byte_offset);
+    try testing.expectEqual(invalid.snippet_start, direct.snippet_start);
+
+    const unsupported_input = "%YAML 1.2\nname: Ada\n";
+    const unsupported = (try lib.formats.yaml.validateYaml(
+        testing.allocator,
+        unsupported_input,
+    )).?;
+    try testing.expectEqual(error.Unsupported, unsupported.err);
+    try testing.expectEqual(
+        lib.formats.yaml.YamlDiagnosticKind.unsupported,
+        unsupported.kind,
+    );
+    try testing.expectError(
+        error.Unsupported,
+        lib.formats.yaml.buildYamlTape(testing.allocator, unsupported_input),
+    );
+}
+
+test "public YAML stream matches one-shot index across byte feeds" {
+    const input = @embedFile("corpus/yaml/basic.yaml");
+    var expected = try lib.formats.yaml.indexYaml(testing.allocator, input);
+    defer expected.deinit(testing.allocator);
+
+    var stream = try lib.formats.yaml.YamlStreamIndexer.init(testing.allocator, 1);
+    defer stream.deinit();
+    for (input, 0..) |_, offset| {
+        try stream.feed(input[offset .. offset + 1]);
+    }
+    try stream.finish();
+
+    var actual = stream.take();
+    defer actual.deinit(testing.allocator);
+    try testing.expectEqual(expected.count, actual.count);
+    try testing.expectEqualSlices(u32, expected.slice(), actual.slice());
+    try testing.expectEqualSlices(
+        lib.formats.yaml.YamlTokenKind,
+        expected.kinds[0..expected.count],
+        actual.kinds[0..actual.count],
+    );
+    try testing.expectEqualSlices(
+        u32,
+        expected.lengths[0..expected.count],
+        actual.lengths[0..actual.count],
+    );
 }
 
 test "public JSON cursor keeps exact input and document live through nested navigation" {

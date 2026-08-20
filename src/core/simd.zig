@@ -197,6 +197,494 @@ pub fn extractBitIndexes(
     return written;
 }
 
+pub const Utf8ErrorKind = enum(u8) {
+    invalid_header,
+    unexpected_continuation,
+    missing_continuation,
+    truncated_sequence,
+    overlong,
+    surrogate,
+    too_large,
+};
+
+pub const Utf8Error = struct {
+    kind: Utf8ErrorKind,
+    offset: usize,
+};
+
+pub const Utf8Result = union(enum) {
+    valid,
+    invalid: Utf8Error,
+};
+
+const Utf8BlockState = struct {
+    continuation_count: u2 = 0,
+    constrained_header: u8 = 0,
+};
+
+fn utf8Invalid(kind: Utf8ErrorKind, offset: usize) Utf8Result {
+    return .{ .invalid = .{
+        .kind = kind,
+        .offset = offset,
+    } };
+}
+
+fn utf8Continuation(byte: u8) bool {
+    return byte >= 0x80 and byte <= 0xbf;
+}
+
+fn validateUtf8Scalar(input: []const u8) Utf8Result {
+    var offset: usize = 0;
+    while (offset < input.len) {
+        const header = input[offset];
+        if (header <= 0x7f) {
+            offset += 1;
+            continue;
+        }
+        if (header <= 0xbf) {
+            return utf8Invalid(.unexpected_continuation, offset);
+        }
+        if (header <= 0xc1) {
+            if (offset + 1 >= input.len) {
+                return utf8Invalid(.truncated_sequence, offset);
+            }
+            if (!utf8Continuation(input[offset + 1])) {
+                return utf8Invalid(.missing_continuation, offset + 1);
+            }
+            return utf8Invalid(.overlong, offset);
+        }
+        if (header <= 0xdf) {
+            if (offset + 1 >= input.len) {
+                return utf8Invalid(.truncated_sequence, offset);
+            }
+            if (!utf8Continuation(input[offset + 1])) {
+                return utf8Invalid(.missing_continuation, offset + 1);
+            }
+            offset += 2;
+            continue;
+        }
+        if (header <= 0xef) {
+            if (offset + 1 >= input.len) {
+                return utf8Invalid(.truncated_sequence, offset);
+            }
+            const continuation_1 = input[offset + 1];
+            if (!utf8Continuation(continuation_1)) {
+                return utf8Invalid(.missing_continuation, offset + 1);
+            }
+            if (header == 0xe0 and continuation_1 < 0xa0) {
+                return utf8Invalid(.overlong, offset + 1);
+            }
+            if (header == 0xed and continuation_1 >= 0xa0) {
+                return utf8Invalid(.surrogate, offset + 1);
+            }
+            if (offset + 2 >= input.len) {
+                return utf8Invalid(.truncated_sequence, offset);
+            }
+            if (!utf8Continuation(input[offset + 2])) {
+                return utf8Invalid(.missing_continuation, offset + 2);
+            }
+            offset += 3;
+            continue;
+        }
+        if (header <= 0xf4) {
+            if (offset + 1 >= input.len) {
+                return utf8Invalid(.truncated_sequence, offset);
+            }
+            const continuation_1 = input[offset + 1];
+            if (!utf8Continuation(continuation_1)) {
+                return utf8Invalid(.missing_continuation, offset + 1);
+            }
+            if (header == 0xf0 and continuation_1 < 0x90) {
+                return utf8Invalid(.overlong, offset + 1);
+            }
+            if (header == 0xf4 and continuation_1 > 0x8f) {
+                return utf8Invalid(.too_large, offset + 1);
+            }
+            if (offset + 2 >= input.len) {
+                return utf8Invalid(.truncated_sequence, offset);
+            }
+            if (!utf8Continuation(input[offset + 2])) {
+                return utf8Invalid(.missing_continuation, offset + 2);
+            }
+            if (offset + 3 >= input.len) {
+                return utf8Invalid(.truncated_sequence, offset);
+            }
+            if (!utf8Continuation(input[offset + 3])) {
+                return utf8Invalid(.missing_continuation, offset + 3);
+            }
+            offset += 4;
+            continue;
+        }
+        if (header <= 0xf7) {
+            return utf8Invalid(.too_large, offset);
+        }
+        return utf8Invalid(.invalid_header, offset);
+    }
+    return .valid;
+}
+
+fn utf8ContinuationMask(comptime len: usize, count: u2) Mask(len) {
+    return switch (count) {
+        0 => 0,
+        1 => 0b001,
+        2 => 0b011,
+        3 => 0b111,
+    };
+}
+
+fn utf8ConstrainedContinuationValid(header: u8, continuation: u8) bool {
+    return switch (header) {
+        0xe0 => continuation >= 0xa0 and continuation <= 0xbf,
+        0xed => continuation >= 0x80 and continuation <= 0x9f,
+        0xf0 => continuation >= 0x90 and continuation <= 0xbf,
+        0xf4 => continuation >= 0x80 and continuation <= 0x8f,
+        else => true,
+    };
+}
+
+fn utf8BlockIsValid(
+    comptime len: usize,
+    bytes: Vec(len, u8),
+    state: *Utf8BlockState,
+) bool {
+    const ascii = matchRange(len, bytes, 0x00, 0x7f);
+    const continuation = matchRange(len, bytes, 0x80, 0xbf);
+    const lead_2 = matchRange(len, bytes, 0xc2, 0xdf);
+    const lead_3 = matchRange(len, bytes, 0xe0, 0xef);
+    const lead_4 = matchRange(len, bytes, 0xf0, 0xf4);
+    const valid_byte = ascii | continuation | lead_2 | lead_3 | lead_4;
+    if (~valid_byte != 0) return false;
+
+    const expected_continuation =
+        ((lead_2 | lead_3 | lead_4) << 1) |
+        ((lead_3 | lead_4) << 2) |
+        (lead_4 << 3) |
+        utf8ContinuationMask(len, state.continuation_count);
+    if (continuation != expected_continuation) return false;
+    if (state.constrained_header != 0 and
+        !utf8ConstrainedContinuationValid(state.constrained_header, bytes[0]))
+    {
+        return false;
+    }
+
+    const bad_e0 = (matchByte(len, bytes, 0xe0) << 1) &
+        matchRange(len, bytes, 0x80, 0x9f);
+    const bad_ed = (matchByte(len, bytes, 0xed) << 1) &
+        matchRange(len, bytes, 0xa0, 0xbf);
+    const bad_f0 = (matchByte(len, bytes, 0xf0) << 1) &
+        matchRange(len, bytes, 0x80, 0x8f);
+    const bad_f4 = (matchByte(len, bytes, 0xf4) << 1) &
+        matchRange(len, bytes, 0x90, 0xbf);
+    if ((bad_e0 | bad_ed | bad_f0 | bad_f4) != 0) return false;
+
+    const bytes_array: [len]u8 = @bitCast(bytes);
+    var trailing_index: usize = len;
+    var trailing_count: u2 = 0;
+    var trailing_header: u8 = 0;
+    while (trailing_index > 0) {
+        trailing_index -= 1;
+        const byte = bytes_array[trailing_index];
+        const required_count: usize = if (byte >= 0xf0 and byte <= 0xf4)
+            3
+        else if (byte >= 0xe0 and byte <= 0xef)
+            2
+        else if (byte >= 0xc2 and byte <= 0xdf)
+            1
+        else
+            0;
+        if (required_count == 0) {
+            if (!utf8Continuation(byte)) break;
+            continue;
+        }
+        const bytes_after = len - trailing_index - 1;
+        if (bytes_after < required_count) {
+            trailing_count = @intCast(required_count - bytes_after);
+            if (bytes_after == 0) trailing_header = byte;
+        }
+        break;
+    }
+    state.continuation_count = trailing_count;
+    state.constrained_header = trailing_header;
+    return true;
+}
+
+// Full blocks use vector masks; a non-ASCII tail is replayed by the scalar
+// classifier so short input is never over-read.
+
+fn utf8SuspectOffset(comptime len: usize, input: []const u8) ?usize {
+    comptime assert(len == 16 or len == 32 or len == 64);
+
+    var state: Utf8BlockState = .{};
+    var offset: usize = 0;
+    while (input.len - offset >= len) : (offset += len) {
+        const bytes: Vec(len, u8) = input[offset..][0..len].*;
+        if (!utf8BlockIsValid(len, bytes, &state)) return offset;
+    }
+
+    if (state.continuation_count != 0) return offset;
+    for (input[offset..], 0..) |byte, tail_offset| {
+        if (byte >= 0x80) return offset + tail_offset;
+    }
+    return null;
+}
+
+fn utf8ReplayStart(input: []const u8, suspect_offset: usize) usize {
+    var replay_start = @min(suspect_offset, input.len);
+    if (replay_start == input.len) {
+        return replay_start - @min(@as(usize, 3), replay_start);
+    }
+    while (replay_start > 0 and utf8Continuation(input[replay_start - 1])) {
+        replay_start -= 1;
+    }
+    if (replay_start > 0) {
+        const preceding = input[replay_start - 1];
+        if (preceding >= 0xc2 and preceding <= 0xf4) {
+            replay_start -= 1;
+        }
+    }
+    return replay_start;
+}
+
+fn validateUtf8Replay(input: []const u8, suspect_offset: usize) Utf8Result {
+    const replay_start = utf8ReplayStart(input, suspect_offset);
+    return switch (validateUtf8Scalar(input[replay_start..])) {
+        .valid => .valid,
+        .invalid => |error_info| .{ .invalid = .{
+            .kind = error_info.kind,
+            .offset = replay_start + error_info.offset,
+        } },
+    };
+}
+
+pub fn validateUtf8WithWidth(comptime len: usize, input: []const u8) Utf8Result {
+    comptime assert(len == 16 or len == 32 or len == 64);
+    // SIMD identifies a suspect block; scalar replay establishes the first
+    // failure class and offset without exposing internal mask bits.
+    const suspect_offset = utf8SuspectOffset(len, input) orelse return .valid;
+    return validateUtf8Replay(input, suspect_offset);
+}
+
+pub fn validateUtf8(input: []const u8) Utf8Result {
+    return validateUtf8WithWidth(default_vector_len, input);
+}
+
+fn expectUtf8Result(
+    input: []const u8,
+    expected: Utf8Result,
+) !void {
+    inline for ([_]usize{ 16, 32, 64 }) |width| {
+        try testing.expectEqual(expected, validateUtf8WithWidth(width, input));
+    }
+    try testing.expectEqual(expected, validateUtf8(input));
+}
+
+fn expectUtf8ValidSequenceAtBoundary(
+    comptime width: usize,
+    sequence: []const u8,
+    start: usize,
+) !void {
+    var input: [68]u8 = [_]u8{'a'} ** 68;
+    @memcpy(input[start..][0..sequence.len], sequence);
+    const expected: Utf8Result = .valid;
+    try testing.expectEqual(
+        expected,
+        validateUtf8WithWidth(width, input[0 .. start + sequence.len]),
+    );
+}
+
+fn expectUtf8ValidSequenceInsideBlock(
+    comptime width: usize,
+    sequence: []const u8,
+) !void {
+    var input: [width + 1]u8 = [_]u8{'a'} ** (width + 1);
+    @memcpy(input[1..][0..sequence.len], sequence);
+    const expected: Utf8Result = .valid;
+    try testing.expectEqual(expected, validateUtf8WithWidth(width, &input));
+}
+
+fn expectUtf8InvalidSequenceAtBoundary(
+    comptime width: usize,
+    sequence: []const u8,
+    start: usize,
+    kind: Utf8ErrorKind,
+    error_relative_offset: usize,
+) !void {
+    var input: [68]u8 = [_]u8{'a'} ** 68;
+    @memcpy(input[start..][0..sequence.len], sequence);
+    const expected = Utf8Result{ .invalid = .{
+        .kind = kind,
+        .offset = start + error_relative_offset,
+    } };
+    try testing.expectEqual(
+        expected,
+        validateUtf8WithWidth(width, input[0 .. start + sequence.len]),
+    );
+}
+
+test "UTF-8 accepts ASCII and valid sequences at every SIMD width" {
+    const sequences = [_][]const u8{
+        &[_]u8{ 0xc2, 0xa2 },
+        &[_]u8{ 0xe0, 0xa0, 0x80 },
+        &[_]u8{ 0xed, 0x9f, 0xbf },
+        &[_]u8{ 0xf0, 0x90, 0x8d, 0x88 },
+        &[_]u8{ 0xf4, 0x8f, 0xbf, 0xbf },
+    };
+
+    inline for ([_]usize{ 16, 32, 64 }) |width| {
+        var ascii: [width * 2 + 3]u8 = [_]u8{'x'} ** (width * 2 + 3);
+        const expected: Utf8Result = .valid;
+        try testing.expectEqual(expected, validateUtf8WithWidth(width, &ascii));
+
+        for (sequences) |sequence| {
+            try expectUtf8ValidSequenceInsideBlock(width, sequence);
+            inline for ([_]usize{ width - 3, width - 2, width - 1, width }) |start| {
+                if (start + sequence.len <= 68) {
+                    try expectUtf8ValidSequenceAtBoundary(width, sequence, start);
+                }
+            }
+        }
+    }
+}
+
+test "UTF-8 reports exact scalar error classes and offsets" {
+    const cases = [_]struct {
+        bytes: []const u8,
+        kind: Utf8ErrorKind,
+        offset: usize,
+    }{
+        .{ .bytes = &[_]u8{0x80}, .kind = .unexpected_continuation, .offset = 0 },
+        .{ .bytes = &[_]u8{ 0xc2, 0x20 }, .kind = .missing_continuation, .offset = 1 },
+        .{ .bytes = &[_]u8{ 0xe2, 0x82, 0x20 }, .kind = .missing_continuation, .offset = 2 },
+        .{ .bytes = &[_]u8{ 0xf0, 0x90, 0x8d, 0x20 }, .kind = .missing_continuation, .offset = 3 },
+        .{ .bytes = &[_]u8{ 0xc0, 0x80 }, .kind = .overlong, .offset = 0 },
+        .{ .bytes = &[_]u8{ 0xe0, 0x80, 0x80 }, .kind = .overlong, .offset = 1 },
+        .{ .bytes = &[_]u8{ 0xf0, 0x80, 0x80, 0x80 }, .kind = .overlong, .offset = 1 },
+        .{ .bytes = &[_]u8{ 0xed, 0xa0, 0x80 }, .kind = .surrogate, .offset = 1 },
+        .{ .bytes = &[_]u8{ 0xf4, 0x90, 0x80, 0x80 }, .kind = .too_large, .offset = 1 },
+        .{ .bytes = &[_]u8{ 0xf5, 0x80, 0x80, 0x80 }, .kind = .too_large, .offset = 0 },
+        .{ .bytes = &[_]u8{0xff}, .kind = .invalid_header, .offset = 0 },
+        .{ .bytes = &[_]u8{0xe2}, .kind = .truncated_sequence, .offset = 0 },
+        .{ .bytes = &[_]u8{ 0xf0, 0x90 }, .kind = .truncated_sequence, .offset = 0 },
+    };
+    for (cases) |case| {
+        const expected = Utf8Result{ .invalid = .{
+            .kind = case.kind,
+            .offset = case.offset,
+        } };
+        try expectUtf8Result(case.bytes, expected);
+    }
+}
+
+test "UTF-8 reports truncation at block edges and tails" {
+    const prefixes = [_][]const u8{
+        &[_]u8{0xc2},
+        &[_]u8{ 0xe2, 0x82 },
+        &[_]u8{ 0xf0, 0x90, 0x8d },
+    };
+
+    inline for ([_]usize{ 16, 32, 64 }) |width| {
+        for (prefixes) |prefix| {
+            inline for ([_]usize{ width - 1, width, width + 1 }) |start| {
+                if (start + prefix.len <= 68) {
+                    var input: [68]u8 = [_]u8{'z'} ** 68;
+                    @memcpy(input[start..][0..prefix.len], prefix);
+                    const expected = Utf8Result{ .invalid = .{
+                        .kind = .truncated_sequence,
+                        .offset = start,
+                    } };
+                    try testing.expectEqual(
+                        expected,
+                        validateUtf8WithWidth(width, input[0 .. start + prefix.len]),
+                    );
+                }
+            }
+        }
+    }
+}
+
+test "UTF-8 SIMD widths match the scalar classifier" {
+    const corpus = [_][]const u8{
+        "",
+        "ASCII only",
+        &[_]u8{ 0x80, 'x' },
+        &[_]u8{ 'x', 0xe0, 0x80, 0x80 },
+        &[_]u8{ 'x', 0xed, 0xa0, 0x80 },
+        &[_]u8{ 'x', 0xf4, 0x90, 0x80, 0x80 },
+        &[_]u8{ 'x', 0xf0, 0x90 },
+        &[_]u8{ 'x', 0xff },
+    };
+
+    for (corpus) |input| {
+        try expectUtf8Result(input, validateUtf8Scalar(input));
+    }
+}
+
+test "UTF-8 carries valid and invalid sequences across SIMD blocks" {
+    const valid_sequences = [_][]const u8{
+        &[_]u8{ 0xc2, 0xa2 },
+        &[_]u8{ 0xe2, 0x82, 0xac },
+        &[_]u8{ 0xf0, 0x90, 0x8d, 0x88 },
+    };
+    const invalid_sequences = [_]struct {
+        bytes: []const u8,
+        kind: Utf8ErrorKind,
+        error_relative_offset: usize,
+    }{
+        .{
+            .bytes = &[_]u8{0x80},
+            .kind = .unexpected_continuation,
+            .error_relative_offset = 0,
+        },
+        .{
+            .bytes = &[_]u8{0xff},
+            .kind = .invalid_header,
+            .error_relative_offset = 0,
+        },
+        .{
+            .bytes = &[_]u8{ 0xc2, 0x20 },
+            .kind = .missing_continuation,
+            .error_relative_offset = 1,
+        },
+        .{
+            .bytes = &[_]u8{ 0xe0, 0x80, 0x80 },
+            .kind = .overlong,
+            .error_relative_offset = 1,
+        },
+        .{
+            .bytes = &[_]u8{ 0xed, 0xa0, 0x80 },
+            .kind = .surrogate,
+            .error_relative_offset = 1,
+        },
+        .{
+            .bytes = &[_]u8{ 0xf4, 0x90, 0x80, 0x80 },
+            .kind = .too_large,
+            .error_relative_offset = 1,
+        },
+    };
+    inline for ([_]usize{ 16, 32, 64 }) |width| {
+        for (valid_sequences) |sequence| {
+            inline for ([_]usize{ width - 3, width - 2, width - 1, width }) |start| {
+                if (start + sequence.len <= 68) {
+                    try expectUtf8ValidSequenceAtBoundary(width, sequence, start);
+                }
+            }
+        }
+        for (invalid_sequences) |case| {
+            inline for ([_]usize{ width - 3, width - 2, width - 1, width }) |start| {
+                if (start + case.bytes.len <= 68) {
+                    try expectUtf8InvalidSequenceAtBoundary(
+                        width,
+                        case.bytes,
+                        start,
+                        case.kind,
+                        case.error_relative_offset,
+                    );
+                }
+            }
+        }
+    }
+}
+
 test "refAllDecls" {
     testing.refAllDecls(@This());
 }
