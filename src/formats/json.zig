@@ -1,8 +1,36 @@
 const std = @import("std");
 const simd = @import("../core/simd.zig");
 const stage1 = @import("../core/stage1.zig");
+const stage2 = @import("../core/stage2.zig");
 
 const testing = std.testing;
+
+/// Builds an owned, validated RFC JSON tape from the Stage1 structural index.
+pub fn buildJsonTape(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+) stage2.BuildError!stage2.Document {
+    var structural_index = indexJson(allocator, input) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        // Stage1 cannot represent inputs that Stage2 cannot address on its tape.
+        return error.TapeTooLarge;
+    };
+    defer structural_index.deinit(allocator);
+    return stage2.buildTape(allocator, input, &structural_index);
+}
+
+/// Validates RFC JSON and returns the first semantic diagnostic, if any.
+pub fn validateJson(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+) stage2.ValidationError!?stage2.Diagnostic {
+    var structural_index = indexJson(allocator, input) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return error.TapeTooLarge;
+    };
+    defer structural_index.deinit(allocator);
+    return stage2.validate(input, &structural_index);
+}
 
 pub fn indexJson(
     allocator: std.mem.Allocator,
@@ -506,6 +534,71 @@ test "indexJson differential adversarial byte matrix" {
             try expectMatchesScalarAtWidth(vlen, input[0..length]);
         }
     }
+}
+
+test "buildJsonTape returns a validated owned tape" {
+    const input = "{\"ok\":true}";
+    var document = try buildJsonTape(testing.allocator, input);
+    defer document.deinit(testing.allocator);
+
+    const expected_kinds = [_]stage2.TapeKind{
+        .object_start,
+        .key,
+        .true_literal,
+        .object_end,
+    };
+    try testing.expectEqual(expected_kinds.len, document.tape.len);
+    for (document.tape, expected_kinds) |word, expected_kind| {
+        try testing.expectEqual(expected_kind, word.tapeKind());
+    }
+    try testing.expectEqual(@as(u24, 1), document.tape[0].payload);
+    try testing.expectEqual(@as(u32, 1), document.tape[1].offset);
+    try testing.expectEqual(@as(u32, 6), document.tape[2].offset);
+}
+
+test "buildJsonTape rejects invalid RFC JSON grammar" {
+    try testing.expectError(
+        error.TrailingComma,
+        buildJsonTape(testing.allocator, "[1,]"),
+    );
+}
+
+test "validateJson returns first diagnostic with source location" {
+    try testing.expect((try validateJson(testing.allocator, "{}")) == null);
+
+    const malformed_escape = "\n  [\"bad\\q\"]";
+    const escape_diagnostic = (try validateJson(
+        testing.allocator,
+        malformed_escape,
+    )).?;
+    try testing.expectEqual(error.InvalidEscape, escape_diagnostic.err);
+    try testing.expectEqual(@as(usize, 9), escape_diagnostic.byte_offset);
+    try testing.expectEqual(@as(u32, 2), escape_diagnostic.line);
+    try testing.expectEqual(@as(u32, 9), escape_diagnostic.column);
+    try testing.expectEqual(@as(usize, 1), escape_diagnostic.snippet_start);
+    try testing.expectEqualStrings("  [\"bad\\q\"]", escape_diagnostic.snippet);
+
+    const unclosed_array = "\n  [1";
+    const array_diagnostic = (try validateJson(
+        testing.allocator,
+        unclosed_array,
+    )).?;
+    try testing.expectEqual(error.UnclosedArray, array_diagnostic.err);
+    try testing.expectEqual(@as(usize, 3), array_diagnostic.byte_offset);
+    try testing.expectEqual(@as(u32, 2), array_diagnostic.line);
+    try testing.expectEqual(@as(u32, 3), array_diagnostic.column);
+    try testing.expectEqualStrings("  [1", array_diagnostic.snippet);
+
+    const unclosed_object = "\n {\"a\": 1";
+    const object_diagnostic = (try validateJson(
+        testing.allocator,
+        unclosed_object,
+    )).?;
+    try testing.expectEqual(error.UnclosedObject, object_diagnostic.err);
+    try testing.expectEqual(@as(usize, 2), object_diagnostic.byte_offset);
+    try testing.expectEqual(@as(u32, 2), object_diagnostic.line);
+    try testing.expectEqual(@as(u32, 2), object_diagnostic.column);
+    try testing.expectEqualStrings(" {\"a\": 1", object_diagnostic.snippet);
 }
 
 test "refAllDecls" {

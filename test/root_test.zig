@@ -8,6 +8,7 @@ test "refAllDecls" {
     testing.refAllDecls(lib);
     testing.refAllDecls(lib.simd);
     testing.refAllDecls(lib.stage1);
+    testing.refAllDecls(lib.stage2);
     testing.refAllDecls(lib.debug);
     testing.refAllDecls(lib.formats);
     testing.refAllDecls(lib.formats.json);

@@ -3,6 +3,7 @@ const testing = std.testing;
 
 pub const simd = @import("core/simd.zig");
 pub const stage1 = @import("core/stage1.zig");
+pub const stage2 = @import("core/stage2.zig");
 pub const debug = @import("core/debug.zig");
 
 pub const default_vector_len = simd.default_vector_len;
