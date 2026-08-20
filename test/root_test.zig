@@ -8,6 +8,7 @@ test "refAllDecls" {
     testing.refAllDecls(lib);
     testing.refAllDecls(lib.simd);
     testing.refAllDecls(lib.stage1);
+    testing.refAllDecls(lib.stream);
     testing.refAllDecls(lib.stage2);
     testing.refAllDecls(lib.ondemand);
     testing.refAllDecls(lib.debug);
@@ -190,4 +191,134 @@ test "on-demand EventReader skips one nested JSON value" {
     try expectOnDemandEvent(.null, (try reader.next()).?);
     try expectOnDemandEvent(.object_end, (try reader.next()).?);
     try testing.expect((try reader.next()) == null);
+}
+
+const stream_sentinel_count: usize = 3;
+
+fn expectJsonStreamParity(
+    input: []const u8,
+    actual: *const lib.StructuralIndex,
+) !void {
+    var expected = try lib.formats.json.indexJson(testing.allocator, input);
+    defer expected.deinit(testing.allocator);
+
+    try testing.expectEqual(expected.count, actual.count);
+    try testing.expectEqualSlices(
+        u32,
+        expected.indexes[0..expected.count],
+        actual.indexes[0..actual.count],
+    );
+    try testing.expectEqualSlices(
+        u32,
+        expected.indexes[expected.count..][0..stream_sentinel_count],
+        actual.indexes[actual.count..][0..stream_sentinel_count],
+    );
+}
+
+fn expectJsonStreamWithCuts(
+    input: []const u8,
+    cuts: []const usize,
+    empty_feeds: bool,
+) !void {
+    var stream = try lib.stream.StreamIndexer.init(testing.allocator, vector_len);
+    defer stream.deinit();
+
+    var start: usize = 0;
+    if (empty_feeds) try stream.feed("");
+    for (cuts) |cut| {
+        try testing.expect(cut >= start);
+        try testing.expect(cut <= input.len);
+        try stream.feed(input[start..cut]);
+        if (empty_feeds) try stream.feed("");
+        start = cut;
+    }
+    try stream.feed(input[start..]);
+    if (empty_feeds) try stream.feed("");
+    try stream.finish();
+
+    var actual = stream.take();
+    defer actual.deinit(testing.allocator);
+    try expectJsonStreamParity(input, &actual);
+}
+
+fn expectJsonStreamByteFeeds(input: []const u8) !void {
+    var stream = try lib.stream.StreamIndexer.init(testing.allocator, 1);
+    defer stream.deinit();
+
+    for (input) |byte| {
+        try stream.feed(&.{byte});
+    }
+    try stream.finish();
+
+    var actual = stream.take();
+    defer actual.deinit(testing.allocator);
+    try expectJsonStreamParity(input, &actual);
+}
+
+test "stream: one feed and byte feeds match JSON indexing" {
+    const input =
+        \\{"text":"punctuation {}[],: stays quoted","value":-12345,"ok":true}
+    ;
+
+    try expectJsonStreamWithCuts(input, &.{}, false);
+    try expectJsonStreamByteFeeds(input);
+}
+
+test "stream: empty feeds and SIMD boundary cuts match JSON indexing" {
+    const input =
+        \\{"padding":"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz","tail":[false,null,-987654321]}
+    ;
+    const cuts = [_]usize{
+        vector_len - 1,
+        vector_len,
+        vector_len + 1,
+    };
+
+    try expectJsonStreamWithCuts(input, &cuts, true);
+}
+
+test "stream: quote backslash and atom splits match JSON indexing" {
+    const input =
+        \\{"text":"odd\\\"quote","atom":-12345,"bool":true}
+    ;
+    const quote_cut = std.mem.indexOf(u8, input, "\"odd").? + 1;
+    const backslash_cut = std.mem.indexOf(u8, input, "\\\\\\\"").? + 2;
+    const atom_cut = std.mem.indexOf(u8, input, "-12345").? + 3;
+    const cuts = [_]usize{ quote_cut, backslash_cut, atom_cut };
+
+    try expectJsonStreamWithCuts(input, &cuts, false);
+}
+
+test "stream: finish is idempotent and take survives reset" {
+    const first_input = "{\"first\":\"quoted []{}:,\",\"value\":false}";
+    const second_input = "[-1,null,\"second\\\\document\"]";
+
+    var results = results: {
+        var stream = try lib.stream.StreamIndexer.init(testing.allocator, 2);
+        defer stream.deinit();
+
+        try stream.feed(first_input);
+        try stream.finish();
+        try stream.finish();
+        var first = stream.take();
+        errdefer first.deinit(testing.allocator);
+
+        stream.reset();
+        try stream.feed("");
+        try stream.feed(second_input[0..3]);
+        try stream.feed(second_input[3..]);
+        try stream.finish();
+        try stream.finish();
+        const second = stream.take();
+
+        break :results .{
+            .first = first,
+            .second = second,
+        };
+    };
+    defer results.first.deinit(testing.allocator);
+    defer results.second.deinit(testing.allocator);
+
+    try expectJsonStreamParity(first_input, &results.first);
+    try expectJsonStreamParity(second_input, &results.second);
 }
