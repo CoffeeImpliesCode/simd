@@ -1,18 +1,20 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const assert = std.debug.assert;
 const testing = std.testing;
 
-pub const default_vector_len: usize = switch (builtin.cpu.arch) {
-    .x86, .x86_64 => if (std.Target.x86.featureSetHas(builtin.cpu.features, .avx512f) and
-        std.Target.x86.featureSetHas(builtin.cpu.features, .avx512bw))
-        64
-    else if (std.Target.x86.featureSetHas(builtin.cpu.features, .avx2))
-        32
-    else
-        16,
-    else => 16,
-};
+pub const default_vector_len: usize = build_options.vector_len orelse
+    switch (builtin.cpu.arch) {
+        .x86, .x86_64 => if (std.Target.x86.featureSetHas(builtin.cpu.features, .avx512f) and
+            std.Target.x86.featureSetHas(builtin.cpu.features, .avx512bw))
+            64
+        else if (std.Target.x86.featureSetHas(builtin.cpu.features, .avx2))
+            32
+        else
+            16,
+        else => 16,
+    };
 
 comptime {
     assert(

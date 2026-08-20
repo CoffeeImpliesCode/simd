@@ -14,6 +14,21 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
+    const vector_len = b.option(
+        usize,
+        "vector_len",
+        "Override SIMD vector width (16, 32, or 64)",
+    );
+    if (vector_len) |len| switch (len) {
+        16, 32, 64 => {},
+        else => std.debug.panic(
+            "invalid -Dvector_len={d}: expected 16, 32, or 64",
+            .{len},
+        ),
+    };
+
+    const build_options = b.addOptions();
+    build_options.addOption(?usize, "vector_len", vector_len);
 
     // This creates a "module", which represents a collection of source files alongside
     // some compilation options, such as optimization mode and linked system libraries.
@@ -27,23 +42,27 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    lib_mod.addOptions("build_options", build_options);
 
     const lib_test_mod = b.createModule(.{
         .root_source_file = b.path("test/root_test.zig"),
         .target = target,
         .optimize = optimize,
     });
+    lib_test_mod.addOptions("build_options", build_options);
 
     const fuzz_test_mod = b.createModule(.{
         .root_source_file = b.path("test/fuzz_test.zig"),
         .target = target,
         .optimize = optimize,
     });
+    fuzz_test_mod.addOptions("build_options", build_options);
     const corpus_test_mod = b.createModule(.{
         .root_source_file = b.path("test/corpus_test.zig"),
         .target = target,
         .optimize = optimize,
     });
+    corpus_test_mod.addOptions("build_options", build_options);
     corpus_test_mod.addImport("simd_lib", lib_mod);
     fuzz_test_mod.addImport("simd_lib", lib_mod);
     lib_test_mod.addImport("simd_lib", lib_mod);
@@ -58,6 +77,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    exe_mod.addOptions("build_options", build_options);
 
     // Modules can depend on one another using the `std.Build.Module.addImport` function.
     // This is what allows Zig source code to use `@import("foo")` where 'foo' is not a
