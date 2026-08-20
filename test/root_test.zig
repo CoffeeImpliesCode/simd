@@ -113,6 +113,137 @@ test "corpus: XML indexing on catalog.xml" {
     try expectTokenWidths(lib.formats.xml.indexXmlImpl, xml_data);
 }
 
+test "public JSON cursor keeps exact input and document live through nested navigation" {
+    const input =
+        \\{"nested":[1,{"deep":[]}],"empty_object":{},"empty_array":[]}
+    ;
+    var document = try lib.formats.json.buildJsonTape(testing.allocator, input);
+    defer document.deinit(testing.allocator);
+
+    var cursor: lib.stage2.TapeCursor = try document.root(input);
+    try testing.expectEqual(lib.stage2.TapeKind.object_start, (try cursor.peek()).tapeKind());
+    try testing.expectEqual(@as(u32, 3), try cursor.containerCount());
+
+    try cursor.advance();
+    try testing.expectEqualStrings("nested", try cursor.rawValue());
+    try cursor.advance();
+    try testing.expectEqual(@as(u32, 2), try cursor.containerCount());
+
+    var inner_end = cursor;
+    try inner_end.advance();
+    try inner_end.skipValue();
+    try inner_end.advance();
+    try inner_end.advance();
+    try inner_end.skipValue();
+    try inner_end.advance();
+    try testing.expectEqual(
+        lib.stage2.TapeKind.array_end,
+        (try inner_end.peek()).tapeKind(),
+    );
+    const inner_start = try inner_end.matchingStart();
+    try testing.expectEqual(@as(usize, 2), inner_start.position());
+
+    var nested_end = cursor;
+    try nested_end.advance();
+    try nested_end.skipValue();
+    try nested_end.skipValue();
+    try testing.expectEqual(lib.stage2.TapeKind.array_end, (try nested_end.peek()).tapeKind());
+    const nested_start = try nested_end.matchingStart();
+    try testing.expectEqual(cursor.position(), nested_start.position());
+
+    try cursor.skipValue();
+    try testing.expectEqual(lib.stage2.TapeKind.key, (try cursor.peek()).tapeKind());
+    try testing.expectEqual(@as(usize, 10), cursor.position());
+    try testing.expectEqualStrings("empty_object", try cursor.rawValue());
+    try cursor.advance();
+    try testing.expectEqual(@as(u32, 0), try cursor.containerCount());
+    try cursor.skipValue();
+
+    try testing.expectEqualStrings("empty_array", try cursor.rawValue());
+    try cursor.advance();
+    try testing.expectEqual(@as(u32, 0), try cursor.containerCount());
+    try cursor.skipValue();
+
+    try testing.expectEqual(lib.stage2.TapeKind.object_end, (try cursor.peek()).tapeKind());
+    const root_start = try cursor.matchingStart();
+    try testing.expectEqual(@as(usize, 0), root_start.position());
+}
+
+test "public JSON cursor rejects malformed borrowed source and public tape" {
+    const input = "\"value\"";
+    var document = try lib.formats.json.buildJsonTape(testing.allocator, input);
+    defer document.deinit(testing.allocator);
+
+    var wrong_source_cursor = try document.root("\"x\"");
+    try testing.expectError(error.SourceOutOfBounds, wrong_source_cursor.rawValue());
+
+    var invalid_source_cursor = try document.root("\"valuex");
+    try testing.expectError(error.InvalidSource, invalid_source_cursor.rawValue());
+
+    const escaped_input = "\"a\\n\"";
+    var escaped_document = try lib.formats.json.buildJsonTape(
+        testing.allocator,
+        escaped_input,
+    );
+    defer escaped_document.deinit(testing.allocator);
+    var malformed_escape_cursor = try escaped_document.root("\"a\\q\"");
+    try testing.expectError(error.InvalidSource, malformed_escape_cursor.rawValue());
+
+    var empty_tape: [0]lib.stage2.TapeWord = .{};
+    const empty_document = lib.stage2.Document{ .tape = empty_tape[0..] };
+    try testing.expectError(error.TapeOutOfBounds, empty_document.root(""));
+
+    var invalid_kind_tape = [_]lib.stage2.TapeWord{.{
+        .kind = std.math.maxInt(u8),
+        .payload = 0,
+        .offset = 0,
+    }};
+    const invalid_kind_document = lib.stage2.Document{ .tape = invalid_kind_tape[0..] };
+    try testing.expectError(error.InvalidTapeKind, invalid_kind_document.root("0"));
+
+    var wrong_end_tape = [_]lib.stage2.TapeWord{
+        .{
+            .kind = @intFromEnum(lib.stage2.TapeKind.array_start),
+            .payload = 0,
+            .offset = 0,
+        },
+        .{
+            .kind = @intFromEnum(lib.stage2.TapeKind.object_end),
+            .payload = 0,
+            .offset = 1,
+        },
+    };
+    const wrong_end_document = lib.stage2.Document{ .tape = wrong_end_tape[0..] };
+    var wrong_end_cursor = try wrong_end_document.root("[]");
+    try testing.expectError(error.InvalidTapeOrder, wrong_end_cursor.skipValue());
+
+    var malformed_interior_tape = [_]lib.stage2.TapeWord{
+        .{
+            .kind = @intFromEnum(lib.stage2.TapeKind.array_start),
+            .payload = 0,
+            .offset = 0,
+        },
+        .{
+            .kind = @intFromEnum(lib.stage2.TapeKind.number),
+            .payload = 0,
+            .offset = 1,
+        },
+        .{
+            .kind = @intFromEnum(lib.stage2.TapeKind.array_end),
+            .payload = 0,
+            .offset = 2,
+        },
+    };
+    const malformed_interior_document = lib.stage2.Document{
+        .tape = malformed_interior_tape[0..],
+    };
+    var malformed_interior_end = try malformed_interior_document.root("[0]");
+    try malformed_interior_end.advance();
+    try malformed_interior_end.advance();
+    const malformed_interior_start = try malformed_interior_end.matchingStart();
+    try testing.expectEqual(@as(usize, 0), malformed_interior_start.position());
+}
+
 fn expectOnDemandEvent(
     expected: lib.ondemand.Event,
     actual: lib.ondemand.Event,

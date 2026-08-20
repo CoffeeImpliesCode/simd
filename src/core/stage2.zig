@@ -53,14 +53,296 @@ comptime {
     std.debug.assert(@sizeOf(TapeWord) == 8);
 }
 
+/// An owned tape. Source bytes are supplied separately to `root` and borrowed.
 pub const Document = struct {
     tape: []TapeWord,
+
+    /// Creates a cursor over the owned tape and borrowed source input.
+    ///
+    /// The document owns only its tape. The caller must keep `input` and this
+    /// document alive for as long as the returned cursor is used.
+    pub fn root(self: *const Document, input: []const u8) NavigationError!TapeCursor {
+        if (self.tape.len == 0) return error.TapeOutOfBounds;
+        const cursor = TapeCursor{
+            .tape = self.tape,
+            .input = input,
+        };
+        _ = try cursor.peek();
+        return cursor;
+    }
 
     pub fn deinit(self: *Document, allocator: std.mem.Allocator) void {
         allocator.free(self.tape);
         self.* = undefined;
     }
 };
+
+pub const NavigationError = error{
+    PositionOutOfBounds,
+    InvalidTapeKind,
+    InvalidTapeOrder,
+    TapeOutOfBounds,
+    SourceOutOfBounds,
+    InvalidSource,
+    TypeMismatch,
+    DepthExceeded,
+};
+
+const ContainerFrame = struct {
+    is_object: bool,
+    start_index: usize,
+    remaining: u32,
+    expect_key: bool,
+};
+
+/// A zero-allocation cursor over an owned tape and borrowed source input.
+///
+/// The cursor does not own either slice. The document and input must outlive
+/// the cursor.
+pub const TapeCursor = struct {
+    tape: []const TapeWord,
+    input: []const u8,
+    position_index: usize = 0,
+
+    pub fn peek(self: *const TapeCursor) NavigationError!TapeWord {
+        return self.currentWord();
+    }
+
+    pub fn advance(self: *TapeCursor) NavigationError!void {
+        _ = try self.currentWord();
+        self.position_index += 1;
+    }
+
+    pub fn position(self: *const TapeCursor) usize {
+        return self.position_index;
+    }
+
+    pub fn containerCount(self: *const TapeCursor) NavigationError!u32 {
+        const word = try self.currentWord();
+        const kind = try checkedTapeKind(word);
+        switch (kind) {
+            .object_start, .array_start => {
+                _ = try self.valueEnd(self.position_index);
+                return word.payload;
+            },
+            else => return error.TypeMismatch,
+        }
+    }
+
+    pub fn matchingStart(self: *const TapeCursor) NavigationError!TapeCursor {
+        const word = try self.currentWord();
+        const end_kind = try checkedTapeKind(word);
+        const expected_start_kind = switch (end_kind) {
+            .object_end => TapeKind.object_start,
+            .array_end => TapeKind.array_start,
+            else => return error.TypeMismatch,
+        };
+
+        const start_index: usize = @intCast(word.payload);
+        if (start_index >= self.tape.len) return error.TapeOutOfBounds;
+        if (start_index >= self.position_index) return error.InvalidTapeOrder;
+        const start_word = self.tape[start_index];
+        if (try checkedTapeKind(start_word) != expected_start_kind) {
+            return error.InvalidTapeOrder;
+        }
+
+        return .{
+            .tape = self.tape,
+            .input = self.input,
+            .position_index = start_index,
+        };
+    }
+
+    /// Advances past the current scalar or complete container subtree.
+    /// Container skips validate and scan each nested tape word.
+    pub fn skipValue(self: *TapeCursor) NavigationError!void {
+        self.position_index = try self.valueEnd(self.position_index);
+    }
+
+    /// Returns still-escaped string/key content, or the complete scalar source.
+    pub fn rawValue(self: *const TapeCursor) NavigationError![]const u8 {
+        const word = try self.currentWord();
+        const kind = try checkedTapeKind(word);
+        switch (kind) {
+            .string, .key => return self.rawString(word),
+            .number => {
+                if (word.payload != 0) return error.InvalidTapeOrder;
+                return self.rawNumber(word);
+            },
+            .true_literal => {
+                if (word.payload != 0) return error.InvalidTapeOrder;
+                return self.rawLiteral(word, "true");
+            },
+            .false_literal => {
+                if (word.payload != 0) return error.InvalidTapeOrder;
+                return self.rawLiteral(word, "false");
+            },
+            .null_literal => {
+                if (word.payload != 0) return error.InvalidTapeOrder;
+                return self.rawLiteral(word, "null");
+            },
+            else => return error.TypeMismatch,
+        }
+    }
+
+    fn currentWord(self: *const TapeCursor) NavigationError!TapeWord {
+        if (self.position_index >= self.tape.len) return error.PositionOutOfBounds;
+        const word = self.tape[self.position_index];
+        _ = try checkedTapeKind(word);
+        return word;
+    }
+
+    fn valueEnd(self: *const TapeCursor, start_index: usize) NavigationError!usize {
+        if (start_index >= self.tape.len) return error.TapeOutOfBounds;
+
+        var frames: [max_depth]ContainerFrame = undefined;
+        var frame_count: usize = 0;
+        var index = start_index;
+        var root_pending = true;
+
+        while (index < self.tape.len) {
+            if (frame_count > 0) {
+                var frame = &frames[frame_count - 1];
+                if (frame.remaining == 0) {
+                    const end_word = self.tape[index];
+                    const end_kind = try checkedTapeKind(end_word);
+                    const expected_end = if (frame.is_object)
+                        TapeKind.object_end
+                    else
+                        TapeKind.array_end;
+                    if (end_kind != expected_end) return error.InvalidTapeOrder;
+                    const end_start_index: usize = @intCast(end_word.payload);
+                    if (end_start_index != frame.start_index) {
+                        return error.InvalidTapeOrder;
+                    }
+
+                    index += 1;
+                    frame_count -= 1;
+                    if (frame_count == 0) return index;
+                    try completeChild(&frames[frame_count - 1]);
+                    continue;
+                }
+
+                if (frame.is_object and frame.expect_key) {
+                    const key_word = self.tape[index];
+                    if (try checkedTapeKind(key_word) != .key) {
+                        return error.InvalidTapeOrder;
+                    }
+                    index += 1;
+                    frame.expect_key = false;
+                    continue;
+                }
+            } else if (!root_pending) {
+                return index;
+            }
+
+            const word = self.tape[index];
+            const kind = try checkedTapeKind(word);
+            if (kind == .key) return error.InvalidTapeOrder;
+            switch (kind) {
+                .object_end, .array_end => return error.InvalidTapeOrder,
+                .object_start, .array_start => {
+                    if (frame_count >= max_depth) return error.DepthExceeded;
+                    frames[frame_count] = .{
+                        .is_object = kind == .object_start,
+                        .start_index = index,
+                        .remaining = @intCast(word.payload),
+                        .expect_key = kind == .object_start,
+                    };
+                    frame_count += 1;
+                    index += 1;
+                },
+                else => {
+                    if (kind == .number or
+                        kind == .true_literal or
+                        kind == .false_literal or
+                        kind == .null_literal)
+                    {
+                        if (word.payload != 0) return error.InvalidTapeOrder;
+                    }
+                    index += 1;
+                    if (frame_count == 0) {
+                        root_pending = false;
+                        return index;
+                    }
+                    try completeChild(&frames[frame_count - 1]);
+                },
+            }
+        }
+
+        return error.TapeOutOfBounds;
+    }
+
+    fn completeChild(frame: *ContainerFrame) NavigationError!void {
+        if (frame.remaining == 0) return error.InvalidTapeOrder;
+        if (frame.is_object and frame.expect_key) return error.InvalidTapeOrder;
+        frame.remaining -= 1;
+        frame.expect_key = frame.is_object;
+    }
+
+    fn rawString(self: *const TapeCursor, word: TapeWord) NavigationError![]const u8 {
+        const offset: usize = @intCast(word.offset);
+        if (offset >= self.input.len) return error.SourceOutOfBounds;
+        if (self.input[offset] != '"') return error.InvalidSource;
+
+        const content_start = offset + 1;
+        const content_length: usize = @intCast(word.payload);
+        if (content_length > self.input.len - content_start) {
+            return error.SourceOutOfBounds;
+        }
+        const content_end = content_start + content_length;
+        if (content_end >= self.input.len) return error.SourceOutOfBounds;
+        var failure_offset = offset;
+        const token = validateString(self.input, offset, &failure_offset) catch {
+            return error.InvalidSource;
+        };
+        if (token.content_length != content_length) return error.InvalidSource;
+        if (token.end_offset != content_end + 1) return error.InvalidSource;
+        return self.input[content_start..content_end];
+    }
+
+    fn rawNumber(self: *const TapeCursor, word: TapeWord) NavigationError![]const u8 {
+        const offset: usize = @intCast(word.offset);
+        if (offset >= self.input.len) return error.SourceOutOfBounds;
+        var failure_offset = offset;
+        const end = validateNumber(self.input, offset, &failure_offset) catch {
+            return error.InvalidSource;
+        };
+        return self.input[offset..end];
+    }
+
+    fn rawLiteral(
+        self: *const TapeCursor,
+        word: TapeWord,
+        literal: []const u8,
+    ) NavigationError![]const u8 {
+        const offset: usize = @intCast(word.offset);
+        if (offset > self.input.len) return error.SourceOutOfBounds;
+        if (literal.len > self.input.len - offset) return error.SourceOutOfBounds;
+        const end = offset + literal.len;
+        if (!std.mem.eql(u8, self.input[offset..end], literal)) return error.InvalidSource;
+        if (end < self.input.len and !isAtomBoundary(self.input[end])) {
+            return error.InvalidSource;
+        }
+        return self.input[offset..end];
+    }
+};
+
+fn checkedTapeKind(word: TapeWord) NavigationError!TapeKind {
+    return switch (word.kind) {
+        @intFromEnum(TapeKind.object_start) => .object_start,
+        @intFromEnum(TapeKind.array_start) => .array_start,
+        @intFromEnum(TapeKind.object_end) => .object_end,
+        @intFromEnum(TapeKind.array_end) => .array_end,
+        @intFromEnum(TapeKind.string) => .string,
+        @intFromEnum(TapeKind.key) => .key,
+        @intFromEnum(TapeKind.number) => .number,
+        @intFromEnum(TapeKind.true_literal) => .true_literal,
+        @intFromEnum(TapeKind.false_literal) => .false_literal,
+        @intFromEnum(TapeKind.null_literal) => .null_literal,
+        else => error.InvalidTapeKind,
+    };
+}
 
 pub const Diagnostic = struct {
     err: Error,
@@ -1094,4 +1376,197 @@ test "diagnosticAt reports byte location and zero-copy line snippet" {
     try testing.expectEqual(@as(usize, 4), diagnostic.snippet_start);
     try testing.expectEqualStrings("bad token", diagnostic.snippet);
     try testing.expect(diagnostic.snippet.ptr == input.ptr + diagnostic.snippet_start);
+}
+
+test "TapeCursor navigates nested containers and skips complete values" {
+    const input = "{\"a\":[1,{\"b\":[]}],\"empty\":{}}";
+    var structural_index = try indexForTest(testing.allocator, input);
+    defer structural_index.deinit(testing.allocator);
+
+    var document = try buildTape(testing.allocator, input, &structural_index);
+    defer document.deinit(testing.allocator);
+
+    var cursor = try document.root(input);
+    try testing.expectEqual(TapeKind.object_start, (try cursor.peek()).tapeKind());
+    try testing.expectEqual(@as(u32, 2), try cursor.containerCount());
+
+    try cursor.advance();
+    try testing.expectEqualStrings("a", try cursor.rawValue());
+    try cursor.advance();
+    try testing.expectEqual(@as(u32, 2), try cursor.containerCount());
+    try cursor.advance();
+    try testing.expectEqualStrings("1", try cursor.rawValue());
+    try cursor.skipValue();
+    try testing.expectEqual(@as(usize, 4), cursor.position());
+
+    try cursor.skipValue();
+    try testing.expectEqual(@as(usize, 9), cursor.position());
+    const array_start = try cursor.matchingStart();
+    try testing.expectEqual(@as(usize, 2), array_start.position());
+
+    try cursor.advance();
+    try testing.expectEqualStrings("empty", try cursor.rawValue());
+    try cursor.advance();
+    try testing.expectEqual(@as(u32, 0), try cursor.containerCount());
+    try cursor.skipValue();
+    try testing.expectEqual(@as(usize, 13), cursor.position());
+    const object_start = try cursor.matchingStart();
+    try testing.expectEqual(@as(usize, 0), object_start.position());
+
+    try cursor.advance();
+    try testing.expectEqual(document.tape.len, cursor.position());
+    try testing.expectError(error.PositionOutOfBounds, cursor.peek());
+}
+
+test "TapeCursor skips empty object and array roots" {
+    const cases = [_][]const u8{ "{}", "[]" };
+    for (cases) |input| {
+        var structural_index = try indexForTest(testing.allocator, input);
+        defer structural_index.deinit(testing.allocator);
+
+        var document = try buildTape(testing.allocator, input, &structural_index);
+        defer document.deinit(testing.allocator);
+
+        var cursor = try document.root(input);
+        try testing.expectEqual(@as(u32, 0), try cursor.containerCount());
+        try cursor.skipValue();
+        try testing.expectEqual(document.tape.len, cursor.position());
+    }
+}
+
+test "TapeCursor returns escaped strings keys numbers and literals without copying" {
+    const input =
+        "{\"a\\n\":\"x\\u0041\",\"n\":-12.5e+2,\"t\":true,\"f\":false,\"z\":null}";
+    var structural_index = try indexForTest(testing.allocator, input);
+    defer structural_index.deinit(testing.allocator);
+
+    var document = try buildTape(testing.allocator, input, &structural_index);
+    defer document.deinit(testing.allocator);
+
+    var cursor = try document.root(input);
+    try cursor.advance();
+    try testing.expectEqualStrings("a\\n", try cursor.rawValue());
+    try cursor.advance();
+    try testing.expectEqualStrings("x\\u0041", try cursor.rawValue());
+    try cursor.advance();
+    try testing.expectEqualStrings("n", try cursor.rawValue());
+    try cursor.advance();
+    try testing.expectEqualStrings("-12.5e+2", try cursor.rawValue());
+    try cursor.advance();
+    try testing.expectEqualStrings("t", try cursor.rawValue());
+    try cursor.advance();
+    try testing.expectEqualStrings("true", try cursor.rawValue());
+    try cursor.advance();
+    try testing.expectEqualStrings("f", try cursor.rawValue());
+    try cursor.advance();
+    try testing.expectEqualStrings("false", try cursor.rawValue());
+    try cursor.advance();
+    try testing.expectEqualStrings("z", try cursor.rawValue());
+    try cursor.advance();
+    const raw_null = try cursor.rawValue();
+    try testing.expectEqualStrings("null", raw_null);
+    try testing.expect(
+        raw_null.ptr ==
+            input.ptr + @as(usize, @intCast(document.tape[cursor.position()].offset)),
+    );
+}
+
+test "TapeCursor matchingStart validates only the local backlink" {
+    var tape = [_]TapeWord{
+        .{ .kind = @intFromEnum(TapeKind.array_start), .payload = 1, .offset = 0 },
+        .{ .kind = @intFromEnum(TapeKind.key), .payload = 0, .offset = 0 },
+        .{ .kind = @intFromEnum(TapeKind.array_end), .payload = 0, .offset = 1 },
+    };
+    const document = Document{ .tape = tape[0..] };
+    var cursor = try document.root("[]");
+    try cursor.advance();
+    try cursor.advance();
+
+    const start = try cursor.matchingStart();
+    try testing.expectEqual(@as(usize, 0), start.position());
+}
+
+test "TapeCursor raw strings validate source and exact tape extent" {
+    const cases = [_]struct {
+        kind: TapeKind,
+        input: []const u8,
+        payload: u24,
+    }{
+        .{ .kind = .string, .input = "\"a\\q\"", .payload = 3 },
+        .{ .kind = .key, .input = "\"a\\q\"", .payload = 3 },
+        .{ .kind = .string, .input = "\"a\\\"b\"", .payload = 2 },
+        .{ .kind = .key, .input = "\"a\\\"b\"", .payload = 2 },
+    };
+
+    for (cases) |case| {
+        var tape = [_]TapeWord{.{
+            .kind = @intFromEnum(case.kind),
+            .payload = case.payload,
+            .offset = 0,
+        }};
+        const document = Document{ .tape = tape[0..] };
+        const cursor = try document.root(case.input);
+        try testing.expectError(error.InvalidSource, cursor.rawValue());
+    }
+}
+
+test "TapeCursor rejects malformed kinds order bounds counts and source ranges" {
+    var invalid_kind_tape = [_]TapeWord{.{
+        .kind = std.math.maxInt(u8),
+        .payload = 0,
+        .offset = 0,
+    }};
+    const invalid_kind_document = Document{ .tape = invalid_kind_tape[0..] };
+    try testing.expectError(error.InvalidTapeKind, invalid_kind_document.root("0"));
+
+    var wrong_end_tape = [_]TapeWord{
+        .{ .kind = @intFromEnum(TapeKind.array_start), .payload = 0, .offset = 0 },
+        .{ .kind = @intFromEnum(TapeKind.object_end), .payload = 0, .offset = 1 },
+    };
+    const wrong_end_document = Document{ .tape = wrong_end_tape[0..] };
+    var wrong_end_cursor = try wrong_end_document.root("[]");
+    try testing.expectError(error.InvalidTapeOrder, wrong_end_cursor.skipValue());
+
+    var unclosed_tape = [_]TapeWord{
+        .{ .kind = @intFromEnum(TapeKind.array_start), .payload = 0, .offset = 0 },
+    };
+    const unclosed_document = Document{ .tape = unclosed_tape[0..] };
+    var unclosed_cursor = try unclosed_document.root("[");
+    try testing.expectError(error.TapeOutOfBounds, unclosed_cursor.skipValue());
+
+    var wrong_count_tape = [_]TapeWord{
+        .{ .kind = @intFromEnum(TapeKind.array_start), .payload = 2, .offset = 0 },
+        .{ .kind = @intFromEnum(TapeKind.number), .payload = 0, .offset = 1 },
+        .{ .kind = @intFromEnum(TapeKind.array_end), .payload = 0, .offset = 2 },
+    };
+    const wrong_count_document = Document{ .tape = wrong_count_tape[0..] };
+    var wrong_count_cursor = try wrong_count_document.root("[0]");
+    try testing.expectError(error.InvalidTapeOrder, wrong_count_cursor.skipValue());
+
+    var bad_start_tape = [_]TapeWord{
+        .{ .kind = @intFromEnum(TapeKind.array_start), .payload = 0, .offset = 0 },
+        .{ .kind = @intFromEnum(TapeKind.array_end), .payload = 2, .offset = 1 },
+    };
+    const bad_start_document = Document{ .tape = bad_start_tape[0..] };
+    var bad_start_cursor = try bad_start_document.root("[]");
+    try bad_start_cursor.advance();
+    try testing.expectError(error.TapeOutOfBounds, bad_start_cursor.matchingStart());
+
+    var string_tape = [_]TapeWord{.{
+        .kind = @intFromEnum(TapeKind.string),
+        .payload = 4,
+        .offset = 0,
+    }};
+    const string_document = Document{ .tape = string_tape[0..] };
+    var string_cursor = try string_document.root("\"x\"");
+    try testing.expectError(error.SourceOutOfBounds, string_cursor.rawValue());
+
+    var number_tape = [_]TapeWord{.{
+        .kind = @intFromEnum(TapeKind.number),
+        .payload = 0,
+        .offset = 0,
+    }};
+    const number_document = Document{ .tape = number_tape[0..] };
+    var number_cursor = try number_document.root("0");
+    try testing.expectError(error.TypeMismatch, number_cursor.containerCount());
 }

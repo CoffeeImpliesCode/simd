@@ -1,31 +1,37 @@
-# simd — Stage 2, Streaming, On-Demand Architecture Plan
+# simd — Stage 2, On-Demand, and Streaming Architecture
 
-Status: research + synthesis complete (Items 1, 3, 4, 5). No code changed.
-Scope: plan only. Each section is independently implementable; Item 1 and
-Item 4 share one Stage-1 contract and must land together.
+Status: Stage 1 is implemented for JSON, JSONL, JSONC, JSON5, Markdown, and XML.
+JSON also has Stage 2 tape validation, On-Demand traversal, and a chunk-fed
+Stage 1 `StreamIndexer`.
+
+Scope: this document records current contracts and the remaining roadmap.
+Sections marked **Future roadmap** are designs, not current APIs. Sections
+marked **Historical design record** describe the plan used for completed work.
 
 Grounded in: `papers/1902.08318_parsing_gigabytes_of_json_per_second.pdf`,
 `papers/2312.17149_on_demand_json.pdf`,
 `~/projects/github-simdjson-simdjson/doc/ondemand_design.md`, simdjson
 `json_scanner.h` / `json_structural_indexer.h` / tape design, RFC 8259, and the
-current repo (`src/core/simd.zig`, `src/core/stage1.zig`, `src/formats/*`).
-
-Current state: Stage 1 SIMD indexers for JSON/JSONL/JSONC/JSON5/Markdown/XML
-(all 64-byte hardwired), one-shot `[]const u8` → `StructuralIndex`. No Stage 2,
-no tape, no on-demand cursor, no streaming layer.
+current repo (`src/core/stage1.zig`, `src/core/stage2.zig`,
+`src/core/ondemand.zig`, `src/core/stream.zig`, and `src/formats/*`).
 
 ---
 
-## Item 1 — On-Demand Event Interface
+## Item 1 — On-Demand Event Interface (implemented for JSON)
 
-### Model: pull-based On-Demand cursor over `Stage1.StructuralIndex`
+The current JSON entry point is `json.initOnDemandDocument(parser, input)`.
+An `ondemand.Document` exposes `tokenCursor()` and `eventReader()`. Both read a
+complete caller-owned input slice. `EventReader` emits a pull event sequence,
+but it is not a chunk-at-a-time input reader.
 
-Recommended front-end: a zero-alloc pull cursor over the Stage 1 index,
-mirroring simdjson On-Demand's `json_iterator`/`value_iterator` (2023 paper:
-5.1 instr/byte geomean, ~70% faster than a DOM tape, up to 8.7 GiB/s on
-field-heavy queries). The cursor is the core; a zero-alloc `EventReader`
-(pull-SAX) is a thin adapter for streaming; the 64-bit tape (Item 4) remains
-the optional DOM layer for random access.
+### Historical design record: pull-based cursor over `Stage1.StructuralIndex`
+
+The selected front-end was a zero-allocation pull cursor over the Stage 1
+index, modeled on simdjson On-Demand. The 2023 paper reports a 5.1
+instructions-per-byte geometric mean, about 70 percent faster than a DOM tape,
+and up to 8.7 GiB/s on field-heavy queries. A zero-allocation `EventReader`
+adapts the cursor to pull events over resident input. The 64-bit tape provides
+a separate validated layer for cursor navigation.
 
 ```zig
 pub const Error = error{
@@ -118,22 +124,32 @@ pub const TapeKind = enum(u8) {
 };
 
 pub const TapeWord = packed struct(u64) {
-    kind: TapeKind,   // 8 bits
-    payload: u24,     // 24 bits: element count | jump-back | string length
-    offset: u32,      // 32 bits: absolute input offset
+    kind: u8,         // stored enum tag
+    payload: u24,     // element count | jump-back | string length
+    offset: u32,      // absolute input offset
+
+    pub fn tapeKind(self: TapeWord) TapeKind {
+        return @enumFromInt(self.kind);
+    }
 };
 comptime { std.debug.assert(@bitSizeOf(TapeWord) == 64); }
 ```
 
-Container back-patch: tape slots are append-only, so patch targets are stable;
-every back-patch is one store. On open, emit `{kind=open, payload=0}` and push
-a depth entry recording tape index + opening offset. On close, emit
-`{kind=close, payload=tape_index_of_open}` (jump-back), then patch the open
-word in place: `tape[open].payload = element_count`. Effect: open word → O(1)
-container skip via jump-back; close word → O(1) jump to matching open. `:` and
-`,` never appear on the tape.
+### `Document.root(input)` and `TapeCursor` ownership
 
-### Zero-alloc `EventReader` pull-adapter (SAX/streaming)
+A Stage 2 `Document` owns only its tape. `Document.root(input)` borrows the
+exact immutable JSON bytes used to build that tape. The input and the
+`Document` must outlive the returned `TapeCursor`. Raw string, number, and
+literal views are zero-copy slices of the borrowed input.
+
+Container tape slots are append-only, so back-patch targets are stable. On
+open, Stage 2 emits `{kind=open, payload=0}` and records the tape index. On
+close, it emits `{kind=close, payload=tape_index_of_open}`, then stores the
+element count in the opening word. A cursor scans nested words to skip forward
+from an opening word. A closing word supports an O(1) `matchingStart()` jump
+back to its opening word. `:` and `,` never appear on the tape.
+
+### Zero-allocation `EventReader` pull adapter over resident input
 
 ```zig
 pub const Event = union(enum) {
@@ -164,51 +180,50 @@ consumed silently. Laziness: events carry raw slices; unescape/convert only on
 `.get()`/`.int()`/`.double()`. Zero-alloc: `stack` lives in the struct (1024 ×
 ~16 B = 16 KiB, matching Item 4 `max_depth`).
 
-### Stage 1 extension requirement (index ↔ cursor bridge)
+### Completed Stage 1 contract (index ↔ cursor bridge)
 
-Current Stage 1 indexes structural chars and atom starts but NOT string-opening
-quotes. Without them no parser can find keys/string values from the index.
-Mirror simdjson `json_scanner.h` (opening quotes are pseudo-structural; closing
-quotes are not — `structural_start & ~string_tail`):
+Stage 1 indexes structural characters, atom starts, and unescaped
+string-opening quotes. This lets JSON parsers find keys and string values
+without a second quote search. The implementation mirrors simdjson
+`json_scanner.h`: opening quotes are pseudo-structural, and closing quotes are
+not.
 
 ```zig
 const string_start_quotes = unescaped_quotes & inside_without_closing;
 const structural_indexes = (structural | atom_starts | string_start_quotes) & outside_string;
 ```
 
-One-line delta to the existing `structural_indexes` expression in
-`src/formats/json.zig` (and `jsonl.zig`); all four mask variables already exist.
+After Stage 1 finishes, each indexer writes three sentinel entries:
+`indexes[n] = len`, `indexes[n+1] = len`, and `indexes[n+2] = 0`. This makes
+`peekLength` well-defined for the last real token and makes EOF detection exact.
+`StructuralIndex` reserves the three sentinel slots.
 
-**Sentinel padding (mandatory, mirrors simdjson `json_structural_indexer.h`).**
-After stage 1 finishes, write three sentinel entries: `indexes[n] = len;
-indexes[n+1] = len; indexes[n+2] = 0`. Effects: `peekLength` on the last real
-token is well-defined; EOF detection is exact; `skipChild` is bounds-checked.
-Requires `StructuralIndex.init` to allocate `max_capacity + 3` and the indexers
-to fill sentinels at the end of their last window.
+The quote and sentinel rules are shared by the implemented JSON Stage 2 and
+On-Demand paths. The old assumption that quotes were not indexed is no longer
+current.
 
-> Coordination note: this supersedes the "quotes NOT indexed" assumption in the
-> Item 4 draft (tape string offsets become `opening quote` from the index
-> instead of a validator re-scan). Items 1 and 4 MUST share one Stage-1
-> contract; the merged design resolves which section is authoritative.
+### Performance: locality and allocation
 
-### Performance: locality, allocation, DOM crossover
-
-| Property | On-Demand cursor | EventReader | DOM tape (Item 4) |
+| Property | On-Demand cursor | EventReader | Stage 2 tape cursor |
 |---|---|---|---|
-| Heap allocs per doc | 0 (scratch reused) | 0 | index + tape + string buffer |
-| Per-token working set | 4 B index + 1 input byte | same | index + 8 B tape word |
-| Skip cost | O(sub-tree), depth counter | same | O(1) jump-back |
-| Convert cost | only on `get_*` | only on `.get()` | eager at build |
-| Random access | rewind + re-scan | no | yes (O(1) container skip) |
+| Heap allocations per document | 0 (parser scratch reused) | 0 | owned tape |
+| Per-token working set | 4-byte index + input byte | same | 8-byte tape word + input |
+| Forward skip cost | O(subtree), depth counter | same | O(subtree), tape scan |
+| Convert cost | only on `get_*` | only on `.get()` | raw views stay lazy |
+| End-to-start navigation | no | no | O(1) with `matchingStart()` |
 
-DOM tape wins for: many point queries, repeated reads of the same nested value,
-retaining the tree after the input buffer is mutated. On-demand wins for:
-single-pass streaming, partial reads, format conversion, memory-constrained
-hosts, skip-heavy traversals. Numbers nobody reads are never converted.
+The tape is useful for validated repeated traversal. It does not own source
+bytes. Raw-value access requires the exact immutable input passed to
+`Document.root(input)`. On-Demand is useful for single-pass event iteration,
+partial reads, format conversion, constrained memory, and skip-heavy traversal.
+Numbers that a caller does not read are not converted.
 
 ---
 
-## Item 3 — Vector-Width Dispatch (16/32/64 bytes)
+## Item 3 — Vector-Width Dispatch (implemented)
+
+The current indexers select 16-, 32-, or 64-byte vectors at compile time. The
+design and adaptation inventory below are a **Historical design record**.
 
 ### Decision: comptime monomorphization, not a runtime vtable
 
@@ -296,9 +311,9 @@ construction from `@Vector` lowering. CI exercises all three widths via
 `-Dcpu=x86_64+avx512f` (64), `-Dcpu=x86_64_v3` (32), baseline (16); `build.zig`
 needs no width plumbing.
 
-### Adaptation inventory
+### Historical adaptation inventory
 
-| File | Today (64-hardwired) | Change |
+| File | Pre-implementation state | Implemented change |
 |---|---|---|
 | `src/core/simd.zig` | `computeBackslashRuns64`, `BackslashResult64`, `extractBitIndexes(u64,…)`, `trailingBackslashRunOdd(Vec(64,u8),…)` | genericize; keep `…64` comptime aliases |
 | `src/core/stage1.zig` | none | unchanged |
@@ -332,20 +347,20 @@ VLEN instantiation unchanged. Keep them; extend the sweep:
 
 ---
 
-## Item 4 — Stage 2 Structural Validation (`src/core/stage2.zig`)
+## Item 4 — Stage 2 Structural Validation (implemented for JSON)
 
-New module, exported from `src/root.zig` as `stage2` (follows `stage1`;
-`root_test.zig` extends `refAllDecls`). Consumes the Stage 1 `StructuralIndex`
-as a cursor, produces a validated tape. Stage 2 drives the scan from the index
-but reads input bytes directly for strings/atom interiors, asserting index
-consistency at each token (`assert(index[i] == pos)`); invisible garbage bytes
-Stage 1 skipped are caught here as `UnexpectedToken` at the exact byte.
+`src/core/stage2.zig` is exported from `src/root.zig` as `stage2`. It consumes
+a Stage 1 `StructuralIndex` and produces a validated, owned tape. Stage 2
+drives the scan from the index and reads input bytes for strings and atom
+interiors.
 
 ### Tape layout — `TapeWord` (64-bit packed, shared with Item 1)
 
-Capacity = `input.len` words (one token max per byte, matching `StructuralIndex`
-capacity precedent). Open-container element counts and jump-back tape indexes are
-< `input.len` ≤ 2^32; both fit. The u24 payload caps a single string at 16 MiB.
+The tape allocates at most one word per input byte. Absolute input offsets use
+`u32`. The `u24` payload stores container counts, closing-word jump-back tape
+indexes, and string lengths. Stage 2 returns `error.TapeTooLarge` before any
+payload value greater than `std.math.maxInt(u24)` is stored. Inputs whose
+offsets do not fit `u32` also return `error.TapeTooLarge`.
 
 ### Depth — `DepthEntry` / `DepthStack`
 
@@ -384,11 +399,11 @@ are needed per level anyway.
 
 ### Tape back-patching
 
-On close of container `e = depth.pop()`:
-`tape[e.tape_index].payload = e.count` (open ← element count);
-`tape[tape_count] = {.kind = end, .payload = @intCast(e.tape_index), .offset = close_pos}`
-(close ← jump-back). The close word carries the jump-back so Stage 3 skips a
-container in O(1).
+When a container closes, Stage 2 stores its element count in the opening word.
+It stores the opening tape index in the closing word. The `u24` payload bound
+applies to both values. `TapeCursor.skipValue()` scans and validates each word
+in a forward subtree, so its cost is O(subtree). From a closing word,
+`matchingStart()` uses the stored jump-back index in O(1).
 
 ### Error set (confirmed 12)
 
@@ -406,14 +421,15 @@ control bytes < 0x20 inside strings → `InvalidEscape` (RFC 8259 §7); malforme
 literals (`tru`, `nulx`) → `UnexpectedToken` with context
 `expected literal true/false/null`; `InvalidNumber` reserved for number-grammar.
 
-**Open decisions for Main:**
-- `StringTooLong`: u24 caps one string at 16 MiB. If longer strings must be
-  supported: add `StringTooLong` as a 13th error, or spill length to a second
-  tape word.
-- BOM policy: accept+skip leading UTF-8 BOM (`EF BB BF`) or reject as
-  `UnexpectedToken`. RFC 8259 permits either.
-- Duplicate-key equality is raw-byte in v1 (`"a"` vs `"\u0061"` not detected);
-  escaped-key unescaping is a later refinement.
+### Future roadmap: optional validation policies
+
+- The current `u24` payload reports `TapeTooLarge` for a string longer than
+  `std.math.maxInt(u24)` bytes. A wider payload or a continuation word could
+  remove this bound.
+- The BOM policy can become an explicit option. The current RFC JSON path does
+  not expose such an option.
+- Duplicate-key equality and escaped-key normalization need a defined policy
+  before duplicate-key checking becomes a supported option.
 
 ### `Diagnostic` — fail-fast, first error only
 
@@ -466,11 +482,9 @@ Transitions:
 Atom span = maximal run of `[0-9 + - . e E]`; the byte after MUST be a delimiter
 (`ws , ] } :`) else `UnexpectedToken` at that byte (catches `1a`). DFA rejects
 `01`, `1.`, `.5`, `+1`, `1e`, `1e+`, `-`, `--1`; accepts RFC-valid numbers.
-Conversion is strictly lazy (Stage 3): span without `.`/`e`/`E` →
-`std.fmt.parseInt(i64, atom, 10)`; else `std.fmt.parseFloat(f64, atom)`.
-`parseFloat`'s accepted superset is unreachable (DFA ran first); `1e400`
-(grammar-valid) → `error.Overflow` at iteration, never at validation. Numbers
-nobody reads are never converted.
+Stage 2 validates number syntax but does not convert numeric values. Consumers
+can convert a valid span lazily. The current `TapeCursor` exposes raw slices,
+so numbers that a caller does not read are not converted.
 
 ### String validation
 
@@ -478,62 +492,59 @@ Scalar scan from `q+1`: `\` → escape table (`" \ / b f n r t` → advance 2; `
 → exactly 4 hex digits via `std.fmt.charToDigit` else `InvalidEscape`); `"` →
 close; byte < 0x20 → `InvalidEscape`; `i == input.len` → `UnterminatedString` at
 `q`. UTF-8: `std.unicode.utf8ValidateSlice(content)` else `InvalidUtf8` (first
-invalid byte via `Utf8Iterator`). Escape bytes are ASCII so validating raw
-content is correct; `\uD8xx\uDCxx` surrogate pairs stay literal text at Stage 2,
-unpaired surrogates fail only at Stage 3 decode (flagged).
+invalid byte via `Utf8Iterator`). Escape bytes are ASCII, so validating raw
+content is correct. Stage 2 validates escapes but does not decode them. The
+current `TapeCursor` raw string view remains escaped.
 
 ### Eager vs lazy (Item 4 verdict)
 
 - **Eager at tape build:** structural validation (bracket matching, colon/comma
-  placement, counts/jumps); string EXTENT scanning (length lives in the tape
-  word); escape/UTF-8/number-SYNTAX validation. Payoff: sound-tape invariant,
-  deterministic first-error diagnostics, a validate-only entry point
-  (`validateJson` = Stage 1 + 2, tape discarded).
-- **Lazy at iteration:** numeric VALUE conversion and surrogate decoding.
+  placement, counts/jumps), string extent scanning (length lives in the tape
+  word), escape/UTF-8/number syntax validation. This gives a sound-tape
+  invariant, deterministic first-error diagnostics, and a validate-only entry
+  point (`validateJson` runs Stage 1 + 2, then discards the tape).
+- **Lazy at consumption:** raw source views remain zero-copy. Numeric conversion
+  and escape decoding belong to consumers and are not done for unread values.
 - Cost: one extra byte walk per atom at build (~1–2 cycles/byte scalar), tape
-  8 B/token vs 4 B index; total memory ≤ ~13× input worst case, typically 2–3×.
-- **Duplicate keys** (option-gated): `ValidateOptions { check_duplicate_keys:
-  bool = false, max_string_length: u32 = 16 MiB }`. When enabled: open-addressing
-  set of FNV-1a-64 hashes over raw key content per open object (pow2 ≥ 2×members,
-  doubling at load 0.5, freed at close); hash+length match → byte compare →
-  `DuplicateKey` at second key's quote. Disabled → zero cost.
+  8 B/token vs 4 B index. Total memory is ≤ ~13× input in the worst case and
+  typically 2–3×.
+- **Future roadmap: duplicate keys.** `Error.DuplicateKey` reserves the error
+  name, but the current API does not expose duplicate-key options. A later
+  implementation can compare decoded keys and define duplicate-key policy.
 
-### Error recovery
+### Future roadmap: error recovery
 
-v1 = fail-fast with a single `Diagnostic` (simdjson-style). Recovery mode
-(re-scan to next `,`/close at same depth) is out of v1 scope.
+The current validator fails at the first `Diagnostic`. Recovery by scanning to
+the next separator or matching close token remains future work.
 
-### Wiring & verification
+### Current wiring
 
-- `src/root.zig`: `pub const stage2 = @import("core/stage2.zig");` + `refAllDecls`.
-- `src/formats/json.zig`: `buildJsonTape(allocator, input)` = `indexJson` +
-  `stage2.buildTape`; `validateJson(input)` → first `Diagnostic`.
-- `src/formats/jsonl.zig`: `validateJsonl` — records split on indexed `\n`
-  (`\r\n` handled), empty/whitespace-only records skipped, absolute diagnostics.
-- `build.zig`: unchanged (existing `zig build test` runs lib + exe + Smith fuzz).
-- Verification: scalar reference twin; Smith differential fuzz (accept/reject
-  agreement + tape invariants: open-word count == elements walked, close-word
-  jump-back == open tape index, string offsets monotone); error-set comptime
-  sweep (`inline for` over `@typeInfo(Error)`); depth 1024/1025 boundaries;
-  grammar tables (number DFA, escapes, `\uXXXX`, raw control bytes, Unicode,
-  dup-key on/off, BOM); corpus goldens (twitter.json / example_config.json);
-  `refAllDecls`.
+- `src/root.zig` exports `stage2`.
+- `json.buildJsonTape(allocator, input)` runs JSON Stage 1 and Stage 2.
+- `json.validateJson(allocator, input)` returns the first optional
+  `stage2.Diagnostic`.
+- JSONL, JSONC, JSON5, Markdown, and XML currently expose Stage 1 only.
 
 ---
 
-## Item 5 — Streaming / Chunk-at-a-Time Reader
+## Item 5 — Streaming / Chunk-at-a-Time Input
 
-### Goal
+### Implemented JSON baseline
 
-Feed arbitrarily large documents in chunks split at arbitrary byte boundaries,
-getting identical structural output to the one-shot path, growing the index
-without bound.
+`src/core/stream.zig` implements a chunk-fed JSON Stage 1 `StreamIndexer`.
+Its public lifecycle is `init`, `feed`, `finish`, `take`, `reset`, and
+`deinit`. It copies chunks through two fixed padded slots and produces a
+`StructuralIndex`.
 
-### `CarryState`: unified cross-chunk tokenizer state
+The current stream module does not accept `std.Io.Reader`. It does not run
+Stage 2 or On-Demand traversal, and it does not support the other five
+formats.
 
-Today each indexer scatters per-format tokenizer state in locals over one pass.
-Streaming splits that pass; any state surviving a chunk boundary is collected
-into one struct.
+### Future roadmap: general streaming reader
+
+The remaining goal is to feed arbitrarily large documents through a reader,
+preserve format-specific state across arbitrary boundaries, and match one-shot
+Stage 1 output for every supported format.
 
 ```zig
 pub const CarryState = struct {
@@ -564,7 +575,7 @@ boundary is only legal where no field needs lookahead; the margin (below) keeps
 the needed bytes resident. `reset()` zeroes wholesale
 (`*std.mem.zeroes(CarryState)`).
 
-### `StreamIndexer` API (Model B: padded double buffer)
+### Future `StreamIndexer` expansion (Model B: padded double buffer)
 
 ```zig
 pub const StreamIndexer = struct {
@@ -662,7 +673,7 @@ refactored to the same backing stores so streaming and batch never fork.
    indexer on that sequence, including truncation: `error.Truncated` iff `carry`
    non-empty at end-of-stream.
 
-### Zig 0.16 `std.Io.Reader` integration (non-generic)
+### Future `std.Io.Reader` integration
 
 Use `std.Io.Reader` (Io-instance world; non-generic, vtable-backed — do not
 implement per-stream generic `Reader` types):
@@ -679,29 +690,23 @@ implement per-stream generic `Reader` types):
 
 ---
 
-## Cross-cutting decisions for Main
+## Current cross-cutting decisions
 
-1. **Item 1 ↔ Item 4 shared Stage-1 contract.** Stage 1 must index string
-   opening quotes AND write `(len, len, 0)` sentinel padding. This supersedes
-   "quotes NOT indexed" in the Item 4 draft. Land Items 1 and 4 together or
-   sequence 4 then 1 with the contract fixed first.
-2. **`StringTooLong` (13th error) / BOM policy / raw-byte dup-key equality** —
-   three open decisions gated on corpus/streaming needs (Item 4).
-3. **`detectVlen()`** is the single source of truth for width across indexers,
-   `main`, and the streaming margin (Item 3 ↔ Item 5).
-4. **No native `--fuzz`** — the deterministic Smith harness is the fuzz path
-   (upstream Zig 0.16 `--fuzz` runner is broken; already worked around).
+1. Stage 1 indexes JSON string-opening quotes and writes `(len, len, 0)`
+   sentinel padding.
+2. `simd.default_vector_len` is the current vector-width source for the six
+   Stage 1 indexers.
+3. JSON Stage 2 owns its tape and borrows source bytes only when
+   `Document.root(input)` creates a cursor.
+4. JSON On-Demand consumes complete resident input through parser-owned
+   structural storage.
+5. JSON streaming currently ends at Stage 1 `StructuralIndex` production.
 
-## Proposed implementation order
+## Future roadmap
 
-1. **Item 3 (vector width)** — self-contained, no contract coupling, enables
-   Item 5's VLEN-aware margin. Lowest risk, do first.
-2. **Item 4 (Stage 2 validation)** — scalar over the index, independent of
-   width. Establishes the tape + depth + error/diagnostic surface.
-3. **Item 1 (on-demand cursor + EventReader)** — depends on Item 4's tape and
-   on the Stage-1 quote/sentinel contract. Requires the Stage-1 extension.
-4. **Item 5 (streaming)** — depends on Item 3 (VLEN margin) and Item 1
-   (DocumentStreamIndexer facade).
-
-Each step lands as its own atomic commit, green (fmt + Debug/ReleaseSafe test +
-Smith fuzz) before the next.
+1. Add chunk-fed Stage 1 support for JSONL, JSONC, JSON5, Markdown, and XML.
+2. Add `std.Io.Reader` integration without presenting pull events as an input
+   streaming API.
+3. Define how chunked source storage outlives Stage 2 or On-Demand cursors
+   before those APIs consume streamed input.
+4. Define wider tape payloads if values beyond the `u24` bound are required.

@@ -662,6 +662,56 @@ test "buildJsonTape returns a validated owned tape" {
     try testing.expectEqual(@as(u32, 6), document.tape[2].offset);
 }
 
+test "buildJsonTape Document.root borrows exact input while document stays alive" {
+    const input =
+        \\{"a\n":"x\u0041","number":-12.5e+2,"enabled":false,"missing":null}
+    ;
+    var document = try buildJsonTape(testing.allocator, input);
+    defer document.deinit(testing.allocator);
+
+    var cursor = try document.root(input);
+    try cursor.advance();
+
+    const raw_key = try cursor.rawValue();
+    try testing.expectEqualStrings("a\\n", raw_key);
+    try testing.expect(
+        raw_key.ptr ==
+            input.ptr + @as(usize, document.tape[cursor.position()].offset) + 1,
+    );
+
+    try cursor.advance();
+    const raw_string = try cursor.rawValue();
+    try testing.expectEqualStrings("x\\u0041", raw_string);
+    try testing.expect(
+        raw_string.ptr ==
+            input.ptr + @as(usize, document.tape[cursor.position()].offset) + 1,
+    );
+
+    try cursor.advance();
+    try cursor.advance();
+    const raw_number = try cursor.rawValue();
+    try testing.expectEqualStrings("-12.5e+2", raw_number);
+    try testing.expect(
+        raw_number.ptr == input.ptr + @as(usize, document.tape[cursor.position()].offset),
+    );
+
+    try cursor.advance();
+    try cursor.advance();
+    const raw_bool = try cursor.rawValue();
+    try testing.expectEqualStrings("false", raw_bool);
+    try testing.expect(
+        raw_bool.ptr == input.ptr + @as(usize, document.tape[cursor.position()].offset),
+    );
+
+    try cursor.advance();
+    try cursor.advance();
+    const raw_null = try cursor.rawValue();
+    try testing.expectEqualStrings("null", raw_null);
+    try testing.expect(
+        raw_null.ptr == input.ptr + @as(usize, document.tape[cursor.position()].offset),
+    );
+}
+
 test "buildJsonTape rejects invalid RFC JSON grammar" {
     try testing.expectError(
         error.TrailingComma,
