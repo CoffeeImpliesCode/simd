@@ -402,7 +402,7 @@ pub const DepthEntry = struct {
 };
 
 pub const DepthStack = struct {
-    entries: [max_depth]DepthEntry = undefined,
+    entries: [max_depth]DepthEntry,
     top: usize = 0,
 
     pub fn push(self: *DepthStack, entry: DepthEntry) Error!void {
@@ -447,6 +447,8 @@ pub fn buildTape(
         .indexes = indexes,
         .tape = &tape,
         .dialect = dialect,
+        // SAFETY: push writes every entry before top exposes it.
+        .depth = .{ .entries = undefined },
     };
     try parser.run();
 
@@ -468,6 +470,8 @@ pub fn validate(
         .input = input,
         .indexes = structural_index.slice(),
         .dialect = dialect,
+        // SAFETY: push writes every entry before top exposes it.
+        .depth = .{ .entries = undefined },
     };
     parser.run() catch |err| {
         if (err == error.TapeTooLarge) return error.TapeTooLarge;
@@ -547,7 +551,7 @@ const Parser = struct {
     byte_position: usize = 0,
     failure_offset: usize = 0,
     tape_count: usize = 0,
-    depth: DepthStack = .{},
+    depth: DepthStack,
     expect: Expect = .value_after_open,
     root_started: bool = false,
     root_done: bool = false,
@@ -1753,7 +1757,13 @@ fn parseJson5IdentifierEscape(
             return error.UnexpectedToken;
         }
         const pair = [_]u16{ first, second };
-        const codepoint = std.unicode.utf16DecodeSurrogatePair(&pair) catch unreachable;
+        // The preceding checks establish the decoder's surrogate-pair preconditions.
+        const codepoint = std.unicode.utf16DecodeSurrogatePair(&pair) catch |err| {
+            std.debug.panic(
+                "validated UTF-16 surrogate pair failed to decode: {s}",
+                .{@errorName(err)},
+            );
+        };
         return .{ .codepoint = codepoint, .width = 12 };
     }
     if (std.unicode.utf16IsLowSurrogate(first)) {
@@ -2158,6 +2168,7 @@ test "TapeWord payload encoding never truncates u24 values" {
         .input = &.{},
         .indexes = &.{},
         .dialect = .json,
+        .depth = .{ .entries = undefined },
     };
     try testing.expectEqual(
         @as(u24, 0),
@@ -2169,6 +2180,7 @@ test "TapeWord payload encoding never truncates u24 values" {
         .input = &.{},
         .indexes = &.{},
         .dialect = .json,
+        .depth = .{ .entries = undefined },
         .tape = &tape,
     };
     try testing.expectEqual(

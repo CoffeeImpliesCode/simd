@@ -725,10 +725,18 @@ pub fn buildXmlTape(
     );
     errdefer tape.deinit(allocator);
 
-    var parser = XmlParser{
-        .input = input,
+    // Every frame is written before stack_top exposes it. Keep the backing storage
+    // uninitialized to avoid clearing the fixed stack for each parse.
+    var stack: [xml_max_depth]XmlFrame = undefined;
+    var output = XmlTapeOutput{
         .allocator = allocator,
         .tape = &tape,
+    };
+
+    var parser = XmlParser{
+        .input = input,
+        .output = &output,
+        .stack = stack[0..],
     };
     try parser.run();
     return .{ .tape = try tape.toOwnedSlice(allocator) };
@@ -737,10 +745,14 @@ pub fn buildXmlTape(
 pub fn validateXml(input: []const u8) XmlValidationError!?XmlDiagnostic {
     if (input.len > std.math.maxInt(u32)) return error.TapeTooLarge;
 
+    // Every frame is written before stack_top exposes it. Keep the backing storage
+    // uninitialized to avoid clearing the fixed stack for each parse.
+    var stack: [xml_max_depth]XmlFrame = undefined;
+
     var parser = XmlParser{
         .input = input,
-        .allocator = undefined,
-        .tape = null,
+        .output = null,
+        .stack = stack[0..],
     };
     parser.run() catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -790,15 +802,19 @@ const XmlDecoded = struct {
     length: usize,
 };
 
+const XmlTapeOutput = struct {
+    allocator: std.mem.Allocator,
+    tape: *std.ArrayList(XmlTapeWord),
+};
+
 const XmlParser = struct {
     input: []const u8,
-    allocator: std.mem.Allocator,
-    tape: ?*std.ArrayList(XmlTapeWord),
+    output: ?*XmlTapeOutput,
+    stack: []XmlFrame,
     failure_offset: usize = 0,
     source_error: ?XmlError = null,
     source_failure_offset: usize = 0,
     position: usize = 0,
-    stack: [xml_max_depth]XmlFrame = undefined,
     stack_top: usize = 0,
     root_seen: bool = false,
     root_closed: bool = false,
@@ -1076,8 +1092,8 @@ const XmlParser = struct {
         }
 
         var element_word_index: ?usize = null;
-        if (self.tape) |tape| {
-            element_word_index = tape.items.len;
+        if (self.output) |output| {
+            element_word_index = output.tape.items.len;
             try self.emit(.element_start, start, name_end);
         }
 
@@ -1139,19 +1155,19 @@ const XmlParser = struct {
             attribute_seen = true;
         }
 
-        if (self.stack_top >= xml_max_depth and !self_closing) {
+        if (self.stack_top >= self.stack.len and !self_closing) {
             return self.fail(error.DepthExceeded, start);
         }
         if (cursor - start > std.math.maxInt(u24)) {
             return self.fail(error.TapeTooLarge, start);
         }
         if (!self.root_seen) self.root_seen = true;
-        if (self.tape) |tape| {
+        if (self.output) |output| {
             const tape_index = element_word_index orelse unreachable;
-            tape.items[tape_index].kind = @intFromEnum(
+            output.tape.items[tape_index].kind = @intFromEnum(
                 if (self_closing) XmlTapeKind.self_closing_element else XmlTapeKind.element_start,
             );
-            tape.items[tape_index].payload = @intCast(cursor - start);
+            output.tape.items[tape_index].payload = @intCast(cursor - start);
         }
         if (self_closing) {
             if (self.stack_top == 0) self.root_closed = true;
@@ -1195,8 +1211,8 @@ const XmlParser = struct {
         if (start > std.math.maxInt(u32) or length > std.math.maxInt(u24)) {
             return self.fail(error.TapeTooLarge, start);
         }
-        if (self.tape) |tape| {
-            try tape.append(self.allocator, .{
+        if (self.output) |output| {
+            try output.tape.append(output.allocator, .{
                 .kind = @intFromEnum(kind),
                 .payload = @intCast(length),
                 .offset = @intCast(start),

@@ -228,7 +228,7 @@ pub fn validateMarkdownIndex(
     input: []const u8,
     structural_index: *const MarkdownStructuralIndex,
 ) MarkdownValidationError!?MarkdownDiagnostic {
-    const max_offset = @as(usize, std.math.maxInt(u32));
+    const max_offset: usize = std.math.maxInt(u32);
     if (input.len > max_offset) return error.TapeTooLarge;
     if (structural_index.count > max_offset) return error.TapeTooLarge;
     const tape_size = std.math.mul(
