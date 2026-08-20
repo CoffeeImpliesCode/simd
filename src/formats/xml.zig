@@ -30,6 +30,372 @@ pub const XmlStructuralIndex = struct {
     }
 };
 
+const XmlMarkupCandidateKind = enum {
+    unknown,
+    comment,
+    cdata,
+};
+
+const XmlMarkupCandidate = struct {
+    token_index: usize,
+    start_offset: usize,
+    prefix_len: u8,
+    kind: XmlMarkupCandidateKind,
+};
+
+/// Incrementally builds the same XML structural index as indexXml.
+///
+/// The indexer copies no caller bytes. It retains only lexical state for an
+/// unfinished markup opener, so every offset remains relative to the document
+/// assembled by feed.
+pub const XmlStreamIndexer = struct {
+    allocator: std.mem.Allocator,
+    index: ?stage1.StructuralIndex = null,
+    kinds: ?[]XmlTokenKind = null,
+    input_len: usize = 0,
+    previous_byte: u8 = 0,
+    in_comment: bool = false,
+    comment_start_offset: usize = 0,
+    comment_previous_previous: u8 = 0,
+    comment_previous: u8 = 0,
+    in_cdata: bool = false,
+    cdata_previous_previous: u8 = 0,
+    cdata_previous: u8 = 0,
+    in_tag: bool = false,
+    in_attr_quote: ?u8 = null,
+    candidate: ?XmlMarkupCandidate = null,
+    finished: bool = false,
+
+    const Self = @This();
+    const initial_output_capacity: usize = 1;
+
+    pub const InitError = stage1.StructuralIndex.InitError;
+    pub const FeedError = std.mem.Allocator.Error || error{
+        AlreadyFinished,
+        CapacityOverflow,
+        InputTooLarge,
+    };
+    pub const FinishError = std.mem.Allocator.Error || error{
+        CapacityOverflow,
+        InputTooLarge,
+    };
+    const CapacityError = std.mem.Allocator.Error || error{
+        CapacityOverflow,
+        InputTooLarge,
+    };
+
+    /// Allocates structural storage with chunk_len as its initial capacity.
+    pub fn init(allocator: std.mem.Allocator, chunk_len: usize) InitError!Self {
+        const output_capacity = @max(chunk_len, initial_output_capacity);
+        var index = try stage1.StructuralIndex.init(allocator, output_capacity);
+        errdefer index.deinit(allocator);
+        const kinds = try allocator.alloc(XmlTokenKind, output_capacity);
+
+        return .{
+            .allocator = allocator,
+            .index = index,
+            .kinds = kinds,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        if (self.index) |*index| {
+            index.deinit(self.allocator);
+        }
+        if (self.kinds) |kinds| {
+            self.allocator.free(kinds);
+        }
+        self.* = undefined;
+    }
+
+    /// Adds a caller-owned chunk without retaining a reference to that chunk.
+    pub fn feed(self: *Self, data: []const u8) FeedError!void {
+        if (self.finished) return error.AlreadyFinished;
+
+        const new_input_len = std.math.add(usize, self.input_len, data.len) catch {
+            return error.CapacityOverflow;
+        };
+        if (new_input_len > std.math.maxInt(u32)) return error.InputTooLarge;
+
+        try self.ensureOutputCapacity(data.len);
+
+        const chunk_start_offset = self.input_len;
+        self.input_len = new_input_len;
+        for (data, 0..) |byte, chunk_offset| {
+            self.processByte(byte, chunk_start_offset + chunk_offset);
+        }
+    }
+
+    /// Finalizes the index and flushes all pending lexical state at EOF.
+    pub fn finish(self: *Self) FinishError!void {
+        if (self.finished) return;
+
+        // A partial opener has already emitted its '<' token. Its remaining
+        // bytes are non-structural at EOF, so no synthetic token is needed.
+        self.candidate = null;
+        try self.ensureOutputCapacity(0);
+        if (self.index) |*index| {
+            try index.finish(self.input_len);
+        } else {
+            unreachable;
+        }
+        self.finished = true;
+    }
+
+    /// Transfers the finalized structural index to the caller.
+    pub fn take(self: *Self) XmlStructuralIndex {
+        std.debug.assert(self.finished);
+        std.debug.assert(self.index != null);
+        std.debug.assert(self.kinds != null);
+
+        const index = self.index.?;
+        const kinds = self.kinds.?;
+        self.index = null;
+        self.kinds = null;
+        return .{
+            .indexes = index.indexes,
+            .kinds = kinds,
+            .count = index.count,
+        };
+    }
+
+    /// Starts a new document while retaining the current allocation capacity.
+    pub fn reset(self: *Self) void {
+        if (self.index) |*index| {
+            index.count = 0;
+        }
+        self.input_len = 0;
+        self.in_comment = false;
+        self.comment_start_offset = 0;
+        self.previous_byte = 0;
+        self.comment_previous_previous = 0;
+        self.comment_previous = 0;
+        self.in_cdata = false;
+        self.cdata_previous_previous = 0;
+        self.cdata_previous = 0;
+        self.in_tag = false;
+        self.in_attr_quote = null;
+        self.candidate = null;
+        self.finished = false;
+    }
+
+    fn ensureOutputCapacity(self: *Self, additional: usize) CapacityError!void {
+        if (self.index == null) {
+            std.debug.assert(self.kinds == null);
+            const output_capacity = @max(additional, initial_output_capacity);
+            var index = try stage1.StructuralIndex.init(
+                self.allocator,
+                output_capacity,
+            );
+            errdefer index.deinit(self.allocator);
+            const kinds = try self.allocator.alloc(XmlTokenKind, output_capacity);
+            self.index = index;
+            self.kinds = kinds;
+            return;
+        }
+
+        const index = &self.index.?;
+        const kinds = self.kinds orelse unreachable;
+        const required = std.math.add(usize, index.count, additional) catch {
+            return error.CapacityOverflow;
+        };
+        if (required <= index.indexes.len - 3 and required <= kinds.len) return;
+
+        const doubled_capacity = std.math.mul(usize, kinds.len, 2) catch required;
+        const new_capacity = @max(
+            required,
+            @max(doubled_capacity, initial_output_capacity),
+        );
+        const new_index_len = std.math.add(usize, new_capacity, 3) catch {
+            return error.CapacityOverflow;
+        };
+        index.indexes = try self.allocator.realloc(index.indexes, new_index_len);
+        self.kinds = try self.allocator.realloc(kinds, new_capacity);
+    }
+
+    fn processByte(self: *Self, byte: u8, offset: usize) void {
+        if (self.in_comment) {
+            self.processCommentByte(byte, offset);
+            self.previous_byte = byte;
+            return;
+        }
+
+        if (self.in_cdata) {
+            self.processCdataByte(byte);
+            self.previous_byte = byte;
+            return;
+        }
+
+        if (self.in_attr_quote) |quote| {
+            if (byte == quote) {
+                self.appendToken(offset, .attr_quote);
+                self.in_attr_quote = null;
+            }
+            self.previous_byte = byte;
+            return;
+        }
+
+        if (self.candidate != null) {
+            if (self.advanceCandidate(byte)) {
+                self.previous_byte = byte;
+                return;
+            }
+        }
+
+        self.processResolvedByte(byte, offset);
+        self.previous_byte = byte;
+    }
+
+    fn processCommentByte(self: *Self, byte: u8, offset: usize) void {
+        if (byte == '>' and offset >= self.comment_start_offset and
+            offset - self.comment_start_offset >= 6 and
+            self.comment_previous_previous == '-' and self.comment_previous == '-')
+        {
+            self.in_comment = false;
+        }
+        self.comment_previous_previous = self.comment_previous;
+        self.comment_previous = byte;
+    }
+
+    fn processCdataByte(self: *Self, byte: u8) void {
+        if (byte == '>' and self.cdata_previous_previous == ']' and
+            self.cdata_previous == ']')
+        {
+            self.in_cdata = false;
+        }
+        self.cdata_previous_previous = self.cdata_previous;
+        self.cdata_previous = byte;
+    }
+
+    fn processResolvedByte(self: *Self, byte: u8, offset: usize) void {
+        if (byte == '<') {
+            self.appendToken(offset, .tag_open);
+            self.in_tag = true;
+            const structural_index = self.index orelse unreachable;
+            self.candidate = .{
+                .token_index = structural_index.count - 1,
+                .start_offset = offset,
+                .prefix_len = 1,
+                .kind = .unknown,
+            };
+            return;
+        }
+
+        if (!self.in_tag) return;
+
+        switch (byte) {
+            '=' => self.appendToken(offset, .attr_equals),
+            '"', '\'' => {
+                self.appendToken(offset, .attr_quote);
+                self.in_attr_quote = byte;
+            },
+            '>' => {
+                if (self.previous_byte == '/') {
+                    self.appendToken(offset - 1, .self_close);
+                } else if (self.previous_byte == '?') {
+                    self.appendToken(offset - 1, .proc_inst_close);
+                } else {
+                    self.appendToken(offset, .tag_close);
+                }
+                self.in_tag = false;
+            },
+            else => {},
+        }
+    }
+
+    fn advanceCandidate(self: *Self, byte: u8) bool {
+        var candidate = self.candidate orelse return false;
+
+        if (candidate.prefix_len == 1) {
+            switch (byte) {
+                '/' => {
+                    const kinds = self.kinds orelse unreachable;
+                    kinds[candidate.token_index] = .closing_tag_open;
+                    self.candidate = null;
+                    return true;
+                },
+                '?' => {
+                    const kinds = self.kinds orelse unreachable;
+                    kinds[candidate.token_index] = .proc_inst_open;
+                    self.candidate = null;
+                    return true;
+                },
+                '!' => {
+                    candidate.prefix_len = 2;
+                    self.candidate = candidate;
+                    return true;
+                },
+                else => {
+                    self.candidate = null;
+                    return false;
+                },
+            }
+        }
+
+        if (candidate.prefix_len == 2) {
+            if (byte == '-') {
+                candidate.kind = .comment;
+                candidate.prefix_len = 3;
+                self.candidate = candidate;
+                return true;
+            }
+            if (byte == '[') {
+                candidate.kind = .cdata;
+                candidate.prefix_len = 3;
+                self.candidate = candidate;
+                return true;
+            }
+            self.candidate = null;
+            return false;
+        }
+
+        const literal: []const u8 = switch (candidate.kind) {
+            .comment => "<!--",
+            .cdata => "<![CDATA[",
+            .unknown => unreachable,
+        };
+        const literal_len: u8 = @intCast(literal.len);
+        const prefix_index: usize = @intCast(candidate.prefix_len);
+        if (byte != literal[prefix_index]) {
+            self.candidate = null;
+            return false;
+        }
+        candidate.prefix_len += 1;
+        if (candidate.prefix_len == literal_len) {
+            switch (candidate.kind) {
+                .comment => {
+                    self.in_comment = true;
+                    self.comment_start_offset = candidate.start_offset;
+                    self.comment_previous_previous = '-';
+                    self.comment_previous = '-';
+                    self.in_tag = false;
+                },
+                .cdata => {
+                    self.in_cdata = true;
+                    self.cdata_previous_previous = 'A';
+                    self.cdata_previous = '[';
+                    self.in_tag = false;
+                },
+                .unknown => unreachable,
+            }
+            self.candidate = null;
+        } else {
+            self.candidate = candidate;
+        }
+        return true;
+    }
+
+    fn appendToken(self: *Self, index: usize, kind: XmlTokenKind) void {
+        const structural_index = if (self.index) |*value| value else unreachable;
+        const kinds = self.kinds orelse unreachable;
+        std.debug.assert(structural_index.count < structural_index.indexes.len - 3);
+        std.debug.assert(structural_index.count < kinds.len);
+        structural_index.indexes[structural_index.count] = @intCast(index);
+        kinds[structural_index.count] = kind;
+        structural_index.count += 1;
+    }
+};
+
 pub fn indexXml(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -357,6 +723,75 @@ fn expectTokens(
     try expectIndexInvariants(&actual, input.len);
 }
 
+fn expectStreamMatchesIndex(input: []const u8) !void {
+    var expected = try indexXml(testing.allocator, input);
+    defer expected.deinit(testing.allocator);
+
+    for (0..input.len + 1) |split| {
+        var stream = try XmlStreamIndexer.init(testing.allocator, 1);
+        defer stream.deinit();
+
+        try stream.feed(input[0..split]);
+        try stream.feed("");
+        try stream.feed(input[split..]);
+        try stream.finish();
+        try stream.finish();
+
+        var actual = stream.take();
+        defer actual.deinit(testing.allocator);
+        try testing.expectEqual(expected.count, actual.count);
+        try testing.expectEqualSlices(
+            u32,
+            expected.indexes[0..expected.count],
+            actual.indexes[0..actual.count],
+        );
+        try testing.expectEqualSlices(
+            XmlTokenKind,
+            expected.kinds[0..expected.count],
+            actual.kinds[0..actual.count],
+        );
+        try testing.expectEqualSlices(
+            u32,
+            expected.indexes[expected.count..][0..3],
+            actual.indexes[actual.count..][0..3],
+        );
+        try expectIndexInvariants(&actual, input.len);
+    }
+
+    var byte_stream = try XmlStreamIndexer.init(testing.allocator, 1);
+    defer byte_stream.deinit();
+    for (input) |byte| {
+        try byte_stream.feed(&.{byte});
+    }
+    try byte_stream.finish();
+
+    var byte_actual = byte_stream.take();
+    defer byte_actual.deinit(testing.allocator);
+    try testing.expectEqual(expected.count, byte_actual.count);
+    try testing.expectEqualSlices(
+        u32,
+        expected.indexes[0..expected.count],
+        byte_actual.indexes[0..byte_actual.count],
+    );
+    try testing.expectEqualSlices(
+        XmlTokenKind,
+        expected.kinds[0..expected.count],
+        byte_actual.kinds[0..byte_actual.count],
+    );
+    try testing.expectEqualSlices(
+        u32,
+        expected.indexes[expected.count..][0..3],
+        byte_actual.indexes[byte_actual.count..][0..3],
+    );
+    try expectIndexInvariants(&byte_actual, input.len);
+}
+
+fn expectStreamMatchesDocuments(documents: []const []const u8) !void {
+    for (documents) |document| {
+        try expectStreamMatchesIndex(document);
+    }
+}
+
 fn expectFragmentAnchorAtVectorBoundaries(
     comptime VLEN: usize,
     fragment: []const u8,
@@ -543,6 +978,81 @@ test "indexXml tolerates unclosed and malformed fragments" {
     for (malformed_sections) |fragment| {
         try expectMatchesScalar(fragment);
     }
+}
+
+test "XML stream matches indexXml across every partition and byte feed" {
+    const documents = [_][]const u8{
+        "",
+        "<",
+        "</",
+        "<?",
+        "<!",
+        "<!--",
+        "<![CDATA[",
+        "<!-->",
+        "<!---->",
+        "<![CDATA[>",
+        "<![CDATA[]]>",
+        "</>",
+        "<tag?>",
+        "<?xml version=\"1.0\" encoding = 'UTF-8'?>",
+        "<root first = 'one > two' second=\"three = four\"/>",
+        "<root><!-- <fake a='>'/> --><![CDATA[<x>=</x>]]><child/></root>",
+        "<!-- <fake a='>'/> -->",
+        "<![CDATA[<fake a='>'/>]]>",
+        "<tag a = \"unterminated > <fake/>",
+        "<!--unclosed <tag>",
+        "<![CDATA[unclosed <tag>]]",
+    };
+    try expectStreamMatchesDocuments(documents[0..]);
+}
+
+test "XML stream finish flushes pending state and reset starts at zero" {
+    var stream = try XmlStreamIndexer.init(testing.allocator, 2);
+    defer stream.deinit();
+
+    try stream.feed("<![CDATA[");
+    try stream.finish();
+    var first = stream.take();
+
+    stream.reset();
+    try stream.feed("<?xml");
+    try stream.finish();
+    var second = stream.take();
+    stream.reset();
+    try stream.finish();
+    var third = stream.take();
+
+    defer first.deinit(testing.allocator);
+    defer second.deinit(testing.allocator);
+
+    defer third.deinit(testing.allocator);
+    var expected_first = try indexXml(testing.allocator, "<![CDATA[");
+    defer expected_first.deinit(testing.allocator);
+    var expected_second = try indexXml(testing.allocator, "<?xml");
+    defer expected_second.deinit(testing.allocator);
+
+    try testing.expectEqualSlices(
+        u32,
+        expected_first.indexes[0..expected_first.count],
+        first.indexes[0..first.count],
+    );
+    try testing.expectEqualSlices(
+        XmlTokenKind,
+        expected_first.kinds[0..expected_first.count],
+        first.kinds[0..first.count],
+    );
+    try testing.expectEqualSlices(
+        u32,
+        expected_second.indexes[0..expected_second.count],
+        second.indexes[0..second.count],
+    );
+    try testing.expectEqualSlices(
+        XmlTokenKind,
+        expected_second.kinds[0..expected_second.count],
+        second.kinds[0..second.count],
+    );
+    try testing.expectEqual(@as(usize, 0), third.count);
 }
 
 test "indexXml matches scalar oracle at every vector width boundary" {

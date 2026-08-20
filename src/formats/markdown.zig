@@ -99,6 +99,405 @@ pub fn indexMarkdownImpl(
     };
 }
 
+/// Incrementally indexes Markdown from arbitrary byte chunks.
+///
+/// The indexer owns only the unfinished line and the structural output. A
+/// completed line is consumed before `feed` returns, while `finish` consumes
+/// the final unterminated line and writes the structural sentinels.
+pub const MarkdownStreamIndexer = struct {
+    allocator: std.mem.Allocator,
+    line: std.ArrayList(u8) = .empty,
+    line_start_offset: usize = 0,
+    input_len: usize = 0,
+    pending_carriage_return: bool = false,
+    in_code_fence: bool = false,
+    in_inline_code: bool = false,
+    inline_code_length: usize = 0,
+    fence_character: u8 = 0,
+    fence_length: usize = 0,
+    index: ?stage1.StructuralIndex = null,
+    kinds: ?[]MarkdownTokenKind = null,
+    finished: bool = false,
+
+    const Self = @This();
+    const initial_output_capacity: usize = 1;
+
+    const ProcessError = std.mem.Allocator.Error || error{
+        CapacityOverflow,
+        InputTooLarge,
+    };
+
+    pub const InitError = stage1.StructuralIndex.InitError;
+    pub const FeedError = std.mem.Allocator.Error || error{
+        AlreadyFinished,
+        CapacityOverflow,
+        InputTooLarge,
+    };
+    pub const FinishError = std.mem.Allocator.Error || error{
+        CapacityOverflow,
+        InputTooLarge,
+    };
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        chunk_len: usize,
+    ) InitError!Self {
+        const output_capacity = @max(chunk_len, initial_output_capacity);
+        var index = try stage1.StructuralIndex.init(allocator, output_capacity);
+        errdefer index.deinit(allocator);
+        const kinds = try allocator.alloc(MarkdownTokenKind, output_capacity);
+        return .{
+            .allocator = allocator,
+            .index = index,
+            .kinds = kinds,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        if (self.index) |*index| {
+            index.deinit(self.allocator);
+        }
+        if (self.kinds) |kinds| {
+            self.allocator.free(kinds);
+        }
+        self.line.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    /// Adds bytes to the current document. Input bytes are never borrowed
+    /// after this call returns.
+    pub fn feed(self: *Self, data: []const u8) FeedError!void {
+        if (self.finished) return error.AlreadyFinished;
+
+        const new_input_len = std.math.add(
+            usize,
+            self.input_len,
+            data.len,
+        ) catch return error.CapacityOverflow;
+        if (new_input_len > std.math.maxInt(u32)) return error.InputTooLarge;
+        const line_capacity = self.maxLineLengthForFeed(data);
+        const pending_output_additional = std.math.add(
+            usize,
+            self.line.items.len,
+            data.len,
+        ) catch return error.CapacityOverflow;
+        try self.line.ensureTotalCapacity(self.allocator, line_capacity);
+        try self.ensureOutputCapacity(pending_output_additional);
+        self.input_len = new_input_len;
+
+        var data_offset: usize = 0;
+        while (data_offset < data.len) {
+            const character = data[data_offset];
+            if (self.pending_carriage_return) {
+                if (character == '\n') {
+                    try self.processLine(2);
+                    self.pending_carriage_return = false;
+                    data_offset += 1;
+                    continue;
+                }
+                try self.processLine(1);
+                self.pending_carriage_return = false;
+            }
+
+            if (character == '\r') {
+                self.pending_carriage_return = true;
+            } else if (character == '\n') {
+                try self.processLine(1);
+            } else {
+                self.line.appendAssumeCapacity(character);
+            }
+            data_offset += 1;
+        }
+    }
+
+    /// Consumes pending line state and finalizes the owned structural index.
+    /// Repeated calls do not duplicate output.
+    pub fn finish(self: *Self) FinishError!void {
+        if (self.finished) return;
+
+        if (self.pending_carriage_return) {
+            try self.processLine(1);
+            self.pending_carriage_return = false;
+        } else if (self.line.items.len > 0) {
+            try self.processLine(0);
+        }
+
+        try self.ensureOutputCapacity(0);
+        if (self.index) |*index| {
+            try index.finish(self.input_len);
+        } else {
+            unreachable;
+        }
+        self.finished = true;
+    }
+
+    /// Returns the finalized index without copying. The caller owns the
+    /// returned arrays and must deinitialize them with the init allocator.
+    pub fn take(self: *Self) MarkdownStructuralIndex {
+        assert(self.finished);
+        assert(self.index != null);
+        assert(self.kinds != null);
+
+        const index = self.index.?;
+        const kinds = self.kinds.?;
+        self.index = null;
+        self.kinds = null;
+        return .{
+            .indexes = index.indexes,
+            .kinds = kinds,
+            .count = index.count,
+        };
+    }
+
+    /// Starts a new document while retaining reusable output and line
+    /// allocations. A previously taken index is intentionally not restored.
+    pub fn reset(self: *Self) void {
+        if (self.index) |*index| {
+            index.count = 0;
+        }
+        self.line.clearRetainingCapacity();
+        self.line_start_offset = 0;
+        self.input_len = 0;
+        self.pending_carriage_return = false;
+        self.in_code_fence = false;
+        self.in_inline_code = false;
+        self.inline_code_length = 0;
+        self.fence_character = 0;
+        self.fence_length = 0;
+        self.finished = false;
+    }
+
+    fn maxLineLengthForFeed(self: *const Self, data: []const u8) usize {
+        var current_length = self.line.items.len;
+        var maximum_length = current_length;
+        var pending_carriage_return = self.pending_carriage_return;
+
+        for (data) |character| {
+            if (pending_carriage_return) {
+                if (character == '\n') {
+                    current_length = 0;
+                    pending_carriage_return = false;
+                    continue;
+                }
+                current_length = 0;
+                pending_carriage_return = false;
+            }
+
+            if (character == '\r') {
+                pending_carriage_return = true;
+            } else if (character == '\n') {
+                current_length = 0;
+            } else {
+                current_length += 1;
+                maximum_length = @max(maximum_length, current_length);
+            }
+        }
+        return maximum_length;
+    }
+
+    fn ensureOutputCapacity(self: *Self, additional: usize) ProcessError!void {
+        if (self.index == null) {
+            assert(self.kinds == null);
+            const output_capacity = @max(additional, initial_output_capacity);
+            var new_index = try stage1.StructuralIndex.init(
+                self.allocator,
+                output_capacity,
+            );
+            errdefer new_index.deinit(self.allocator);
+            const new_kinds = try self.allocator.alloc(
+                MarkdownTokenKind,
+                output_capacity,
+            );
+            self.index = new_index;
+            self.kinds = new_kinds;
+            return;
+        }
+
+        const index = &self.index.?;
+        const kinds = self.kinds orelse unreachable;
+
+        const required = std.math.add(usize, index.count, additional) catch
+            return error.CapacityOverflow;
+        if (required <= kinds.len and required <= index.indexes.len - 3) return;
+
+        const doubled_capacity = std.math.mul(usize, kinds.len, 2) catch required;
+        const new_capacity = @max(required, @max(doubled_capacity, initial_output_capacity));
+        const new_index_len = std.math.add(usize, new_capacity, 3) catch
+            return error.CapacityOverflow;
+        index.indexes = try self.allocator.realloc(index.indexes, new_index_len);
+        self.kinds = try self.allocator.realloc(kinds, new_capacity);
+    }
+
+    fn appendStreamToken(
+        self: *Self,
+        offset: usize,
+        kind: MarkdownTokenKind,
+    ) void {
+        const index = &self.index.?;
+        const kinds = self.kinds orelse unreachable;
+        assert(index.count < index.indexes.len - 3);
+        assert(index.count < kinds.len);
+        index.indexes[index.count] = @intCast(offset);
+        kinds[index.count] = kind;
+        index.count += 1;
+    }
+
+    fn processLine(self: *Self, terminator_len: usize) ProcessError!void {
+        const line = self.line.items;
+        try self.ensureOutputCapacity(line.len);
+        self.processLineContents(line);
+        self.line.clearRetainingCapacity();
+        self.line_start_offset += line.len + terminator_len;
+    }
+
+    fn processLineContents(self: *Self, line: []const u8) void {
+        var content_start: usize = 0;
+        while (content_start < line.len and line[content_start] == ' ') {
+            content_start += 1;
+        }
+        const indentation = content_start;
+
+        if (self.in_code_fence) {
+            if (indentation <= 3 and content_start < line.len and
+                line[content_start] == self.fence_character)
+            {
+                const run_length = scalarRunLength(
+                    line,
+                    content_start,
+                    line.len,
+                    self.fence_character,
+                );
+                if (run_length >= self.fence_length and scalarOnlyWhitespace(
+                    line,
+                    content_start + run_length,
+                    line.len,
+                )) {
+                    self.appendStreamToken(
+                        self.line_start_offset + content_start,
+                        .code_fence,
+                    );
+                    self.in_code_fence = false;
+                    self.fence_character = 0;
+                    self.fence_length = 0;
+                }
+            }
+            return;
+        }
+
+        var is_fence_line = false;
+        if (!self.in_inline_code and indentation <= 3 and content_start < line.len) {
+            const character = line[content_start];
+            if (character == '`' or character == '~') {
+                const run_length = scalarRunLength(
+                    line,
+                    content_start,
+                    line.len,
+                    character,
+                );
+                if (run_length >= 3) {
+                    self.appendStreamToken(
+                        self.line_start_offset + content_start,
+                        .code_fence,
+                    );
+                    self.in_code_fence = true;
+                    self.in_inline_code = false;
+                    self.inline_code_length = 0;
+                    self.fence_character = character;
+                    self.fence_length = run_length;
+                    is_fence_line = true;
+                }
+            }
+        }
+
+        if (is_fence_line) return;
+        if (!self.in_inline_code and indentation <= 3 and content_start < line.len) {
+            self.processLineMarker(line, content_start);
+        }
+
+        var offset: usize = 0;
+        while (offset < line.len) {
+            const character = line[offset];
+            if (character == '`') {
+                const run_length = scalarRunLength(line, offset, line.len, '`');
+                const run_end = offset + run_length;
+                var run_offset = offset;
+                while (run_offset < run_end) : (run_offset += 1) {
+                    self.appendStreamToken(
+                        self.line_start_offset + run_offset,
+                        .inline_code,
+                    );
+                }
+                if (self.in_inline_code) {
+                    if (run_length == self.inline_code_length) {
+                        self.in_inline_code = false;
+                        self.inline_code_length = 0;
+                    }
+                } else {
+                    self.in_inline_code = true;
+                    self.inline_code_length = run_length;
+                }
+                offset = run_end;
+            } else {
+                if (!self.in_inline_code) {
+                    switch (character) {
+                        '[', '(' => self.appendStreamToken(
+                            self.line_start_offset + offset,
+                            .link_open,
+                        ),
+                        ']', ')' => self.appendStreamToken(
+                            self.line_start_offset + offset,
+                            .link_close,
+                        ),
+                        else => {},
+                    }
+                }
+                offset += 1;
+            }
+        }
+    }
+
+    fn processLineMarker(self: *Self, line: []const u8, content_start: usize) void {
+        const character = line[content_start];
+        if ((character == '-' or character == '*' or character == '_') and
+            scalarIsThematicBreak(line, content_start, line.len, character))
+        {
+            self.appendStreamToken(
+                self.line_start_offset + content_start,
+                .thematic_break,
+            );
+            return;
+        }
+
+        switch (character) {
+            '#' => self.appendStreamToken(
+                self.line_start_offset + content_start,
+                .heading,
+            ),
+            '>' => self.appendStreamToken(
+                self.line_start_offset + content_start,
+                .blockquote,
+            ),
+            '-', '*', '+' => self.appendStreamToken(
+                self.line_start_offset + content_start,
+                .list_item,
+            ),
+            '0'...'9' => {
+                var digit_end = content_start;
+                while (digit_end < line.len and std.ascii.isDigit(line[digit_end])) {
+                    digit_end += 1;
+                }
+                if (digit_end < line.len and line[digit_end] == '.') {
+                    self.appendStreamToken(
+                        self.line_start_offset + content_start,
+                        .list_item,
+                    );
+                }
+            },
+            else => {},
+        }
+    }
+};
+
 fn scanMarkdown(comptime VLEN: usize, input: []const u8, sink: anytype) void {
     const Mask = simd.Mask(VLEN);
     var state = MarkdownScanState{
@@ -782,6 +1181,132 @@ fn expectExactTokens(
         expected_kinds,
         actual.kinds[0..actual.count],
     );
+}
+
+fn expectStreamMatchesReference(
+    input: []const u8,
+    chunk_ends: []const usize,
+) !void {
+    var expected = try indexMarkdown(testing.allocator, input);
+    defer expected.deinit(testing.allocator);
+
+    var stream = try MarkdownStreamIndexer.init(testing.allocator, 3);
+    defer stream.deinit();
+
+    var chunk_start: usize = 0;
+    for (chunk_ends) |chunk_end| {
+        try testing.expect(chunk_start <= chunk_end);
+        try testing.expect(chunk_end <= input.len);
+        try stream.feed(input[chunk_start..chunk_end]);
+        chunk_start = chunk_end;
+    }
+    try stream.feed(input[chunk_start..]);
+    try stream.finish();
+    try stream.finish();
+
+    var actual = stream.take();
+    defer actual.deinit(testing.allocator);
+    try testing.expectEqual(expected.count, actual.count);
+    try testing.expectEqualSlices(
+        u32,
+        expected.indexes[0..expected.count],
+        actual.indexes[0..actual.count],
+    );
+    try testing.expectEqualSlices(
+        MarkdownTokenKind,
+        expected.kinds[0..expected.count],
+        actual.kinds[0..actual.count],
+    );
+}
+
+test "Markdown stream matches one-shot indexing at every partition" {
+    const input =
+        "   # heading\r\n" ++
+        "~~~language\n[hidden](target)\n~~~~\n" ++
+        "`one` ``two [hidden]`` [link](target)\n" ++
+        "- - -\n12. item\n> quote\n";
+
+    for (0..input.len + 1) |partition| {
+        try expectStreamMatchesReference(input, &.{partition});
+    }
+}
+
+test "Markdown stream matches one-shot indexing byte by byte" {
+    const input =
+        "```zig\n# hidden [link](target)\n```\r\n" ++
+        "``inline [hidden]`` [visible](target)\n" ++
+        "* * *\n7. item\n";
+    var chunk_ends: [input.len]usize = undefined;
+    for (&chunk_ends, 0..) |*chunk_end, offset| {
+        chunk_end.* = offset + 1;
+    }
+
+    try expectStreamMatchesReference(input, &chunk_ends);
+}
+
+test "Markdown stream finish flushes pending line state" {
+    const inputs = [_][]const u8{
+        "#",
+        "12.",
+        "- - -",
+        "~~~language",
+        "[link](target)",
+        "``code [hidden]``",
+        "```zig\n# hidden\n```",
+    };
+    for (inputs) |input| {
+        const middle = input.len / 2;
+        try expectStreamMatchesReference(input, &.{ 0, middle, middle, input.len });
+    }
+}
+
+test "Markdown stream reset supports reuse before and after take" {
+    var stream = try MarkdownStreamIndexer.init(testing.allocator, 2);
+    defer stream.deinit();
+
+    try stream.feed("# discarded");
+    stream.reset();
+
+    const first_input = "~~~zig\n# hidden\n~~~";
+    try stream.feed(first_input[0..5]);
+    try stream.feed(first_input[5..]);
+    try stream.finish();
+    var first_actual = stream.take();
+    defer first_actual.deinit(testing.allocator);
+    var first_expected = try indexMarkdown(testing.allocator, first_input);
+    defer first_expected.deinit(testing.allocator);
+    try testing.expectEqualSlices(
+        u32,
+        first_expected.indexes[0..first_expected.count],
+        first_actual.indexes[0..first_actual.count],
+    );
+    try testing.expectEqualSlices(
+        MarkdownTokenKind,
+        first_expected.kinds[0..first_expected.count],
+        first_actual.kinds[0..first_actual.count],
+    );
+
+    stream.reset();
+    const second_input = "`code` [link](target)";
+    for (second_input) |byte| {
+        try stream.feed(&.{byte});
+    }
+    try stream.finish();
+    var second_actual = stream.take();
+    defer second_actual.deinit(testing.allocator);
+    var second_expected = try indexMarkdown(testing.allocator, second_input);
+    defer second_expected.deinit(testing.allocator);
+    try testing.expectEqualSlices(
+        u32,
+        second_expected.indexes[0..second_expected.count],
+        second_actual.indexes[0..second_actual.count],
+    );
+    try testing.expectEqualSlices(
+        MarkdownTokenKind,
+        second_expected.kinds[0..second_expected.count],
+        second_actual.kinds[0..second_actual.count],
+    );
+    try testing.expectError(error.AlreadyFinished, stream.feed("ignored"));
 }
 
 test "refAllDecls" {

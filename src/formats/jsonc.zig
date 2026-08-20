@@ -1,8 +1,22 @@
 const std = @import("std");
 const simd = @import("../core/simd.zig");
 const stage1 = @import("../core/stage1.zig");
+const stream = @import("../core/stream.zig");
 const stage2 = @import("../core/stage2.zig");
 const testing = std.testing;
+const sentinel_count: usize = 3;
+
+/// Initializes a chunk-fed JSONC Stage 1 indexer in document mode.
+pub fn initStreamIndexer(
+    allocator: std.mem.Allocator,
+    chunk_len: usize,
+) stream.StreamIndexer.InitError!stream.StreamIndexer {
+    return stream.StreamIndexer.init(
+        allocator,
+        chunk_len,
+        stream.Options{ .dialect = .jsonc, .mode = .document },
+    );
+}
 
 pub fn indexJsonc(
     allocator: std.mem.Allocator,
@@ -738,4 +752,83 @@ test "indexJsonc matches scalar for every byte value" {
     inline for ([_]usize{ 16, 32, 64 }) |vlen| {
         try expectJsoncMatchesScalarAtWidth(vlen, &input);
     }
+}
+
+fn expectJsoncStreamIndexEqual(
+    expected: *const stage1.StructuralIndex,
+    actual: *const stage1.StructuralIndex,
+) !void {
+    try testing.expectEqual(expected.count, actual.count);
+    try testing.expectEqualSlices(
+        u32,
+        expected.indexes[0 .. expected.count + sentinel_count],
+        actual.indexes[0 .. actual.count + sentinel_count],
+    );
+}
+
+fn feedJsoncStream(
+    input: []const u8,
+    split: usize,
+    chunk_len: usize,
+) !stage1.StructuralIndex {
+    var indexer = try initStreamIndexer(testing.allocator, chunk_len);
+    defer indexer.deinit();
+
+    try indexer.feed(input[0..split]);
+    try indexer.feed("");
+    try indexer.feed(input[split..]);
+    try indexer.finish();
+    try indexer.finish();
+    return indexer.take();
+}
+
+test "JSONC stream wrapper matches one-shot across comments and partitions" {
+    const input =
+        "{/*lead*/\"alpha\":[true,//tail\nfalse],\"text\":\"a\\\\\\\"b\"}";
+    var expected = try indexJsonc(testing.allocator, input);
+    defer expected.deinit(testing.allocator);
+
+    for (0..input.len + 1) |split| {
+        var actual = try feedJsoncStream(input, split, 3);
+        defer actual.deinit(testing.allocator);
+        try expectJsoncStreamIndexEqual(&expected, &actual);
+    }
+
+    var byte_indexer = try initStreamIndexer(testing.allocator, 1);
+    defer byte_indexer.deinit();
+    for (input) |byte| {
+        try byte_indexer.feed(&.{byte});
+    }
+    try byte_indexer.finish();
+    var byte_actual = byte_indexer.take();
+    defer byte_actual.deinit(testing.allocator);
+    try expectJsoncStreamIndexEqual(&expected, &byte_actual);
+}
+
+test "JSONC stream wrapper reset and finish lifecycle preserve offsets" {
+    const first_input = "{/*discard*/\"first\":true}";
+    const second_input = "{\"second\":2}";
+    var indexer = try initStreamIndexer(testing.allocator, 2);
+    defer indexer.deinit();
+
+    try indexer.feed(first_input);
+    try indexer.finish();
+    try indexer.finish();
+    try testing.expectError(error.AlreadyFinished, indexer.feed("0"));
+    var first = indexer.take();
+    defer first.deinit(testing.allocator);
+
+    indexer.reset();
+    try indexer.feed(second_input[0..3]);
+    try indexer.feed(second_input[3..]);
+    try indexer.finish();
+    var second = indexer.take();
+    defer second.deinit(testing.allocator);
+
+    var expected_first = try indexJsonc(testing.allocator, first_input);
+    defer expected_first.deinit(testing.allocator);
+    var expected_second = try indexJsonc(testing.allocator, second_input);
+    defer expected_second.deinit(testing.allocator);
+    try expectJsoncStreamIndexEqual(&expected_first, &first);
+    try expectJsoncStreamIndexEqual(&expected_second, &second);
 }

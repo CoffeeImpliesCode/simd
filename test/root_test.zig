@@ -83,6 +83,59 @@ fn expectTokenWidths(comptime index_fn: anytype, input: []const u8) !void {
     }
 }
 
+test "upstream corpus manifests pin provenance for offline tests" {
+    const manifests = [_]struct {
+        contents: []const u8,
+        source: []const u8,
+        revision: []const u8,
+        offline_rule: []const u8,
+    }{
+        .{
+            .contents = @embedFile("corpus/upstream/json/MANIFEST.md"),
+            .source = "https://github.com/nst/JSONTestSuite",
+            .revision = "1ef36fa01286573e846ac449e8683f8833c5b26a",
+            .offline_rule = "Tests must use only checked-in corpus files and metadata.",
+        },
+        .{
+            .contents = @embedFile("corpus/upstream/jsonl/MANIFEST.md"),
+            .source = "wardi/jsonlines",
+            .revision = "a8e8671adf470477cd2cc1dfc40c30825f421baa",
+            .offline_rule = "Tests must read checked-in files only.",
+        },
+        .{
+            .contents = @embedFile("corpus/upstream/jsonc/MANIFEST.md"),
+            .source = "https://github.com/microsoft/node-jsonc-parser.git",
+            .revision = "37e207ed23f544efc33a1893f21e0bf10b250df0",
+            .offline_rule = "Corpus tests must use only checked-in files",
+        },
+        .{
+            .contents = @embedFile("corpus/upstream/json5/MANIFEST.md"),
+            .source = "https://github.com/json5/json5-tests.git",
+            .revision = "ceb24d4080137d70833f86c25659c1331b80a387",
+            .offline_rule = "Tests must read only checked-in local files",
+        },
+        .{
+            .contents = @embedFile("corpus/upstream/markdown/MANIFEST.md"),
+            .source = "commonmark/commonmark-spec",
+            .revision = "9103e341a973013013bb1a80e13567007c5cef6f",
+            .offline_rule = "must not fetch network resources during tests",
+        },
+        .{
+            .contents = @embedFile("corpus/upstream/xml/MANIFEST.md"),
+            .source = "https://www.w3.org/XML/Test/xmlts20130923.tar.gz",
+            .revision = "9b61db9f5dbffa545f4b8d78422167083a8568c59bd1129f94138f936cf6fc1f",
+            .offline_rule = "Tests must not access the network.",
+        },
+    };
+
+    for (manifests) |manifest| {
+        try testing.expect(manifest.contents.len > 0);
+        try testing.expect(std.mem.indexOf(u8, manifest.contents, manifest.source) != null);
+        try testing.expect(std.mem.indexOf(u8, manifest.contents, manifest.revision) != null);
+        try testing.expect(std.mem.indexOf(u8, manifest.contents, manifest.offline_rule) != null);
+    }
+}
+
 test "corpus: JSON indexing on example_config.json" {
     const json_data = @embedFile("corpus/json/example_config.json");
     try expectStructuralWidths(lib.formats.json.indexJsonImpl, json_data);
@@ -644,7 +697,11 @@ fn expectJsonStreamWithCuts(
     cuts: []const usize,
     empty_feeds: bool,
 ) !void {
-    var stream = try lib.stream.StreamIndexer.init(testing.allocator, vector_len);
+    var stream = try lib.stream.StreamIndexer.init(
+        testing.allocator,
+        vector_len,
+        lib.stream.Options{ .dialect = .json, .mode = .document },
+    );
     defer stream.deinit();
 
     var start: usize = 0;
@@ -666,7 +723,11 @@ fn expectJsonStreamWithCuts(
 }
 
 fn expectJsonStreamByteFeeds(input: []const u8) !void {
-    var stream = try lib.stream.StreamIndexer.init(testing.allocator, 1);
+    var stream = try lib.stream.StreamIndexer.init(
+        testing.allocator,
+        1,
+        lib.stream.Options{ .dialect = .json, .mode = .document },
+    );
     defer stream.deinit();
 
     for (input) |byte| {
@@ -718,7 +779,11 @@ test "stream: finish is idempotent and take survives reset" {
     const second_input = "[-1,null,\"second\\\\document\"]";
 
     var results = results: {
-        var stream = try lib.stream.StreamIndexer.init(testing.allocator, 2);
+        var stream = try lib.stream.StreamIndexer.init(
+            testing.allocator,
+            2,
+            lib.stream.Options{ .dialect = .json, .mode = .document },
+        );
         defer stream.deinit();
 
         try stream.feed(first_input);
@@ -745,4 +810,197 @@ test "stream: finish is idempotent and take survives reset" {
 
     try expectJsonStreamParity(first_input, &results.first);
     try expectJsonStreamParity(second_input, &results.second);
+}
+
+fn expectJsonlStreamParity(
+    input: []const u8,
+    cuts: []const usize,
+) !void {
+    var expected = try lib.formats.jsonl.indexJsonl(testing.allocator, input);
+    defer expected.deinit(testing.allocator);
+
+    var stream = try lib.formats.jsonl.initStreamIndexer(
+        testing.allocator,
+        vector_len,
+    );
+    defer stream.deinit();
+
+    var start: usize = 0;
+    for (cuts) |cut| {
+        try testing.expect(cut >= start);
+        try testing.expect(cut <= input.len);
+        try stream.feed(input[start..cut]);
+        try stream.feed("");
+        start = cut;
+    }
+    try stream.feed(input[start..]);
+    try stream.feed("");
+    try stream.finish();
+    try stream.finish();
+
+    var actual = stream.take();
+    defer actual.deinit(testing.allocator);
+    try testing.expectEqual(expected.count, actual.count);
+    try testing.expectEqualSlices(
+        u32,
+        expected.indexes[0 .. expected.count + stream_sentinel_count],
+        actual.indexes[0 .. actual.count + stream_sentinel_count],
+    );
+}
+
+fn expectMarkdownStreamParity(
+    input: []const u8,
+    cuts: []const usize,
+) !void {
+    var expected = try lib.formats.markdown.indexMarkdown(testing.allocator, input);
+    defer expected.deinit(testing.allocator);
+
+    var stream = try lib.formats.markdown.MarkdownStreamIndexer.init(
+        testing.allocator,
+        vector_len,
+    );
+    defer stream.deinit();
+
+    var start: usize = 0;
+    for (cuts) |cut| {
+        try testing.expect(cut >= start);
+        try testing.expect(cut <= input.len);
+        try stream.feed(input[start..cut]);
+        try stream.feed("");
+        start = cut;
+    }
+    try stream.feed(input[start..]);
+    try stream.feed("");
+    try stream.finish();
+    try stream.finish();
+
+    var actual = stream.take();
+    defer actual.deinit(testing.allocator);
+    try testing.expectEqual(expected.count, actual.count);
+    try testing.expectEqualSlices(
+        u32,
+        expected.indexes[0 .. expected.count + stream_sentinel_count],
+        actual.indexes[0 .. actual.count + stream_sentinel_count],
+    );
+    try testing.expectEqualSlices(
+        lib.formats.markdown.MarkdownTokenKind,
+        expected.kinds[0..expected.count],
+        actual.kinds[0..actual.count],
+    );
+}
+
+fn expectXmlStreamParity(
+    input: []const u8,
+    cuts: []const usize,
+) !void {
+    var expected = try lib.formats.xml.indexXml(testing.allocator, input);
+    defer expected.deinit(testing.allocator);
+
+    var stream = try lib.formats.xml.XmlStreamIndexer.init(
+        testing.allocator,
+        vector_len,
+    );
+    defer stream.deinit();
+
+    var start: usize = 0;
+    for (cuts) |cut| {
+        try testing.expect(cut >= start);
+        try testing.expect(cut <= input.len);
+        try stream.feed(input[start..cut]);
+        try stream.feed("");
+        start = cut;
+    }
+    try stream.feed(input[start..]);
+    try stream.feed("");
+    try stream.finish();
+    try stream.finish();
+
+    var actual = stream.take();
+    defer actual.deinit(testing.allocator);
+    try testing.expectEqual(expected.count, actual.count);
+    try testing.expectEqualSlices(
+        u32,
+        expected.indexes[0 .. expected.count + stream_sentinel_count],
+        actual.indexes[0 .. actual.count + stream_sentinel_count],
+    );
+    try testing.expectEqualSlices(
+        lib.formats.xml.XmlTokenKind,
+        expected.kinds[0..expected.count],
+        actual.kinds[0..actual.count],
+    );
+}
+
+test "public JSONL stream preserves output and sentinels across chunk boundaries" {
+    const input = "{\"a\":1}\n{\"b\":\"line" ++
+        "\n" ++
+        "value\"}\r\n[true,false]\n";
+    const final_cut = input.len -| 1;
+    const cuts = [_]usize{
+        0,
+        @min(1, final_cut),
+        @min(vector_len - 1, final_cut),
+        @min(vector_len, final_cut),
+        @min(vector_len + 1, final_cut),
+        final_cut,
+    };
+
+    try expectJsonlStreamParity(input, &cuts);
+    try expectJsonlStreamParity("", &.{});
+}
+
+test "public Markdown stream preserves output, sentinels, and token kinds" {
+    const input =
+        "# heading\r\n" ++
+        "- item [link](target)\n" ++
+        "> quote\n" ++
+        "```zig\n# hidden\n```\n" ++
+        "`inline` ***\n";
+    const cuts = [_]usize{
+        0,
+        1,
+        std.mem.indexOf(u8, input, "\r\n").? + 1,
+        vector_len,
+        input.len - 1,
+    };
+
+    try expectMarkdownStreamParity(input, &cuts);
+    try expectMarkdownStreamParity("", &.{});
+}
+
+test "public XML stream preserves output, sentinels, and token kinds" {
+    const input =
+        "<?xml version=\"1.0\"?><root a=\"1\"><item/>" ++
+        "<!-- comment --><![CDATA[text]]></root>";
+    const processing_instruction_cut = std.mem.indexOf(u8, input, "?>").? + 1;
+    const cdata_cut = std.mem.indexOf(u8, input, "<![CDATA[").? + 1;
+    const cuts = if (vector_len <= processing_instruction_cut)
+        [_]usize{
+            0,
+            1,
+            vector_len,
+            processing_instruction_cut,
+            cdata_cut,
+            input.len - 1,
+        }
+    else if (vector_len <= cdata_cut)
+        [_]usize{
+            0,
+            1,
+            processing_instruction_cut,
+            vector_len,
+            cdata_cut,
+            input.len - 1,
+        }
+    else
+        [_]usize{
+            0,
+            1,
+            processing_instruction_cut,
+            cdata_cut,
+            vector_len,
+            input.len - 1,
+        };
+
+    try expectXmlStreamParity(input, &cuts);
+    try expectXmlStreamParity("", &.{});
 }

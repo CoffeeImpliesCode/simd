@@ -16,18 +16,50 @@ comptime {
     assert(SAFE_PAD > simd.default_vector_len);
 }
 
-pub const CarryState = struct {
-    in_string: bool = false,
-    ends_in_backslash: bool = false,
-    backslash_run_odd: bool = false,
-    in_atom: bool = false,
+pub const Dialect = enum {
+    json,
+    jsonc,
+    json5,
 };
 
-/// Incrementally builds the same JSON StructuralIndex as the one-shot Stage 1
-/// indexer. Input bytes are copied through two fixed, padded slots allocated by
-/// init; feed never allocates or replaces that input buffer.
+pub const Mode = enum {
+    document,
+    jsonl,
+};
+
+pub const Options = struct {
+    dialect: Dialect,
+    mode: Mode = .document,
+};
+
+pub const CommentState = enum {
+    none,
+    line,
+    block,
+};
+
+pub const CarryState = struct {
+    in_string: bool = false,
+    in_atom: bool = false,
+    ends_in_backslash: bool = false,
+    quote_delimiter: u8 = 0,
+    comment: CommentState = .none,
+    backslash_run_odd: bool = false,
+    pending_slash: bool = false,
+    pending_escape: bool = false,
+    pending_escape_offset: u32 = 0,
+    pending_unicode_len: u2 = 0,
+    pending_unicode: [3]u8 = .{ 0, 0, 0 },
+    pending_unicode_offset: u32 = 0,
+    block_comment_ends_in_star: bool = false,
+};
+
+/// Incrementally builds a JSON-family StructuralIndex. Input bytes are copied
+/// through two fixed, padded slots allocated by init; feed never allocates or
+/// replaces that input buffer.
 pub const StreamIndexer = struct {
     allocator: std.mem.Allocator,
+    options: Options,
     buffer: []u8,
     slot_len: usize,
     slot_stride: usize,
@@ -51,12 +83,16 @@ pub const StreamIndexer = struct {
         CapacityOverflow,
         InputTooLarge,
     };
+    pub const FeedFromError = FeedError ||
+        FinishError ||
+        std.Io.Reader.ShortError;
 
     /// Allocates both padded input slots and the initial structural storage.
     /// chunk_len is rounded up so every non-final processed slot is SIMD-wide.
     pub fn init(
         allocator: std.mem.Allocator,
         chunk_len: usize,
+        options: Options,
     ) InitError!Self {
         const requested_len = @max(chunk_len, simd.default_vector_len);
         const rounded_len = std.math.add(
@@ -87,6 +123,7 @@ pub const StreamIndexer = struct {
 
         return .{
             .allocator = allocator,
+            .options = options,
             .buffer = buffer,
             .slot_len = slot_len,
             .slot_stride = slot_stride,
@@ -139,6 +176,26 @@ pub const StreamIndexer = struct {
 
         assert(self.processed_len + self.fill == self.input_len);
     }
+    /// Drains an optional Reader adapter into feed and finishes at EOF. Reader
+    /// bytes are borrowed only for each feed call and are never retained.
+    pub fn feedFrom(
+        self: *Self,
+        reader: *std.Io.Reader,
+    ) FeedFromError!void {
+        while (true) {
+            const data = reader.buffered();
+            if (data.len > 0) {
+                try self.feed(data);
+                reader.toss(data.len);
+                continue;
+            }
+
+            reader.fill(1) catch |err| switch (err) {
+                error.EndOfStream => return self.finish(),
+                error.ReadFailed => return error.ReadFailed,
+            };
+        }
+    }
 
     /// Flushes the final partial slot and writes the StructuralIndex sentinels.
     /// Repeated calls are harmless and do not duplicate output.
@@ -152,6 +209,7 @@ pub const StreamIndexer = struct {
             self.fill = 0;
         }
 
+        self.flushDeferred();
         assert(self.processed_len == self.input_len);
         try self.indexPtr().finish(self.input_len);
         self.finished = true;
@@ -230,7 +288,7 @@ pub const StreamIndexer = struct {
         );
     }
 
-    fn processBytes(self: *Self, data: []const u8) void {
+    fn processBytesSimd(self: *Self, data: []const u8) void {
         const VLEN = simd.default_vector_len;
         const Mask = simd.Mask(VLEN);
         const Shift = std.math.Log2Int(Mask);
@@ -290,8 +348,13 @@ pub const StreamIndexer = struct {
             const atom_starts = atom_candidates & atom_active &
                 ~((atom_active << @as(Shift, 1)) |
                     if (self.carry.in_atom) @as(Mask, 1) else 0);
+            const record_boundaries: Mask = if (self.options.mode == .jsonl)
+                simd.matchByte(VLEN, chunk, '\n')
+            else
+                0;
             const structural_indexes =
-                ((structural | atom_starts) & outside_string) |
+                ((structural | atom_starts | record_boundaries) &
+                    outside_string) |
                 opening_quotes;
 
             var candidates: [VLEN]u32 = undefined;
@@ -313,6 +376,8 @@ pub const StreamIndexer = struct {
             self.carry.in_string = (inside_without_closing & top_bit) != 0;
             self.carry.ends_in_backslash = valid_count == VLEN and
                 (backslashes & top_bit) != 0;
+            self.carry.quote_delimiter =
+                if (self.carry.in_string) '"' else 0;
             self.carry.backslash_run_odd = trailingBackslashRunOdd(
                 VLEN,
                 chunk,
@@ -326,7 +391,282 @@ pub const StreamIndexer = struct {
 
         self.processed_len += data.len;
     }
+
+    fn processBytes(self: *Self, data: []const u8) void {
+        if (self.options.dialect == .json) {
+            self.processBytesSimd(data);
+        } else {
+            self.processBytesScalar(data);
+        }
+    }
+
+    fn processBytesScalar(self: *Self, data: []const u8) void {
+        assert(data.len <= self.slot_len);
+        assert(self.index != null);
+        assert(self.processed_len + data.len <= self.input_len);
+
+        for (data, 0..) |byte, local_offset| {
+            self.processByte(
+                self.processed_len + local_offset,
+                byte,
+            );
+        }
+        self.processed_len += data.len;
+    }
+
+    fn processByte(self: *Self, offset: usize, byte: u8) void {
+        defer self.updateBackslashParity(byte);
+
+        if (self.carry.pending_slash) {
+            self.carry.pending_slash = false;
+            if (self.commentsEnabled() and byte == '/') {
+                self.carry.comment = .line;
+                self.carry.in_atom = false;
+                return;
+            }
+            if (self.commentsEnabled() and byte == '*') {
+                self.carry.comment = .block;
+                self.carry.in_atom = false;
+                return;
+            }
+
+            // A slash that is not followed by a comment opener is ordinary
+            // input. JSON-family scanners do not index it, but JSON and JSONC
+            // retain it as atom context while JSON5 treats it as a separator.
+            self.carry.in_atom = self.options.dialect != .json5;
+        }
+
+        if (self.carry.pending_escape) {
+            self.carry.pending_escape = false;
+            if (byte == 'u') {
+                self.recordAtom(self.carry.pending_escape_offset);
+                self.carry.in_atom = true;
+                return;
+            }
+            self.carry.in_atom = false;
+        }
+
+        if (self.carry.pending_unicode_len != 0) {
+            if (self.appendPendingUnicode(byte)) return;
+            self.processByteNow(offset, byte);
+            return;
+        }
+
+        self.processByteNow(offset, byte);
+    }
+
+    fn processByteNow(self: *Self, offset: usize, byte: u8) void {
+        switch (self.carry.comment) {
+            .line => {
+                if (byte == '\n' or byte == '\r') {
+                    self.carry.comment = .none;
+                    self.carry.in_atom = false;
+                    if (self.options.mode == .jsonl and byte == '\n') {
+                        self.record(offset);
+                    }
+                }
+                return;
+            },
+            .block => {
+                if (self.carry.block_comment_ends_in_star) {
+                    self.carry.block_comment_ends_in_star = false;
+                    if (byte == '/') {
+                        self.carry.comment = .none;
+                        self.carry.in_atom = false;
+                        return;
+                    }
+                }
+                if (byte == '*') {
+                    self.carry.block_comment_ends_in_star = true;
+                }
+                return;
+            },
+            .none => {},
+        }
+
+        if (self.carry.quote_delimiter != 0) {
+            if (byte == self.carry.quote_delimiter and
+                !self.carry.backslash_run_odd)
+            {
+                self.carry.in_string = false;
+                self.carry.quote_delimiter = 0;
+                self.carry.in_atom = false;
+            }
+            return;
+        }
+        if (self.commentsEnabled() and byte == '/') {
+            self.carry.pending_slash = true;
+            return;
+        }
+
+        if (self.options.dialect == .json5 and byte == '\\') {
+            self.carry.pending_escape = true;
+            self.carry.pending_escape_offset = @intCast(offset);
+            return;
+        }
+
+        if (self.isQuote(byte)) {
+            if (!self.carry.backslash_run_odd) {
+                self.record(offset);
+                self.carry.in_string = true;
+                self.carry.quote_delimiter = byte;
+                self.carry.in_atom = false;
+            } else {
+                self.carry.in_atom = self.options.dialect == .jsonc;
+            }
+            return;
+        }
+
+        if (self.options.mode == .jsonl and byte == '\n') {
+            self.record(offset);
+            self.carry.in_atom = false;
+            return;
+        }
+
+        if (isStructuralByte(byte)) {
+            self.record(offset);
+            self.carry.in_atom = false;
+            return;
+        }
+
+        if (self.options.dialect == .json5 and startsUnicodeWhitespace(byte)) {
+            self.carry.pending_unicode[0] = byte;
+            self.carry.pending_unicode_len = 1;
+            self.carry.pending_unicode_offset = @intCast(offset);
+            return;
+        }
+
+        if (self.isAtomCandidate(byte)) {
+            self.recordAtom(offset);
+            self.carry.in_atom = true;
+            return;
+        }
+
+        self.carry.in_atom = switch (self.options.dialect) {
+            .json, .jsonc => !isWhitespaceByte(byte),
+            .json5 => false,
+        };
+    }
+    fn appendPendingUnicode(self: *Self, byte: u8) bool {
+        const len: usize = self.carry.pending_unicode_len;
+        const first = self.carry.pending_unicode[0];
+
+        if (len == 1) {
+            const expected = switch (first) {
+                0xc2 => byte == 0xa0,
+                0xe1 => byte == 0x9a,
+                0xe2 => byte == 0x80 or byte == 0x81,
+                0xe3 => byte == 0x80,
+                0xef => byte == 0xbb,
+                else => false,
+            };
+            const continuation = byte >= 0x80 and byte <= 0xbf;
+            if (!expected and !continuation) {
+                self.recordAtom(self.carry.pending_unicode_offset);
+                self.carry.in_atom = true;
+                self.carry.pending_unicode_len = 0;
+                return false;
+            }
+        } else if (len == 2 and (byte < 0x80 or byte > 0xbf)) {
+            self.recordAtom(self.carry.pending_unicode_offset);
+            self.carry.in_atom = true;
+            self.carry.pending_unicode_len = 0;
+            return false;
+        }
+
+        self.carry.pending_unicode[len] = byte;
+        self.carry.pending_unicode_len += 1;
+
+        const count: usize = self.carry.pending_unicode_len;
+        const complete = switch (first) {
+            0xc2 => count >= 2,
+            0xe1, 0xe2, 0xe3, 0xef => count >= 3,
+            else => true,
+        };
+        if (!complete) return true;
+
+        const bytes = self.carry.pending_unicode;
+        const whitespace = switch (first) {
+            0xc2 => bytes[1] == 0xa0,
+            0xe1 => bytes[1] == 0x9a and bytes[2] == 0x80,
+            0xe2 => (bytes[1] == 0x80 and
+                (bytes[2] >= 0x80 and bytes[2] <= 0x8a or
+                    bytes[2] == 0xa8 or bytes[2] == 0xa9 or
+                    bytes[2] == 0xaf)) or
+                (bytes[1] == 0x81 and bytes[2] == 0x9f),
+            0xe3 => bytes[1] == 0x80 and bytes[2] == 0x80,
+            0xef => bytes[1] == 0xbb and bytes[2] == 0xbf,
+            else => false,
+        };
+        if (whitespace) {
+            self.carry.in_atom = false;
+        } else {
+            self.recordAtom(self.carry.pending_unicode_offset);
+            self.carry.in_atom = true;
+        }
+        self.carry.pending_unicode_len = 0;
+        return true;
+    }
+
+    fn flushDeferred(self: *Self) void {
+        if (self.carry.pending_slash) {
+            self.carry.pending_slash = false;
+            self.carry.in_atom = self.options.dialect != .json5;
+        }
+        if (self.carry.pending_escape) {
+            self.carry.pending_escape = false;
+            self.carry.in_atom = false;
+        }
+        if (self.carry.pending_unicode_len != 0) {
+            self.recordAtom(self.carry.pending_unicode_offset);
+            self.carry.in_atom = true;
+            self.carry.pending_unicode_len = 0;
+        }
+    }
+
+    fn record(self: *Self, offset: usize) void {
+        const index = self.indexPtr();
+        assert(index.count + sentinel_count <= index.indexes.len);
+        index.indexes[index.count] = @intCast(offset);
+        index.count += 1;
+    }
+
+    fn recordAtom(self: *Self, offset: usize) void {
+        if (!self.carry.in_atom) self.record(offset);
+    }
+
+    fn commentsEnabled(self: *const Self) bool {
+        return self.options.dialect != .json;
+    }
+
+    fn isQuote(self: *const Self, byte: u8) bool {
+        return byte == '"' or
+            (self.options.dialect == .json5 and byte == '\'');
+    }
+    fn updateBackslashParity(self: *Self, byte: u8) void {
+        self.carry.ends_in_backslash = byte == '\\';
+        self.carry.backslash_run_odd =
+            if (byte == '\\') !self.carry.backslash_run_odd else false;
+    }
+
+    fn isAtomCandidate(self: *const Self, byte: u8) bool {
+        return switch (self.options.dialect) {
+            .json, .jsonc => isAtomByte(byte),
+            .json5 => switch (byte) {
+                '-', '+', '.', '0'...'9', 'a'...'z', 'A'...'Z', '_', '$', 0xc0...0xff => true,
+                0x80...0xbf => self.carry.in_atom,
+                else => false,
+            },
+        };
+    }
 };
+
+fn startsUnicodeWhitespace(byte: u8) bool {
+    return switch (byte) {
+        0xc2, 0xe1, 0xe2, 0xe3, 0xef => true,
+        else => false,
+    };
+}
 
 fn validByteMask(
     comptime VLEN: usize,
@@ -412,6 +752,48 @@ fn scalarIndexJson(
     try result.finish(input.len);
     return result;
 }
+fn scalarIndexJsonl(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+) !stage1.StructuralIndex {
+    var result = try stage1.StructuralIndex.init(allocator, input.len);
+    errdefer result.deinit(allocator);
+
+    var in_string = false;
+    var backslash_run_length: usize = 0;
+    var previous_in_atom = false;
+    for (input, 0..) |byte, offset| {
+        const unescaped_quote = byte == '"' and backslash_run_length % 2 == 0;
+        if (unescaped_quote) {
+            if (!in_string) {
+                result.indexes[result.count] = @intCast(offset);
+                result.count += 1;
+            }
+            in_string = !in_string;
+        }
+
+        if (!in_string) {
+            if (isStructuralByte(byte) or byte == '\n') {
+                result.indexes[result.count] = @intCast(offset);
+                result.count += 1;
+            } else if (isAtomByte(byte) and !previous_in_atom) {
+                result.indexes[result.count] = @intCast(offset);
+                result.count += 1;
+            }
+        }
+
+        previous_in_atom = !in_string and byte != '"' and
+            !isStructuralByte(byte) and !isWhitespaceByte(byte);
+        if (byte == '\\') {
+            backslash_run_length += 1;
+        } else {
+            backslash_run_length = 0;
+        }
+    }
+
+    try result.finish(input.len);
+    return result;
+}
 
 fn isWhitespaceByte(byte: u8) bool {
     return switch (byte) {
@@ -446,12 +828,18 @@ fn expectIndexEqual(
     );
 }
 
-fn expectEveryFeedPartition(input: []const u8) !void {
-    var expected = try scalarIndexJson(testing.allocator, input);
+fn expectEveryFeedPartition(
+    input: []const u8,
+    options: Options,
+) !void {
+    var expected = if (options.mode == .jsonl)
+        try scalarIndexJsonl(testing.allocator, input)
+    else
+        try scalarIndexJson(testing.allocator, input);
     defer expected.deinit(testing.allocator);
 
     for (0..input.len + 1) |split| {
-        var stream = try StreamIndexer.init(testing.allocator, 3);
+        var stream = try StreamIndexer.init(testing.allocator, 3, options);
         defer stream.deinit();
 
         try stream.feed(input[0..split]);
@@ -464,7 +852,7 @@ fn expectEveryFeedPartition(input: []const u8) !void {
         try expectIndexEqual(&expected, &actual);
     }
 
-    var byte_stream = try StreamIndexer.init(testing.allocator, 1);
+    var byte_stream = try StreamIndexer.init(testing.allocator, 1, options);
     defer byte_stream.deinit();
     for (input) |byte| {
         try byte_stream.feed(&.{byte});
@@ -475,20 +863,161 @@ fn expectEveryFeedPartition(input: []const u8) !void {
     defer byte_actual.deinit(testing.allocator);
     try expectIndexEqual(&expected, &byte_actual);
 }
+fn expectEveryFeedPartitionAgainst(
+    input: []const u8,
+    options: Options,
+    expected_offsets: []const u32,
+) !void {
+    var expected = try stage1.StructuralIndex.init(
+        testing.allocator,
+        input.len,
+    );
+    defer expected.deinit(testing.allocator);
+    @memcpy(expected.indexes[0..expected_offsets.len], expected_offsets);
+    expected.count = expected_offsets.len;
+    try expected.finish(input.len);
+
+    for (0..input.len + 1) |split| {
+        var stream = try StreamIndexer.init(testing.allocator, 3, options);
+        defer stream.deinit();
+        try stream.feed(input[0..split]);
+        try stream.feed(input[split..]);
+        try stream.finish();
+        var actual = stream.take();
+        defer actual.deinit(testing.allocator);
+        try expectIndexEqual(&expected, &actual);
+    }
+
+    var byte_stream = try StreamIndexer.init(testing.allocator, 1, options);
+    defer byte_stream.deinit();
+    for (input) |byte| try byte_stream.feed(&.{byte});
+    try byte_stream.finish();
+    var byte_actual = byte_stream.take();
+    defer byte_actual.deinit(testing.allocator);
+    try expectIndexEqual(&expected, &byte_actual);
+}
+
+const FaultingReader = struct {
+    reader: std.Io.Reader,
+    input: []const u8,
+    offset: usize = 0,
+    fail_at: usize,
+
+    const vtable: std.Io.Reader.VTable = .{
+        .stream = stream,
+    };
+
+    fn init(
+        input: []const u8,
+        fail_at: usize,
+        buffer: []u8,
+    ) FaultingReader {
+        return .{
+            .reader = .{
+                .vtable = &vtable,
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+            .input = input,
+            .fail_at = fail_at,
+        };
+    }
+
+    fn stream(
+        reader: *std.Io.Reader,
+        writer: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
+        const self: *@This() = @alignCast(@fieldParentPtr("reader", reader));
+        if (self.offset >= self.fail_at) return error.ReadFailed;
+
+        const available = self.fail_at - self.offset;
+        const count = @min(available, @intFromEnum(limit));
+        if (count == 0) return 0;
+
+        try writer.writeAll(self.input[self.offset..][0..count]);
+        self.offset += count;
+        return count;
+    }
+};
+
+test "JSON stream reader adapter finishes when the reader reaches EOF" {
+    const input = "{\"reader\":true}";
+    var reader = std.Io.Reader.fixed(input);
+    var stream = try StreamIndexer.init(
+        testing.allocator,
+        3,
+        .{ .dialect = .json },
+    );
+    defer stream.deinit();
+
+    try stream.feedFrom(&reader);
+
+    try testing.expect(stream.finished);
+    var actual = stream.take();
+    defer actual.deinit(testing.allocator);
+    var expected = try scalarIndexJson(testing.allocator, input);
+    defer expected.deinit(testing.allocator);
+    try expectIndexEqual(&expected, &actual);
+}
+
+test "JSON stream reader adapter finishes an empty reader" {
+    var reader = std.Io.Reader.fixed("");
+    var stream = try StreamIndexer.init(
+        testing.allocator,
+        3,
+        .{ .dialect = .json },
+    );
+    defer stream.deinit();
+
+    try stream.feedFrom(&reader);
+
+    try testing.expect(stream.finished);
+    try testing.expectEqual(@as(usize, 0), stream.input_len);
+    var actual = stream.take();
+    defer actual.deinit(testing.allocator);
+    var expected = try scalarIndexJson(testing.allocator, "");
+    defer expected.deinit(testing.allocator);
+    try expectIndexEqual(&expected, &actual);
+}
+
+test "JSON stream reader adapter returns a reader error after buffered data" {
+    const input = "[1]";
+    var source_buffer: [2]u8 = undefined;
+    var faulting = FaultingReader.init(input, input.len, &source_buffer);
+    var stream = try StreamIndexer.init(
+        testing.allocator,
+        3,
+        .{ .dialect = .json },
+    );
+    defer stream.deinit();
+
+    try testing.expectError(error.ReadFailed, stream.feedFrom(&faulting.reader));
+    try testing.expect(!stream.finished);
+    try testing.expectEqual(input.len, stream.input_len);
+
+    try stream.finish();
+    var actual = stream.take();
+    defer actual.deinit(testing.allocator);
+    var expected = try scalarIndexJson(testing.allocator, input);
+    defer expected.deinit(testing.allocator);
+    try expectIndexEqual(&expected, &actual);
+}
 
 test "JSON stream matches one-shot indexes at quote and escape boundaries" {
     // Odd and even backslash runs cross every possible two-feed boundary.
     const input = [_]u8{
         '{', '"', 'o', 'd', 'd', '"', ':', '"', 'a', '\\', '\\', '\\', '"', 'b', '"', ',',
         '"', 'e', 'v', 'e', 'n', '"', ':', '"', 'c', '\\', '\\', '"',  ',', '"', 'x', '"',
-        ':', '"', '{', '[', ',', ':', ']', '}', '"', '}',
+        ':', '{', '[', ',', ':', ']', '}', '"', '}',
     };
-    try expectEveryFeedPartition(&input);
+    try expectEveryFeedPartition(&input, .{ .dialect = .json });
 }
 
 test "JSON stream matches one-shot indexes for split atoms and sentinels" {
     const input = "[true,false,null,-1234567890,0,{\"tail\":42}]";
-    try expectEveryFeedPartition(input);
+    try expectEveryFeedPartition(input, .{ .dialect = .json });
 }
 
 test "JSON stream carries state across SIMD slots" {
@@ -497,11 +1026,53 @@ test "JSON stream carries state across SIMD slots" {
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ\\\\\\\"tail\"," ++
         "\"values\":[true,false,null,-12345678901234567890]," ++
         "\"nested\":{\"punctuation\":\"{}[],:\"}}";
-    try expectEveryFeedPartition(input);
+    try expectEveryFeedPartition(input, .{ .dialect = .json });
+}
+
+test "JSONL stream indexes LF records but not quoted LF" {
+    const input = "{\"a\":1}\n{\"b\":\"line" ++
+        "\n" ++
+        "value\"}\r\n[true,false]\n";
+    try expectEveryFeedPartition(
+        input,
+        .{ .dialect = .json, .mode = .jsonl },
+    );
+}
+
+test "JSONL stream carries CRLF and LF across arbitrary feeds" {
+    const input = "1\r\n2\n3\r\n";
+    try expectEveryFeedPartition(
+        input,
+        .{ .dialect = .json, .mode = .jsonl },
+    );
+}
+
+test "JSONC stream carries comments across feeds" {
+    const input = "{/*a*/\"x\":true,//tail\n\"y\":2}";
+    const expected = [_]u32{ 0, 6, 9, 10, 14, 22, 25, 26, 27 };
+    try expectEveryFeedPartitionAgainst(
+        input,
+        .{ .dialect = .jsonc },
+        &expected,
+    );
+}
+
+test "JSON5 stream carries quote delimiters and atom boundaries" {
+    const input = "{'x':+1,foo:0x2A}";
+    const expected = [_]u32{ 0, 1, 4, 5, 7, 8, 11, 12, 16 };
+    try expectEveryFeedPartitionAgainst(
+        input,
+        .{ .dialect = .json5 },
+        &expected,
+    );
 }
 
 test "JSON stream take transfers ownership and reset starts at offset zero" {
-    var stream = try StreamIndexer.init(testing.allocator, 2);
+    var stream = try StreamIndexer.init(
+        testing.allocator,
+        2,
+        .{ .dialect = .json },
+    );
     defer stream.deinit();
 
     try stream.feed("{\"first\":true}");

@@ -1,11 +1,24 @@
 const std = @import("std");
 const simd = @import("../core/simd.zig");
 const stage1 = @import("../core/stage1.zig");
+const stream = @import("../core/stream.zig");
 const ondemand = @import("../core/ondemand.zig");
 const stage2 = @import("../core/stage2.zig");
 
 const testing = std.testing;
 const sentinel_count: usize = 3;
+
+/// Initializes a chunk-fed RFC JSON Stage 1 indexer in document mode.
+pub fn initStreamIndexer(
+    allocator: std.mem.Allocator,
+    chunk_len: usize,
+) stream.StreamIndexer.InitError!stream.StreamIndexer {
+    return stream.StreamIndexer.init(
+        allocator,
+        chunk_len,
+        stream.Options{ .dialect = .json, .mode = .document },
+    );
+}
 
 /// Builds an on-demand document backed by parser-owned structural storage.
 ///
@@ -760,4 +773,82 @@ test "validateJson returns first diagnostic with source location" {
 test "refAllDecls" {
     testing.refAllDecls(@This());
     _ = simd;
+}
+
+fn expectJsonStreamIndexEqual(
+    expected: *const stage1.StructuralIndex,
+    actual: *const stage1.StructuralIndex,
+) !void {
+    try testing.expectEqual(expected.count, actual.count);
+    try testing.expectEqualSlices(
+        u32,
+        expected.indexes[0 .. expected.count + sentinel_count],
+        actual.indexes[0 .. actual.count + sentinel_count],
+    );
+}
+
+fn feedJsonStream(
+    input: []const u8,
+    split: usize,
+    chunk_len: usize,
+) !stage1.StructuralIndex {
+    var indexer = try initStreamIndexer(testing.allocator, chunk_len);
+    defer indexer.deinit();
+
+    try indexer.feed(input[0..split]);
+    try indexer.feed("");
+    try indexer.feed(input[split..]);
+    try indexer.finish();
+    try indexer.finish();
+    return indexer.take();
+}
+
+test "JSON stream wrapper matches one-shot at every partition and byte feed" {
+    const input = "{\"alpha\":[true,false,null,-42],\"text\":\"a\\\\\\\"b\"}";
+    var expected = try indexJson(testing.allocator, input);
+    defer expected.deinit(testing.allocator);
+
+    for (0..input.len + 1) |split| {
+        var actual = try feedJsonStream(input, split, 3);
+        defer actual.deinit(testing.allocator);
+        try expectJsonStreamIndexEqual(&expected, &actual);
+    }
+
+    var byte_indexer = try initStreamIndexer(testing.allocator, 1);
+    defer byte_indexer.deinit();
+    for (input) |byte| {
+        try byte_indexer.feed(&.{byte});
+    }
+    try byte_indexer.finish();
+    var byte_actual = byte_indexer.take();
+    defer byte_actual.deinit(testing.allocator);
+    try expectJsonStreamIndexEqual(&expected, &byte_actual);
+}
+
+test "JSON stream wrapper reset and finish lifecycle preserve document offsets" {
+    const first_input = "{\"first\":true}";
+    const second_input = "[-1,null]";
+    var indexer = try initStreamIndexer(testing.allocator, 2);
+    defer indexer.deinit();
+
+    try indexer.feed(first_input);
+    try indexer.finish();
+    try indexer.finish();
+    try testing.expectError(error.AlreadyFinished, indexer.feed("0"));
+    var first = indexer.take();
+    defer first.deinit(testing.allocator);
+
+    indexer.reset();
+    try indexer.feed(second_input[0..2]);
+    try indexer.feed(second_input[2..]);
+    try indexer.finish();
+    var second = indexer.take();
+    defer second.deinit(testing.allocator);
+
+    var expected_first = try indexJson(testing.allocator, first_input);
+    defer expected_first.deinit(testing.allocator);
+    var expected_second = try indexJson(testing.allocator, second_input);
+    defer expected_second.deinit(testing.allocator);
+    try expectJsonStreamIndexEqual(&expected_first, &first);
+    try expectJsonStreamIndexEqual(&expected_second, &second);
 }

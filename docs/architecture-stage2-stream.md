@@ -579,19 +579,40 @@ not JSON documents, JSON tape cursors, or JSON DOMs.
 ### Implemented JSON baseline
 
 `src/core/stream.zig` implements a chunk-fed JSON Stage 1 `StreamIndexer`.
-Its public lifecycle is `init`, `feed`, `finish`, `take`, `reset`, and
-`deinit`. It copies chunks through two fixed padded slots and produces a
+Its public lifecycle is `init`, `feed`, `feedFrom`, `finish`, `take`, `reset`,
+and `deinit`. It copies chunks through two fixed padded slots and produces a
 `StructuralIndex`.
 
-The current stream module does not accept `std.Io.Reader`. It does not run
-Stage 2 or On-Demand traversal, and it does not support the other five
-formats.
+`feedFrom` is an optional convenience adapter over `feed`:
 
-### Future roadmap: general streaming reader
+```zig
+pub fn feedFrom(
+    self: *StreamIndexer,
+    reader: *std.Io.Reader,
+) FeedFromError!void;
+```
 
-The remaining goal is to feed arbitrarily large documents through a reader,
-preserve format-specific state across arbitrary boundaries, and match one-shot
-Stage 1 output for every supported format.
+It drains `reader.buffered()`, calls `feed` with each available slice, then
+calls `reader.toss` only after `feed` succeeds. When no bytes are buffered it
+calls `reader.fill(1)`. `error.EndOfStream` is normalized to `finish`; other
+reader errors and all indexer errors propagate.
+
+The adapter retains no `std.Io.Reader`, source slice, or reader buffer. The
+reader object and its backing buffer must remain valid for the duration of the
+`feedFrom` call. Each `feed` call borrows its input only until that call
+returns because the indexer copies it into its resident padded slots. After
+`feedFrom` returns, only the indexer's parser state and `StructuralIndex`
+remain. `feedFrom` produces Stage 1 output only; Stage 2 and On-Demand still
+require separate caller-owned complete input that outlives those consumers.
+
+The stream module does not run Stage 2 or On-Demand traversal, and it does not
+yet provide chunk-fed Stage 1 support for the other five formats.
+
+### General streaming reader boundary
+
+For formats beyond JSON, the remaining goal is to feed arbitrarily large
+documents through a reader, preserve format-specific state across arbitrary
+boundaries, and match one-shot Stage 1 output for every supported format.
 
 ```zig
 pub const CarryState = struct {
@@ -720,20 +741,22 @@ refactored to the same backing stores so streaming and batch never fork.
    indexer on that sequence, including truncation: `error.Truncated` iff `carry`
    non-empty at end-of-stream.
 
-### Future `std.Io.Reader` integration
+### `std.Io.Reader` integration boundary
 
-Use `std.Io.Reader` (Io-instance world; non-generic, vtable-backed — do not
-implement per-stream generic `Reader` types):
-- `reader.buffer(size)` → `[]u8` for zero-copy chunk fill.
-- `reader.fill(want)` guarantees `want` bytes (blocks short reads), tops up the
-  margin before `carve`.
-- `reader.seek(advance)` / `reader.pos` → forward-only consumption mapping onto
-  `buf.toss(n)` + `fill(buf.resolve(n))`.
-- `reader.takeDelimiter(allocator, delim)` → Model C/JSONL line path.
-- `reader.end` (eof) terminates `finish`.
-- A `StreamIndexer` takes a `std.Io.Reader` in a `feedFrom` helper; `feed` stays
-  buffer-only so tests feed synthetic chunks without a real I/O source.
-- NixOS: avoid `std.c`-backed reads in the hot loop; one `read` per `feed`.
+`std.Io.Reader` is the Zig 0.16 non-generic, vtable-backed reader interface.
+`StreamIndexer.feedFrom` uses only its `buffered`, `fill`, and `toss` methods:
+
+- Drain `reader.buffered()` and pass each returned slice to `feed`.
+- Call `reader.toss(buffered.len)` only after that `feed` call succeeds.
+- When no bytes are buffered, call `reader.fill(1)` to request progress.
+- Normalize `error.EndOfStream` from `fill` to `finish`.
+- Propagate `error.ReadFailed` and all `feed`/`finish` errors unchanged.
+
+`feed` remains buffer-only, so tests and callers can supply synthetic chunks
+without a real I/O source. `feedFrom` does not store the reader or its buffer;
+the reader and its backing storage need only live through that call. The
+resulting Stage 1 index does not retain source bytes. Stage 2 and On-Demand
+therefore still require independent complete input owned by the caller.
 
 ---
 
@@ -750,13 +773,17 @@ implement per-stream generic `Reader` types):
 5. Markdown and XML use format-local documents and tapes, not JSON DOMs.
 6. JSON On-Demand consumes complete resident input through parser-owned
    structural storage.
-7. JSON streaming currently ends at Stage 1 `StructuralIndex` production.
+7. JSON streaming ends at Stage 1 `StructuralIndex` production; `feedFrom` is
+   only an input adapter and does not make Stage 2 or On-Demand source-safe.
+8. The `feedFrom` reader and its backing storage are caller-owned for the
+   duration of the call only; the indexer retains parser state and indexes, not
+   source bytes.
 
 ## Future roadmap
 
 1. Add chunk-fed Stage 1 support for JSONL, JSONC, JSON5, Markdown, and XML.
-2. Add `std.Io.Reader` integration without presenting pull events as an input
-   streaming API.
+2. Keep `std.Io.Reader` integration as an optional adapter without presenting
+   pull events as an input streaming API.
 3. Define how chunked source storage outlives Stage 2 or On-Demand cursors
    before those APIs consume streamed input.
 4. Define wider tape payloads if values beyond the `u24` bound are required.

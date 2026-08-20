@@ -1,7 +1,20 @@
 const std = @import("std");
 const simd = @import("../core/simd.zig");
 const stage1 = @import("../core/stage1.zig");
+const stream = @import("../core/stream.zig");
 const stage2 = @import("../core/stage2.zig");
+
+/// Initializes a chunk-fed JSONL Stage 1 indexer with LF framing enabled.
+pub fn initStreamIndexer(
+    allocator: std.mem.Allocator,
+    chunk_len: usize,
+) stream.StreamIndexer.InitError!stream.StreamIndexer {
+    return stream.StreamIndexer.init(
+        allocator,
+        chunk_len,
+        stream.Options{ .dialect = .json, .mode = .jsonl },
+    );
+}
 
 /// One validated JSONL record. The source is a caller-backed view and the tape
 /// is owned by the record document, so a cursor cannot cross record boundaries.
@@ -280,6 +293,7 @@ fn isBlankRecord(source: []const u8) bool {
 }
 
 const testing = std.testing;
+const sentinel_count: usize = 3;
 
 pub fn indexJsonl(
     allocator: std.mem.Allocator,
@@ -932,4 +946,83 @@ test "validateJsonl reports later record errors in global coordinates" {
 test "refAllDecls" {
     testing.refAllDecls(@This());
     _ = simd;
+}
+
+fn expectJsonlStreamIndexEqual(
+    expected: *const stage1.StructuralIndex,
+    actual: *const stage1.StructuralIndex,
+) !void {
+    try testing.expectEqual(expected.count, actual.count);
+    try testing.expectEqualSlices(
+        u32,
+        expected.indexes[0 .. expected.count + sentinel_count],
+        actual.indexes[0 .. actual.count + sentinel_count],
+    );
+}
+
+fn feedJsonlStream(
+    input: []const u8,
+    split: usize,
+    chunk_len: usize,
+) !stage1.StructuralIndex {
+    var indexer = try initStreamIndexer(testing.allocator, chunk_len);
+    defer indexer.deinit();
+
+    try indexer.feed(input[0..split]);
+    try indexer.feed("");
+    try indexer.feed(input[split..]);
+    try indexer.finish();
+    try indexer.finish();
+    return indexer.take();
+}
+
+test "JSONL stream wrapper matches one-shot at every partition and byte feed" {
+    const input =
+        "{\"a\":1}\n{\"b\":\"line\nvalue\"}\r\n[true,false]\n";
+    var expected = try indexJsonl(testing.allocator, input);
+    defer expected.deinit(testing.allocator);
+
+    for (0..input.len + 1) |split| {
+        var actual = try feedJsonlStream(input, split, 3);
+        defer actual.deinit(testing.allocator);
+        try expectJsonlStreamIndexEqual(&expected, &actual);
+    }
+
+    var byte_indexer = try initStreamIndexer(testing.allocator, 1);
+    defer byte_indexer.deinit();
+    for (input) |byte| {
+        try byte_indexer.feed(&.{byte});
+    }
+    try byte_indexer.finish();
+    var byte_actual = byte_indexer.take();
+    defer byte_actual.deinit(testing.allocator);
+    try expectJsonlStreamIndexEqual(&expected, &byte_actual);
+}
+
+test "JSONL stream wrapper reset and finish lifecycle restart offsets" {
+    const first_input = "1\n2\n";
+    const second_input = "{\"x\":true}\n";
+    var indexer = try initStreamIndexer(testing.allocator, 2);
+    defer indexer.deinit();
+
+    try indexer.feed(first_input);
+    try indexer.finish();
+    try indexer.finish();
+    try testing.expectError(error.AlreadyFinished, indexer.feed("0"));
+    var first = indexer.take();
+    defer first.deinit(testing.allocator);
+
+    indexer.reset();
+    try indexer.feed(second_input[0..4]);
+    try indexer.feed(second_input[4..]);
+    try indexer.finish();
+    var second = indexer.take();
+    defer second.deinit(testing.allocator);
+
+    var expected_first = try indexJsonl(testing.allocator, first_input);
+    defer expected_first.deinit(testing.allocator);
+    var expected_second = try indexJsonl(testing.allocator, second_input);
+    defer expected_second.deinit(testing.allocator);
+    try expectJsonlStreamIndexEqual(&expected_first, &first);
+    try expectJsonlStreamIndexEqual(&expected_second, &second);
 }

@@ -11,6 +11,120 @@ fn checkMonotonicBounds(indexes: []const u32, input_len: usize) !void {
     }
 }
 
+const stream_sentinel_count: usize = 3;
+
+fn fuzzCuts(input_len: usize) [4]usize {
+    return .{
+        0,
+        input_len / 3,
+        input_len / 2,
+        input_len,
+    };
+}
+
+fn expectJsonlStreamPartitions(
+    input: []const u8,
+    expected: *const lib.StructuralIndex,
+) !void {
+    const cuts = fuzzCuts(input.len);
+    var stream = try lib.formats.jsonl.initStreamIndexer(
+        testing.allocator,
+        3,
+    );
+    defer stream.deinit();
+
+    var start: usize = 0;
+    for (cuts) |cut| {
+        try testing.expect(cut >= start);
+        try stream.feed(input[start..cut]);
+        try stream.feed("");
+        start = cut;
+    }
+    try stream.feed(input[start..]);
+    try stream.finish();
+
+    var actual = stream.take();
+    defer actual.deinit(testing.allocator);
+    try testing.expectEqual(expected.count, actual.count);
+    try testing.expectEqualSlices(
+        u32,
+        expected.indexes[0 .. expected.count + stream_sentinel_count],
+        actual.indexes[0 .. actual.count + stream_sentinel_count],
+    );
+}
+
+fn expectMarkdownStreamPartitions(
+    input: []const u8,
+    expected: *const lib.formats.markdown.MarkdownStructuralIndex,
+) !void {
+    const cuts = fuzzCuts(input.len);
+    var stream = try lib.formats.markdown.MarkdownStreamIndexer.init(
+        testing.allocator,
+        3,
+    );
+    defer stream.deinit();
+
+    var start: usize = 0;
+    for (cuts) |cut| {
+        try testing.expect(cut >= start);
+        try stream.feed(input[start..cut]);
+        try stream.feed("");
+        start = cut;
+    }
+    try stream.feed(input[start..]);
+    try stream.finish();
+
+    var actual = stream.take();
+    defer actual.deinit(testing.allocator);
+    try testing.expectEqual(expected.count, actual.count);
+    try testing.expectEqualSlices(
+        u32,
+        expected.indexes[0 .. expected.count + stream_sentinel_count],
+        actual.indexes[0 .. actual.count + stream_sentinel_count],
+    );
+    try testing.expectEqualSlices(
+        lib.formats.markdown.MarkdownTokenKind,
+        expected.kinds[0..expected.count],
+        actual.kinds[0..actual.count],
+    );
+}
+
+fn expectXmlStreamPartitions(
+    input: []const u8,
+    expected: *const lib.formats.xml.XmlStructuralIndex,
+) !void {
+    const cuts = fuzzCuts(input.len);
+    var stream = try lib.formats.xml.XmlStreamIndexer.init(
+        testing.allocator,
+        3,
+    );
+    defer stream.deinit();
+
+    var start: usize = 0;
+    for (cuts) |cut| {
+        try testing.expect(cut >= start);
+        try stream.feed(input[start..cut]);
+        try stream.feed("");
+        start = cut;
+    }
+    try stream.feed(input[start..]);
+    try stream.finish();
+
+    var actual = stream.take();
+    defer actual.deinit(testing.allocator);
+    try testing.expectEqual(expected.count, actual.count);
+    try testing.expectEqualSlices(
+        u32,
+        expected.indexes[0 .. expected.count + stream_sentinel_count],
+        actual.indexes[0 .. actual.count + stream_sentinel_count],
+    );
+    try testing.expectEqualSlices(
+        lib.formats.xml.XmlTokenKind,
+        expected.kinds[0..expected.count],
+        actual.kinds[0..actual.count],
+    );
+}
+
 const deterministic_case_count = 2_048;
 const input_size_max = 512;
 
@@ -86,6 +200,7 @@ fn testFuzzJsonl(_: void, smith: *testing.Smith) !void {
     defer idx.deinit(testing.allocator);
 
     try checkMonotonicBounds(idx.slice(), input.len);
+    try expectJsonlStreamPartitions(input, &idx);
 }
 
 // -------------------------------------------------------------------------
@@ -151,6 +266,7 @@ fn testFuzzMarkdown(_: void, smith: *testing.Smith) !void {
     const slice = idx.indexes[0..idx.count];
     try checkMonotonicBounds(slice, input.len);
     try testing.expect(idx.count <= idx.kinds.len);
+    try expectMarkdownStreamPartitions(input, &idx);
 }
 
 // -------------------------------------------------------------------------
@@ -174,4 +290,5 @@ fn testFuzzXml(_: void, smith: *testing.Smith) !void {
     const slice = idx.indexes[0..idx.count];
     try checkMonotonicBounds(slice, input.len);
     try testing.expect(idx.count <= idx.kinds.len);
+    try expectXmlStreamPartitions(input, &idx);
 }
