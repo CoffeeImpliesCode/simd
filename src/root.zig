@@ -16,7 +16,7 @@ pub const matchAny2 = simd.matchAny2;
 pub const matchAny4 = simd.matchAny4;
 pub const matchRange = simd.matchRange;
 pub const extractBitIndexes = simd.extractBitIndexes;
-pub const computeBackslashRuns64 = simd.computeBackslashRuns64;
+pub const computeBackslashRuns = simd.computeBackslashRuns;
 
 pub const StructuralIndex = stage1.StructuralIndex;
 

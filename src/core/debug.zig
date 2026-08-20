@@ -23,11 +23,13 @@ pub const Style = struct {
     }
 };
 
-pub const HighlightLayer = struct {
-    mask: u64,
-    style: Style,
-    name: []const u8,
-};
+pub fn HighlightLayer(comptime VLEN: usize) type {
+    return struct {
+        mask: simd.Mask(VLEN),
+        style: Style,
+        name: []const u8,
+    };
+}
 
 pub fn printAscii(character: u8, writer: anytype) !void {
     if (std.ascii.isPrint(character)) {
@@ -43,15 +45,19 @@ pub fn printAscii(character: u8, writer: anytype) !void {
 }
 
 pub fn highlightMulti(
-    bytes: simd.Vec(64, u8),
-    layers: []const HighlightLayer,
+    comptime VLEN: usize,
+    bytes: simd.Vec(VLEN, u8),
+    layers: []const HighlightLayer(VLEN),
     note: []const u8,
     writer: anytype,
 ) !void {
-    const values: [64]u8 = bytes;
+    const Mask = simd.Mask(VLEN);
+    const Shift = std.math.Log2Int(Mask);
+    const values: [VLEN]u8 = bytes;
 
     for (values, 0..) |character, bit_index| {
-        const bit: u64 = @as(u64, 1) << @as(u6, @intCast(bit_index));
+        const bit: Mask = @as(Mask, 1) <<
+            @as(Shift, @intCast(bit_index));
         var composite: Style = .{};
         var has_style = false;
 

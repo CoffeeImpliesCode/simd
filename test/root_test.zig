@@ -42,44 +42,70 @@ test "core: prefixXor matches mathematical parity" {
     }
 }
 
+fn expectStructuralWidths(comptime index_fn: anytype, input: []const u8) !void {
+    var expected = try index_fn(16, testing.allocator, input);
+    defer expected.deinit(testing.allocator);
+    try testing.expect(expected.count > 0);
+
+    inline for ([_]usize{ 16, 32, 64 }) |vlen| {
+        var actual = try index_fn(vlen, testing.allocator, input);
+        defer actual.deinit(testing.allocator);
+        try testing.expectEqualSlices(
+            u32,
+            expected.indexes[0..expected.count],
+            actual.indexes[0..actual.count],
+        );
+    }
+}
+
+fn expectTokenWidths(comptime index_fn: anytype, input: []const u8) !void {
+    var expected = try index_fn(16, testing.allocator, input);
+    defer expected.deinit(testing.allocator);
+    try testing.expect(expected.count > 0);
+
+    inline for ([_]usize{ 16, 32, 64 }) |vlen| {
+        var actual = try index_fn(vlen, testing.allocator, input);
+        defer actual.deinit(testing.allocator);
+
+        try testing.expectEqualSlices(
+            u32,
+            expected.indexes[0..expected.count],
+            actual.indexes[0..actual.count],
+        );
+        try testing.expectEqualSlices(
+            @TypeOf(expected.kinds[0]),
+            expected.kinds[0..expected.count],
+            actual.kinds[0..actual.count],
+        );
+    }
+}
+
 test "corpus: JSON indexing on example_config.json" {
     const json_data = @embedFile("corpus/json/example_config.json");
-    var idx = try lib.formats.json.indexJson(testing.allocator, json_data);
-    defer idx.deinit(testing.allocator);
-    try testing.expect(idx.count > 0);
+    try expectStructuralWidths(lib.formats.json.indexJsonImpl, json_data);
 }
 
 test "corpus: JSONL indexing on amazon_cellphones.ndjson" {
     const jsonl_data = @embedFile("corpus/jsonl/amazon_cellphones.ndjson");
-    var idx = try lib.formats.jsonl.indexJsonl(testing.allocator, jsonl_data);
-    defer idx.deinit(testing.allocator);
-    try testing.expect(idx.count > 0);
+    try expectStructuralWidths(lib.formats.jsonl.indexJsonlImpl, jsonl_data);
 }
 
 test "corpus: JSONC indexing on config.jsonc" {
     const jsonc_data = @embedFile("corpus/jsonc/config.jsonc");
-    var idx = try lib.formats.jsonc.indexJsonc(testing.allocator, jsonc_data);
-    defer idx.deinit(testing.allocator);
-    try testing.expect(idx.count > 0);
+    try expectStructuralWidths(lib.formats.jsonc.indexJsoncImpl, jsonc_data);
 }
 
 test "corpus: JSON5 indexing on sample.json5" {
     const json5_data = @embedFile("corpus/json5/sample.json5");
-    var idx = try lib.formats.json5.indexJson5(testing.allocator, json5_data);
-    defer idx.deinit(testing.allocator);
-    try testing.expect(idx.count > 0);
+    try expectStructuralWidths(lib.formats.json5.indexJson5Impl, json5_data);
 }
 
 test "corpus: Markdown indexing on document.md" {
     const md_data = @embedFile("corpus/markdown/document.md");
-    var idx = try lib.formats.markdown.indexMarkdown(testing.allocator, md_data);
-    defer idx.deinit(testing.allocator);
-    try testing.expect(idx.count > 0);
+    try expectTokenWidths(lib.formats.markdown.indexMarkdownImpl, md_data);
 }
 
 test "corpus: XML indexing on catalog.xml" {
     const xml_data = @embedFile("corpus/xml/catalog.xml");
-    var idx = try lib.formats.xml.indexXml(testing.allocator, xml_data);
-    defer idx.deinit(testing.allocator);
-    try testing.expect(idx.count > 0);
+    try expectTokenWidths(lib.formats.xml.indexXmlImpl, xml_data);
 }

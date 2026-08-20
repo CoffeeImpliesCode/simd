@@ -1,12 +1,11 @@
 const std = @import("std");
-const lib = @import("simd_lib");
+const simd = @import("simd_lib");
 const testing = std.testing;
 
 const assert = std.debug.assert;
-const vector_len = lib.default_vector_len;
-const ByteVector = lib.Vec(vector_len, u8);
-const BitMask = lib.Mask(vector_len);
-const debug = lib.debug;
+const VLEN = simd.default_vector_len;
+const BitMask = simd.Mask(VLEN);
+const debug = simd.debug;
 
 const text =
     \\{ "Width": 800,
@@ -32,7 +31,6 @@ const text =
 ;
 
 pub fn main(init: std.process.Init) !void {
-    comptime assert(vector_len == 64);
     comptime assert(text.len > 0);
 
     var stdout_buffer: [4096]u8 = undefined;
@@ -42,36 +40,43 @@ pub fn main(init: std.process.Init) !void {
     try writer.writeAll("\x1b[1m=== SIMD Vector Visualizer (Composite Multi-Mask Orthogonal Styling) ===\x1b[0m\n\n");
     try writer.print("{s}\n\n", .{text});
 
-    var chunk_iterator = lib.windows(u8, vector_len, text, @as(u8, 0));
+    var chunk_iterator = simd.windows(u8, VLEN, text, @as(u8, 0));
     var starts_in_string = false;
     var prev_ends_in_backslash = false;
-    const chunk_count = @divFloor(text.len + vector_len - 1, vector_len);
+    const chunk_count = @divFloor(text.len + VLEN - 1, VLEN);
 
     for (0..chunk_count) |chunk_idx| {
         const bytes = chunk_iterator.next() orelse unreachable;
 
-        const backslash_mask = lib.matchByte(vector_len, bytes, '\\');
-        const bs_runs = lib.computeBackslashRuns64(backslash_mask, prev_ends_in_backslash);
+        const backslash_mask = simd.matchByte(VLEN, bytes, '\\');
+        const bs_runs = simd.computeBackslashRuns(
+            BitMask,
+            backslash_mask,
+            prev_ends_in_backslash,
+        );
         prev_ends_in_backslash = bs_runs.ends_in_backslash;
 
-        const raw_quotes = lib.matchByte(vector_len, bytes, '"');
+        const raw_quotes = simd.matchByte(VLEN, bytes, '"');
         const unescaped_quotes = raw_quotes & ~bs_runs.odd_length_ends;
 
-        const prev_fill: u64 = if (starts_in_string) ~@as(u64, 0) else 0;
-        const inside_without_closing = lib.prefixXor(u64, unescaped_quotes) ^ prev_fill;
+        const prev_fill: BitMask = if (starts_in_string) ~@as(BitMask, 0) else 0;
+        const inside_without_closing =
+            simd.prefixXor(BitMask, unescaped_quotes) ^ prev_fill;
         const string_mask = inside_without_closing | unescaped_quotes;
-        starts_in_string = (inside_without_closing & (@as(u64, 1) << 63)) != 0;
+        const top_bit: BitMask = @as(BitMask, 1) <<
+            @as(std.math.Log2Int(BitMask), @intCast(VLEN - 1));
+        starts_in_string = (inside_without_closing & top_bit) != 0;
 
-        const digits = lib.matchRange(vector_len, bytes, '0', '9');
-        const periods = lib.matchByte(vector_len, bytes, '.');
-        const minus = lib.matchByte(vector_len, bytes, '-');
+        const digits = simd.matchRange(VLEN, bytes, '0', '9');
+        const periods = simd.matchByte(VLEN, bytes, '.');
+        const minus = simd.matchByte(VLEN, bytes, '-');
         const numeric_mask = (digits | periods | minus) & ~string_mask;
 
-        const structurals = lib.matchAny4(vector_len, bytes, '{', '}', '[', ']') |
-            lib.matchAny2(vector_len, bytes, ':', ',');
+        const structurals = simd.matchAny4(VLEN, bytes, '{', '}', '[', ']') |
+            simd.matchAny2(VLEN, bytes, ':', ',');
         const structural_mask = structurals & ~string_mask;
 
-        const layers = [_]debug.HighlightLayer{
+        const layers = [_]debug.HighlightLayer(VLEN){
             .{
                 .mask = unescaped_quotes,
                 .style = .{ .bg_color_256 = 220, .fg_color_256 = 16, .bold = true },
@@ -96,7 +101,7 @@ pub fn main(init: std.process.Init) !void {
 
         var note_buffer: [64]u8 = undefined;
         const note = try std.fmt.bufPrint(&note_buffer, "chunk [{d}/{d}]", .{ chunk_idx + 1, chunk_count });
-        try debug.highlightMulti(bytes, &layers, note, writer);
+        try debug.highlightMulti(VLEN, bytes, &layers, note, writer);
     }
     assert(chunk_iterator.next() == null);
     try writer.writeAll("\n");

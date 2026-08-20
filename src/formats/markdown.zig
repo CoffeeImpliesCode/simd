@@ -31,6 +31,16 @@ pub fn indexMarkdown(
     allocator: std.mem.Allocator,
     input: []const u8,
 ) !MarkdownStructuralIndex {
+    return indexMarkdownImpl(simd.default_vector_len, allocator, input);
+}
+
+pub fn indexMarkdownImpl(
+    comptime VLEN: usize,
+    allocator: std.mem.Allocator,
+    input: []const u8,
+) !MarkdownStructuralIndex {
+    const Mask = simd.Mask(VLEN);
+
     if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
 
     var indexes = try stage1.StructuralIndex.init(allocator, input.len);
@@ -49,17 +59,18 @@ pub fn indexMarkdown(
         .indentation = 0,
         .skip_line = false,
     };
-    var windows = simd.windows(u8, 64, input, 0);
+    var windows = simd.windows(u8, VLEN, input, 0);
     var chunk_offset: usize = 0;
     var scan_offset: usize = 0;
 
-    while (windows.next()) |vector| : (chunk_offset += 64) {
+    while (windows.next()) |vector| : (chunk_offset += VLEN) {
         const remaining = input.len - chunk_offset;
-        const valid_length = @min(remaining, 64);
-        const candidate_mask = markdownCandidateMask(vector);
-        const valid_mask = markdownValidMask(valid_length);
-        var candidate_indexes: [64]u32 = undefined;
+        const valid_length = @min(remaining, VLEN);
+        const candidate_mask = markdownCandidateMask(VLEN, vector);
+        const valid_mask = markdownValidMask(VLEN, valid_length);
+        var candidate_indexes: [VLEN]u32 = undefined;
         const candidate_count = simd.extractBitIndexes(
+            Mask,
             candidate_mask & valid_mask,
             chunk_offset,
             &candidate_indexes,
@@ -92,22 +103,28 @@ const MarkdownScanState = struct {
     skip_line: bool,
 };
 
-fn markdownCandidateMask(vector: simd.Vec(64, u8)) u64 {
-    const line_and_blocks = simd.matchAny4(64, vector, '#', '>', '-', '*');
-    const lists_and_inline = simd.matchAny4(64, vector, '+', '`', '[', ']');
-    const links_and_fences = simd.matchAny4(64, vector, '(', ')', '~', '\n');
-    const carriage_returns = simd.matchByte(64, vector, '\r');
-    const thematic_underscores = simd.matchByte(64, vector, '_');
-    const digits = simd.matchRange(64, vector, '0', '9');
+fn markdownCandidateMask(
+    comptime VLEN: usize,
+    vector: simd.Vec(VLEN, u8),
+) simd.Mask(VLEN) {
+    const line_and_blocks = simd.matchAny4(VLEN, vector, '#', '>', '-', '*');
+    const lists_and_inline = simd.matchAny4(VLEN, vector, '+', '`', '[', ']');
+    const links_and_fences = simd.matchAny4(VLEN, vector, '(', ')', '~', '\n');
+    const carriage_returns = simd.matchByte(VLEN, vector, '\r');
+    const thematic_underscores = simd.matchByte(VLEN, vector, '_');
+    const digits = simd.matchRange(VLEN, vector, '0', '9');
     return line_and_blocks | lists_and_inline | links_and_fences | carriage_returns |
         thematic_underscores | digits;
 }
 
-fn markdownValidMask(valid_length: usize) u64 {
+fn markdownValidMask(comptime VLEN: usize, valid_length: usize) simd.Mask(VLEN) {
+    const Mask = simd.Mask(VLEN);
+    const Shift = std.math.Log2Int(Mask);
+
     assert(valid_length > 0);
-    assert(valid_length <= 64);
-    if (valid_length == 64) return ~@as(u64, 0);
-    return (@as(u64, 1) << @as(u6, @intCast(valid_length))) - 1;
+    assert(valid_length <= VLEN);
+    if (valid_length == VLEN) return ~@as(Mask, 0);
+    return (@as(Mask, 1) << @as(Shift, @intCast(valid_length))) - 1;
 }
 
 fn advanceLinePrefix(
@@ -499,9 +516,13 @@ fn expectIndexInvariants(input: []const u8, index: *const MarkdownStructuralInde
 }
 
 fn expectMatchesScalarOracle(input: []const u8) !void {
+    return expectMatchesScalarOracleAtWidth(simd.default_vector_len, input);
+}
+
+fn expectMatchesScalarOracleAtWidth(comptime VLEN: usize, input: []const u8) !void {
     var expected = try scalarIndexMarkdown(testing.allocator, input);
     defer expected.deinit(testing.allocator);
-    var actual = try indexMarkdown(testing.allocator, input);
+    var actual = try indexMarkdownImpl(VLEN, testing.allocator, input);
     defer actual.deinit(testing.allocator);
 
     try expectIndexInvariants(input, &expected);
@@ -579,6 +600,71 @@ test "Markdown SIMD index matches scalar oracle on sample documents" {
 
     for (samples) |sample| {
         try expectMatchesScalarOracle(sample);
+    }
+}
+
+test "Markdown SIMD widths match scalar across structural boundaries" {
+    const input =
+        "# heading\n" ++
+        "> quote\n" ++
+        "- item\n" ++
+        "* * *\n" ++
+        "`code` [link](target)\n" ++
+        "```zig\n" ++
+        "# hidden\n" ++
+        "```\n";
+    const input_lengths = [_]usize{
+        0,  1,  14, 15, 16, 17, 30, 31,
+        32, 33, 62, 63, 64, 65, 66,
+    };
+    inline for ([_]usize{ 16, 32, 64 }) |vlen| {
+        for (input_lengths) |input_length| {
+            try expectMatchesScalarOracleAtWidth(vlen, input[0..input_length]);
+        }
+    }
+
+    inline for ([_]usize{ 16, 32, 64 }) |vlen| {
+        var line_input: [67]u8 = @splat('x');
+        line_input[vlen - 1] = '\n';
+        line_input[vlen] = '#';
+        line_input[vlen + 1] = ' ';
+        try expectMatchesScalarOracleAtWidth(vlen, line_input[0 .. vlen + 2]);
+
+        var fence_input: [131]u8 = @splat('x');
+        const opening_offset = vlen - 1;
+        fence_input[opening_offset - 1] = '\n';
+        fence_input[opening_offset] = '`';
+        fence_input[opening_offset + 1] = '`';
+        fence_input[opening_offset + 2] = '`';
+        fence_input[opening_offset + 3] = '\n';
+        fence_input[opening_offset + 4] = '#';
+        fence_input[opening_offset + 6] = '[';
+        fence_input[opening_offset + 7] = ']';
+        const closing_offset = 2 * vlen - 1;
+        fence_input[closing_offset - 1] = '\n';
+        fence_input[closing_offset] = '`';
+        fence_input[closing_offset + 1] = '`';
+        fence_input[closing_offset + 2] = '`';
+        fence_input[closing_offset + 3] = '\n';
+        try expectMatchesScalarOracleAtWidth(
+            vlen,
+            fence_input[0 .. closing_offset + 4],
+        );
+
+        var inline_input: [131]u8 = @splat('x');
+        const inline_open = vlen - 1;
+        inline_input[inline_open] = '`';
+        inline_input[inline_open + 1] = '`';
+        inline_input[inline_open + 3] = '[';
+        inline_input[inline_open + 5] = ']';
+        const inline_close = 2 * vlen - 1;
+        inline_input[inline_close] = '`';
+        inline_input[inline_close + 1] = '`';
+        inline_input[inline_close + 2] = '\n';
+        try expectMatchesScalarOracleAtWidth(
+            vlen,
+            inline_input[0 .. inline_close + 3],
+        );
     }
 }
 

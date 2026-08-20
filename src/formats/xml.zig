@@ -30,7 +30,20 @@ pub const XmlStructuralIndex = struct {
     }
 };
 
-pub fn indexXml(allocator: std.mem.Allocator, input: []const u8) !XmlStructuralIndex {
+pub fn indexXml(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+) !XmlStructuralIndex {
+    return indexXmlImpl(simd.default_vector_len, allocator, input);
+}
+
+pub fn indexXmlImpl(
+    comptime VLEN: usize,
+    allocator: std.mem.Allocator,
+    input: []const u8,
+) !XmlStructuralIndex {
+    const Mask = simd.Mask(VLEN);
+
     if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
     const indexes = try allocator.alloc(u32, input.len);
     errdefer allocator.free(indexes);
@@ -48,13 +61,15 @@ pub fn indexXml(allocator: std.mem.Allocator, input: []const u8) !XmlStructuralI
     var in_tag = false;
     var in_attr_quote: ?u8 = null;
     var base_offset: usize = 0;
-    var window_iterator = simd.windows(u8, 64, input, 0);
+    var window_iterator = simd.windows(u8, VLEN, input, 0);
 
-    while (window_iterator.next()) |vector| {
-        const punctuation_mask = simd.matchAny4(64, vector, '<', '>', '=', '"') |
-            simd.matchByte(64, vector, '\'');
-        var candidate_indexes: [64]u32 = undefined;
+    while (base_offset < input.len) {
+        const vector = window_iterator.next().?;
+        const punctuation_mask: Mask = simd.matchAny4(VLEN, vector, '<', '>', '=', '"') |
+            simd.matchByte(VLEN, vector, '\'');
+        var candidate_indexes: [VLEN]u32 = undefined;
         const candidate_count = simd.extractBitIndexes(
+            Mask,
             punctuation_mask,
             base_offset,
             &candidate_indexes,
@@ -139,7 +154,7 @@ pub fn indexXml(allocator: std.mem.Allocator, input: []const u8) !XmlStructuralI
             }
         }
 
-        base_offset += 64;
+        base_offset += VLEN;
     }
 
     return result;
@@ -290,10 +305,10 @@ fn expectIndexInvariants(index: *const XmlStructuralIndex, input_len: usize) !vo
     }
 }
 
-fn expectMatchesScalar(input: []const u8) !void {
+fn expectMatchesScalarAtWidth(comptime VLEN: usize, input: []const u8) !void {
     var expected = try scalarIndexXml(testing.allocator, input);
     defer expected.deinit(testing.allocator);
-    var actual = try indexXml(testing.allocator, input);
+    var actual = try indexXmlImpl(VLEN, testing.allocator, input);
     defer actual.deinit(testing.allocator);
 
     try testing.expectEqual(expected.count, actual.count);
@@ -309,6 +324,12 @@ fn expectMatchesScalar(input: []const u8) !void {
     );
     try expectIndexInvariants(&expected, input.len);
     try expectIndexInvariants(&actual, input.len);
+}
+
+fn expectMatchesScalar(input: []const u8) !void {
+    inline for (.{ 16, 32, 64 }) |VLEN| {
+        try expectMatchesScalarAtWidth(VLEN, input);
+    }
 }
 
 fn expectTokens(
@@ -330,11 +351,12 @@ fn expectTokens(
     try expectIndexInvariants(&actual, input.len);
 }
 
-fn expectFragmentAnchorAtChunkBoundaries(
+fn expectFragmentAnchorAtVectorBoundaries(
+    comptime VLEN: usize,
     fragment: []const u8,
     anchor_in_fragment: usize,
 ) !void {
-    const boundary_offsets = [_]usize{ 62, 63, 64, 65 };
+    const boundary_offsets = [_]usize{ VLEN - 2, VLEN - 1, VLEN, VLEN + 1 };
     std.debug.assert(anchor_in_fragment < fragment.len);
 
     for (boundary_offsets) |boundary_offset| {
@@ -343,7 +365,7 @@ fn expectFragmentAnchorAtChunkBoundaries(
         var input: [160]u8 = @splat('x');
         std.debug.assert(fragment_offset + fragment.len <= input.len);
         @memcpy(input[fragment_offset..][0..fragment.len], fragment);
-        try expectMatchesScalar(&input);
+        try expectMatchesScalarAtWidth(VLEN, &input);
     }
 }
 
@@ -381,6 +403,21 @@ test "indexXml matches scalar oracle for XML constructs" {
 
     for (documents) |document| {
         try expectMatchesScalar(document);
+    }
+}
+
+test "indexXml matches scalar oracle across the exact width matrix" {
+    const document =
+        "<root a='x'><child id=\"1\"/><child><![CDATA[<x>]]></child>" ++
+        "<!-- comment --></root>";
+    const input_lengths = [_]usize{
+        0,  1,  14, 15, 16, 17, 30, 31,
+        32, 33, 62, 63, 64, 65, 66,
+    };
+    inline for ([_]usize{ 16, 32, 64 }) |vlen| {
+        for (input_lengths) |input_length| {
+            try expectMatchesScalarAtWidth(vlen, document[0..input_length]);
+        }
     }
 }
 
@@ -502,33 +539,38 @@ test "indexXml tolerates unclosed and malformed fragments" {
     }
 }
 
-test "indexXml matches scalar oracle at exact SIMD boundary offsets" {
-    // Each opener, terminator, and closing delimiter is placed at offsets 62 through 65.
-    const comment = "<!-- <foo a='x'> -->";
-    try expectFragmentAnchorAtChunkBoundaries(comment, 0);
-    try expectFragmentAnchorAtChunkBoundaries(comment, comment.len - 3);
+test "indexXml matches scalar oracle at every vector width boundary" {
+    // Each XML construct crosses offsets adjacent to 16-, 32-, and 64-byte windows.
+    inline for (.{ 16, 32, 64 }) |VLEN| {
+        const comment = "<!-- <foo a='x'> -->";
+        try expectFragmentAnchorAtVectorBoundaries(VLEN, comment, 0);
+        try expectFragmentAnchorAtVectorBoundaries(VLEN, comment, comment.len - 3);
 
-    const malformed_comment = "<!--><fake/>";
-    for ([_]usize{ 62, 63, 64, 65 }) |comment_offset| {
-        var input: [128]u8 = @splat('x');
-        @memcpy(input[comment_offset..][0..malformed_comment.len], malformed_comment);
-        const expected_indexes = [_]u32{@intCast(comment_offset)};
-        const expected_kinds = [_]XmlTokenKind{.tag_open};
-        try expectTokens(&input, &expected_indexes, &expected_kinds);
+        const malformed_comment = "<!--><fake/>";
+        for ([_]usize{ VLEN - 2, VLEN - 1, VLEN, VLEN + 1 }) |comment_offset| {
+            var input: [160]u8 = @splat('x');
+            @memcpy(input[comment_offset..][0..malformed_comment.len], malformed_comment);
+            try expectMatchesScalarAtWidth(VLEN, &input);
+        }
+
+        const cdata = "<![CDATA[ <not-a-tag> ]]>";
+        try expectFragmentAnchorAtVectorBoundaries(VLEN, cdata, 0);
+        try expectFragmentAnchorAtVectorBoundaries(VLEN, cdata, cdata.len - 3);
+
+        const attributes = "<tag first = 'one' second=\"two\"   />";
+        try expectFragmentAnchorAtVectorBoundaries(VLEN, attributes, 11);
+        try expectFragmentAnchorAtVectorBoundaries(VLEN, attributes, 13);
+        try expectFragmentAnchorAtVectorBoundaries(VLEN, attributes, attributes.len - 2);
+
+        const tags = "<root><child a='x'/></root>";
+        try expectFragmentAnchorAtVectorBoundaries(VLEN, tags, 0);
+        try expectFragmentAnchorAtVectorBoundaries(VLEN, tags, 6);
+        try expectFragmentAnchorAtVectorBoundaries(VLEN, tags, tags.len - 7);
+
+        const instruction = "<?xml version=\"1.0\" encoding = 'UTF-8'?>";
+        try expectFragmentAnchorAtVectorBoundaries(VLEN, instruction, 0);
+        try expectFragmentAnchorAtVectorBoundaries(VLEN, instruction, instruction.len - 2);
     }
-
-    const cdata = "<![CDATA[ <not-a-tag> ]]>";
-    try expectFragmentAnchorAtChunkBoundaries(cdata, 0);
-    try expectFragmentAnchorAtChunkBoundaries(cdata, cdata.len - 3);
-
-    const attributes = "<tag first = 'one' second=\"two\"   />";
-    try expectFragmentAnchorAtChunkBoundaries(attributes, 11);
-    try expectFragmentAnchorAtChunkBoundaries(attributes, 13);
-    try expectFragmentAnchorAtChunkBoundaries(attributes, attributes.len - 2);
-
-    const instruction = "<?xml version=\"1.0\" encoding = 'UTF-8'?>";
-    try expectFragmentAnchorAtChunkBoundaries(instruction, 0);
-    try expectFragmentAnchorAtChunkBoundaries(instruction, instruction.len - 2);
 }
 
 test "indexXml preserves invariants for adversarial bytes and tails" {
