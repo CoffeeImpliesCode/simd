@@ -1,5 +1,6 @@
 const std = @import("std");
 const lib = @import("simd_lib");
+const checking = @import("checking.zig");
 const testing = std.testing;
 
 const vector_len = lib.default_vector_len;
@@ -36,51 +37,7 @@ test "core: prefixXor matches mathematical parity" {
 
     for (test_patterns) |pattern| {
         const simd_result = lib.prefixXor(u64, pattern);
-        var expected: u64 = 0;
-        var parity: u1 = 0;
-        inline for (0..64) |i| {
-            parity ^= @as(u1, @truncate(pattern >> i));
-            expected |= (@as(u64, parity) << i);
-        }
-        try testing.expectEqual(expected, simd_result);
-    }
-}
-
-fn expectStructuralWidths(comptime index_fn: anytype, input: []const u8) !void {
-    var expected = try index_fn(16, testing.allocator, input);
-    defer expected.deinit(testing.allocator);
-    try testing.expect(expected.count > 0);
-
-    inline for ([_]usize{ 16, 32, 64 }) |vlen| {
-        var actual = try index_fn(vlen, testing.allocator, input);
-        defer actual.deinit(testing.allocator);
-        try testing.expectEqualSlices(
-            u32,
-            expected.indexes[0..expected.count],
-            actual.indexes[0..actual.count],
-        );
-    }
-}
-
-fn expectTokenWidths(comptime index_fn: anytype, input: []const u8) !void {
-    var expected = try index_fn(16, testing.allocator, input);
-    defer expected.deinit(testing.allocator);
-    try testing.expect(expected.count > 0);
-
-    inline for ([_]usize{ 16, 32, 64 }) |vlen| {
-        var actual = try index_fn(vlen, testing.allocator, input);
-        defer actual.deinit(testing.allocator);
-
-        try testing.expectEqualSlices(
-            u32,
-            expected.indexes[0..expected.count],
-            actual.indexes[0..actual.count],
-        );
-        try testing.expectEqualSlices(
-            @TypeOf(expected.kinds[0]),
-            expected.kinds[0..expected.count],
-            actual.kinds[0..actual.count],
-        );
+        try testing.expectEqual(checking.scalarPrefixXor(u64, pattern), simd_result);
     }
 }
 
@@ -145,37 +102,37 @@ test "upstream corpus manifests pin provenance for offline tests" {
 
 test "corpus: JSON indexing on example_config.json" {
     const json_data = @embedFile("corpus/json/example_config.json");
-    try expectStructuralWidths(lib.formats.json.indexJsonImpl, json_data);
+    try checking.expectStructuralWidths(lib.formats.json.indexJsonImpl, json_data);
 }
 
 test "corpus: JSONL indexing on amazon_cellphones.ndjson" {
     const jsonl_data = @embedFile("corpus/jsonl/amazon_cellphones.ndjson");
-    try expectStructuralWidths(lib.formats.jsonl.indexJsonlImpl, jsonl_data);
+    try checking.expectStructuralWidths(lib.formats.jsonl.indexJsonlImpl, jsonl_data);
 }
 
 test "corpus: JSONC indexing on config.jsonc" {
     const jsonc_data = @embedFile("corpus/jsonc/config.jsonc");
-    try expectStructuralWidths(lib.formats.jsonc.indexJsoncImpl, jsonc_data);
+    try checking.expectStructuralWidths(lib.formats.jsonc.indexJsoncImpl, jsonc_data);
 }
 
 test "corpus: JSON5 indexing on sample.json5" {
     const json5_data = @embedFile("corpus/json5/sample.json5");
-    try expectStructuralWidths(lib.formats.json5.indexJson5Impl, json5_data);
+    try checking.expectStructuralWidths(lib.formats.json5.indexJson5Impl, json5_data);
 }
 
 test "corpus: Markdown indexing on document.md" {
     const md_data = @embedFile("corpus/markdown/document.md");
-    try expectTokenWidths(lib.formats.markdown.indexMarkdownImpl, md_data);
+    try checking.expectTokenWidths(lib.formats.markdown.indexMarkdownImpl, md_data);
 }
 
 test "corpus: XML indexing on catalog.xml" {
     const xml_data = @embedFile("corpus/xml/catalog.xml");
-    try expectTokenWidths(lib.formats.xml.indexXmlImpl, xml_data);
+    try checking.expectTokenWidths(lib.formats.xml.indexXmlImpl, xml_data);
 }
 
 test "corpus: YAML indexing on basic.yaml" {
     const yaml_data = @embedFile("corpus/yaml/basic.yaml");
-    try expectStructuralWidths(lib.formats.yaml.indexYamlImpl, yaml_data);
+    try checking.expectStructuralWidths(lib.formats.yaml.indexYamlImpl, yaml_data);
 }
 test "public Stage 2 JSON corpus builds validates and exposes raw spans" {
     const input = @embedFile("corpus/json/example_config.json");
@@ -790,26 +747,13 @@ test "on-demand EventReader skips one nested JSON value" {
     try testing.expect((try reader.next()) == null);
 }
 
-const stream_sentinel_count: usize = 3;
-
 fn expectJsonStreamParity(
     input: []const u8,
     actual: *const lib.StructuralIndex,
 ) !void {
     var expected = try lib.formats.json.indexJson(testing.allocator, input);
     defer expected.deinit(testing.allocator);
-
-    try testing.expectEqual(expected.count, actual.count);
-    try testing.expectEqualSlices(
-        u32,
-        expected.indexes[0..expected.count],
-        actual.indexes[0..actual.count],
-    );
-    try testing.expectEqualSlices(
-        u32,
-        expected.indexes[expected.count..][0..stream_sentinel_count],
-        actual.indexes[actual.count..][0..stream_sentinel_count],
-    );
+    try checking.expectIndexParity(&expected, actual, true);
 }
 
 fn expectJsonStreamWithCuts(
@@ -824,17 +768,8 @@ fn expectJsonStreamWithCuts(
     );
     defer stream.deinit();
 
-    var start: usize = 0;
     if (empty_feeds) try stream.feed("");
-    for (cuts) |cut| {
-        try testing.expect(cut >= start);
-        try testing.expect(cut <= input.len);
-        try stream.feed(input[start..cut]);
-        if (empty_feeds) try stream.feed("");
-        start = cut;
-    }
-    try stream.feed(input[start..]);
-    if (empty_feeds) try stream.feed("");
+    try checking.feedPartitions(input, cuts, &stream, empty_feeds);
     try stream.finish();
 
     var actual = stream.take();
@@ -931,7 +866,6 @@ test "stream: finish is idempotent and take survives reset" {
     try expectJsonStreamParity(first_input, &results.first);
     try expectJsonStreamParity(second_input, &results.second);
 }
-
 fn expectJsonlStreamParity(
     input: []const u8,
     cuts: []const usize,
@@ -945,27 +879,13 @@ fn expectJsonlStreamParity(
     );
     defer stream.deinit();
 
-    var start: usize = 0;
-    for (cuts) |cut| {
-        try testing.expect(cut >= start);
-        try testing.expect(cut <= input.len);
-        try stream.feed(input[start..cut]);
-        try stream.feed("");
-        start = cut;
-    }
-    try stream.feed(input[start..]);
-    try stream.feed("");
+    try checking.feedPartitions(input, cuts, &stream, true);
     try stream.finish();
     try stream.finish();
 
     var actual = stream.take();
     defer actual.deinit(testing.allocator);
-    try testing.expectEqual(expected.count, actual.count);
-    try testing.expectEqualSlices(
-        u32,
-        expected.indexes[0 .. expected.count + stream_sentinel_count],
-        actual.indexes[0 .. actual.count + stream_sentinel_count],
-    );
+    try checking.expectIndexParity(&expected, &actual, true);
 }
 
 fn expectMarkdownStreamParity(
@@ -981,32 +901,13 @@ fn expectMarkdownStreamParity(
     );
     defer stream.deinit();
 
-    var start: usize = 0;
-    for (cuts) |cut| {
-        try testing.expect(cut >= start);
-        try testing.expect(cut <= input.len);
-        try stream.feed(input[start..cut]);
-        try stream.feed("");
-        start = cut;
-    }
-    try stream.feed(input[start..]);
-    try stream.feed("");
+    try checking.feedPartitions(input, cuts, &stream, true);
     try stream.finish();
     try stream.finish();
 
     var actual = stream.take();
     defer actual.deinit(testing.allocator);
-    try testing.expectEqual(expected.count, actual.count);
-    try testing.expectEqualSlices(
-        u32,
-        expected.indexes[0 .. expected.count + stream_sentinel_count],
-        actual.indexes[0 .. actual.count + stream_sentinel_count],
-    );
-    try testing.expectEqualSlices(
-        lib.formats.markdown.MarkdownTokenKind,
-        expected.kinds[0..expected.count],
-        actual.kinds[0..actual.count],
-    );
+    try checking.expectTokenParity(&expected, &actual, true);
 }
 
 fn expectXmlStreamParity(
@@ -1022,32 +923,13 @@ fn expectXmlStreamParity(
     );
     defer stream.deinit();
 
-    var start: usize = 0;
-    for (cuts) |cut| {
-        try testing.expect(cut >= start);
-        try testing.expect(cut <= input.len);
-        try stream.feed(input[start..cut]);
-        try stream.feed("");
-        start = cut;
-    }
-    try stream.feed(input[start..]);
-    try stream.feed("");
+    try checking.feedPartitions(input, cuts, &stream, true);
     try stream.finish();
     try stream.finish();
 
     var actual = stream.take();
     defer actual.deinit(testing.allocator);
-    try testing.expectEqual(expected.count, actual.count);
-    try testing.expectEqualSlices(
-        u32,
-        expected.indexes[0 .. expected.count + stream_sentinel_count],
-        actual.indexes[0 .. actual.count + stream_sentinel_count],
-    );
-    try testing.expectEqualSlices(
-        lib.formats.xml.XmlTokenKind,
-        expected.kinds[0..expected.count],
-        actual.kinds[0..actual.count],
-    );
+    try checking.expectTokenParity(&expected, &actual, true);
 }
 
 test "public JSONL stream preserves output and sentinels across chunk boundaries" {
@@ -1123,4 +1005,40 @@ test "public XML stream preserves output, sentinels, and token kinds" {
 
     try expectXmlStreamParity(input, &cuts);
     try expectXmlStreamParity("", &.{});
+}
+
+fn checkPublicJsonAllocationFailure(allocator: std.mem.Allocator) !void {
+    const input = "{\"name\":\"Ada\",\"items\":[1,true,null]}";
+    var index = try lib.formats.json.indexJson(allocator, input);
+    defer index.deinit(allocator);
+
+    var document = try lib.formats.json.buildJsonTape(allocator, input);
+    defer document.deinit(allocator);
+}
+
+fn checkPublicJsonStreamAllocationFailure(allocator: std.mem.Allocator) !void {
+    const input = "{\"a\":1}";
+    var stream = try lib.stream.StreamIndexer.init(
+        allocator,
+        1,
+        .{ .dialect = .json, .mode = .document },
+    );
+    defer stream.deinit();
+    try stream.feed(input);
+    try stream.finish();
+    var index = stream.take();
+    defer index.deinit(allocator);
+}
+
+test "public JSON index, tape, and stream operations propagate allocation failure" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        checkPublicJsonAllocationFailure,
+        .{},
+    );
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        checkPublicJsonStreamAllocationFailure,
+        .{},
+    );
 }

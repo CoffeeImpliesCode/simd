@@ -55,6 +55,23 @@ pub const StructuralIndex = struct {
     }
 };
 
+fn checkStructuralIndexAllocationFailure(allocator: std.mem.Allocator) !void {
+    var index = try StructuralIndex.init(allocator, 16);
+    defer index.deinit(allocator);
+}
+
+test "StructuralIndex propagates allocation failure without leaks" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        checkStructuralIndexAllocationFailure,
+        .{},
+    );
+}
+
+test "refAllDecls" {
+    testing.refAllDecls(@This());
+}
+
 test "StructuralIndex lifecycle" {
     var idx = try StructuralIndex.init(testing.allocator, 16);
     defer idx.deinit(testing.allocator);

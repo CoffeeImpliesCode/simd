@@ -2115,6 +2115,49 @@ test "XmlDocument checks tape and source bounds and diagnostics borrow source" {
     document.tape[0].kind = saved_kind;
 }
 
+fn checkXmlIndexAllocationFailure(allocator: std.mem.Allocator) !void {
+    const input = "<root a=\"b\"><child/></root>";
+    var index = try indexXml(allocator, input);
+    defer index.deinit(allocator);
+}
+
+fn checkXmlTapeAllocationFailure(allocator: std.mem.Allocator) !void {
+    const input = "<root a=\"b\"><child/></root>";
+    var document = try buildXmlTape(allocator, input);
+    defer document.deinit(allocator);
+}
+
+fn checkXmlStreamAllocationFailure(allocator: std.mem.Allocator) !void {
+    const input = "<root a=\"b\"><child/></root>";
+    var stream = try XmlStreamIndexer.init(allocator, 1);
+    defer stream.deinit();
+    try stream.feed(input);
+    try stream.finish();
+    var index = stream.take();
+    defer index.deinit(allocator);
+}
+
+test "XML index and tape operations propagate allocation failure without leaks" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        checkXmlIndexAllocationFailure,
+        .{},
+    );
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        checkXmlTapeAllocationFailure,
+        .{},
+    );
+}
+
+test "XML stream operations propagate allocation failure without leaks" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        checkXmlStreamAllocationFailure,
+        .{},
+    );
+}
+
 test "refAllDecls" {
     testing.refAllDecls(@This());
 }

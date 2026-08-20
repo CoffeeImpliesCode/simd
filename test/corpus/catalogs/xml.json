@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "catalog_id": "xml-local",
+  "format": "xml",
+  "offline": true,
+  "provenance": {
+    "kind": "project-authored-and-pinned-research",
+    "manifest": "upstream/xml/MANIFEST.md",
+    "revision": "9b61db9f5dbffa545f4b8d78422167083a8568c59bd1129f94138f936cf6fc1f",
+    "offline_rule": "Tests must not access the network."
+  },
+  "importer": {
+    "mode": "explicit-local-maintainer",
+    "network": false,
+    "source": "local-directory",
+    "destination": "test/corpus/upstream/xml"
+  },
+  "research": null,
+  "profiles": [
+    {
+      "id": "xml-1.0-utf8",
+      "description": "Supported XML 1.0 UTF-8 grammar without DTD or external entity resolution.",
+      "enabled": true,
+      "default_profile": true,
+      "cases": [
+        {
+          "id": "catalog",
+          "fixture": "xml/catalog.xml",
+          "expected": "accept"
+        },
+        {
+          "id": "mismatched-tags",
+          "fixture": "cases/xml/mismatched.xml",
+          "expected": "reject"
+        }
+      ]
+    }
+  ]
+}

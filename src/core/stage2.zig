@@ -2195,6 +2195,27 @@ test "TapeWord payload encoding never truncates u24 values" {
     );
 }
 
+fn checkBuildTapeAllocationFailure(allocator: std.mem.Allocator) !void {
+    const input = "{\"a\":[1,true,{\"b\":\"x\"}],\"z\":null}";
+    var structural_index = try indexForTest(allocator, input);
+    defer structural_index.deinit(allocator);
+
+    var document = try buildTape(allocator, input, &structural_index, .json);
+    defer document.deinit(allocator);
+}
+
+test "buildTape propagates allocation failure without leaks" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        checkBuildTapeAllocationFailure,
+        .{},
+    );
+}
+
+test "refAllDecls" {
+    testing.refAllDecls(@This());
+}
+
 test "buildTape validates nested JSON and backpatches containers" {
     const input = "{\"a\":[1,true,{\"b\":\"x\"}],\"z\":null}";
     var structural_index = try indexForTest(testing.allocator, input);

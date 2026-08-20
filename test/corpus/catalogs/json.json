@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "catalog_id": "json-local",
+  "format": "json",
+  "offline": true,
+  "provenance": {
+    "kind": "project-authored-and-pinned-research",
+    "manifest": "upstream/json/MANIFEST.md",
+    "revision": "1ef36fa01286573e846ac449e8683f8833c5b26a"
+  },
+  "profiles": [
+    {
+      "id": "strict-rfc8259",
+      "description": "Complete UTF-8 JSON documents accepted by the strict Stage 2 validator.",
+      "cases": [
+        {
+          "id": "example-config",
+          "fixture": "json/example_config.json",
+          "expected": "accept"
+        },
+        {
+          "id": "trailing-comma",
+          "fixture": "cases/json/trailing-comma.json",
+          "expected": "reject"
+        }
+      ]
+    }
+  ]
+}

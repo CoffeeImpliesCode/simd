@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "catalog_id": "jsonl-local",
+  "format": "jsonl",
+  "offline": true,
+  "provenance": {
+    "kind": "project-authored-and-pinned-research",
+    "manifest": "upstream/jsonl/MANIFEST.md",
+    "revision": "a8e8671adf470477cd2cc1dfc40c30825f421baa",
+    "offline_rule": "Tests must read checked-in files only."
+  },
+  "importer": {
+    "mode": "explicit-local-maintainer",
+    "network": false,
+    "source": "local-directory",
+    "destination": "test/corpus/upstream/jsonl"
+  },
+  "research": null,
+  "profiles": [
+    {
+      "id": "jsonlines-permissive",
+      "description": "Permissive compatibility profile: the default JSONL validator accepts blank and whitespace-only physical lines.",
+      "enabled": true,
+      "default_profile": true,
+      "cases": [
+        {
+          "id": "amazon-cellphones",
+          "fixture": "jsonl/amazon_cellphones.ndjson",
+          "expected": "accept"
+        },
+        {
+          "id": "blank-and-whitespace-lines",
+          "fixture": "cases/jsonl/blank-lines.ndjson",
+          "expected": "accept"
+        }
+      ]
+    },
+    {
+      "id": "ndjson-strict",
+      "description": "Strict profile reserved for a future configurable runner; blank and whitespace-only lines are rejected by policy.",
+      "enabled": false,
+      "default_profile": false,
+      "cases": []
+    },
+    {
+      "id": "ndjson-ignore-empty",
+      "description": "Profile reserved for a future configurable runner; only zero-byte physical lines are ignored.",
+      "enabled": false,
+      "default_profile": false,
+      "cases": []
+    }
+  ]
+}

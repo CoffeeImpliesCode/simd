@@ -39,6 +39,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const corpus_test_mod = b.createModule(.{
+        .root_source_file = b.path("test/corpus_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    corpus_test_mod.addImport("simd_lib", lib_mod);
     fuzz_test_mod.addImport("simd_lib", lib_mod);
     lib_test_mod.addImport("simd_lib", lib_mod);
 
@@ -126,6 +132,13 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_smith_fuzz_tests = b.addRunArtifact(smith_fuzz_tests);
+    const corpus_tests = b.addTest(.{
+        .root_module = corpus_test_mod,
+    });
+    const run_corpus_tests = b.addRunArtifact(corpus_tests);
+
+    const corpus_step = b.step("corpus", "Run offline corpus catalogs");
+    corpus_step.dependOn(&run_corpus_tests.step);
 
     const fuzz_step = b.step("fuzz", "Run deterministic Smith fuzz tests");
     fuzz_step.dependOn(&run_smith_fuzz_tests.step);

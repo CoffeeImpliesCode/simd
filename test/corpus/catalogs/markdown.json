@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "catalog_id": "markdown-local",
+  "format": "markdown",
+  "offline": true,
+  "provenance": {
+    "kind": "project-authored-and-pinned-research",
+    "manifest": "upstream/markdown/MANIFEST.md",
+    "revision": "9103e341a973013013bb1a80e13567007c5cef6f",
+    "offline_rule": "The importer must not fetch network resources during tests."
+  },
+  "importer": {
+    "mode": "explicit-local-maintainer",
+    "network": false,
+    "source": "local-directory",
+    "destination": "test/corpus/upstream/markdown"
+  },
+  "research": null,
+  "profiles": [
+    {
+      "id": "marker-index",
+      "description": "Whole-buffer Markdown marker indexing; every byte sequence is a valid document.",
+      "enabled": true,
+      "default_profile": true,
+      "cases": [
+        {
+          "id": "document",
+          "fixture": "markdown/document.md",
+          "expected": "accept"
+        },
+        {
+          "id": "markers",
+          "fixture": "cases/markdown/markers.md",
+          "expected": "accept"
+        }
+      ]
+    }
+  ]
+}

@@ -1414,3 +1414,72 @@ test "YAML stream indexer matches one-shot output" {
     try testing.expectEqualSlices(u32, expected.slice(), actual.slice());
     try testing.expectEqualSlices(YamlTokenKind, expected.kinds[0..expected.count], actual.kinds[0..actual.count]);
 }
+
+fn checkYamlIndexAllocationFailure(allocator: std.mem.Allocator) !void {
+    const input = "name: Ada\nitems:\n  - one\n  - two\n";
+    var index = try indexYaml(allocator, input);
+    defer index.deinit(allocator);
+}
+
+fn checkYamlValidationAllocationFailure(allocator: std.mem.Allocator) !void {
+    const input = "name: Ada\nitems:\n  - one\n  - two\n";
+    _ = try validateYaml(allocator, input);
+}
+
+fn checkYamlValidationIndexAllocationFailure(allocator: std.mem.Allocator) !void {
+    const input = "name: Ada\nitems:\n  - one\n  - two\n";
+    var index = try indexYaml(allocator, input);
+    defer index.deinit(allocator);
+    _ = try validateYamlIndex(allocator, input, &index);
+}
+
+fn checkYamlTapeAllocationFailure(allocator: std.mem.Allocator) !void {
+    const input = "name: Ada\nitems:\n  - one\n  - two\n";
+    var document = try buildYamlTape(allocator, input);
+    defer document.deinit(allocator);
+}
+
+fn checkYamlStreamAllocationFailure(allocator: std.mem.Allocator) !void {
+    const input = "name: Ada\nitems:\n  - one\n  - two\n";
+    var stream = try YamlStreamIndexer.init(allocator, 1);
+    defer stream.deinit();
+    try stream.feed(input);
+    try stream.finish();
+    var index = stream.take();
+    defer index.deinit(allocator);
+}
+
+test "YAML index and tape operations propagate allocation failure without leaks" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        checkYamlIndexAllocationFailure,
+        .{},
+    );
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        checkYamlValidationAllocationFailure,
+        .{},
+    );
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        checkYamlValidationIndexAllocationFailure,
+        .{},
+    );
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        checkYamlTapeAllocationFailure,
+        .{},
+    );
+}
+
+test "YAML stream operations propagate allocation failure without leaks" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        checkYamlStreamAllocationFailure,
+        .{},
+    );
+}
+
+test "refAllDecls" {
+    testing.refAllDecls(@This());
+}

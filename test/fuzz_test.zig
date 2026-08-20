@@ -1,15 +1,7 @@
 const std = @import("std");
 const lib = @import("simd_lib");
+const checking = @import("checking.zig");
 const testing = std.testing;
-
-fn checkMonotonicBounds(indexes: []const u32, input_len: usize) !void {
-    for (indexes, 0..) |offset, i| {
-        try testing.expect(offset < input_len);
-        if (i > 0) {
-            try testing.expect(indexes[i - 1] < offset);
-        }
-    }
-}
 
 fn scalarUtf8FailureOffset(input: []const u8) ?usize {
     var index: usize = 0;
@@ -192,122 +184,65 @@ fn expectXmlSemanticUtf8(payload: []const u8) !void {
     }
 }
 
-const stream_sentinel_count: usize = 3;
-
-fn fuzzCuts(input_len: usize) [4]usize {
-    return .{
-        0,
-        input_len / 3,
-        input_len / 2,
-        input_len,
-    };
-}
-
 fn expectJsonlStreamPartitions(
     input: []const u8,
     expected: *const lib.StructuralIndex,
 ) !void {
-    const cuts = fuzzCuts(input.len);
+    const cuts = checking.fuzzCuts(input.len);
     var stream = try lib.formats.jsonl.initStreamIndexer(
         testing.allocator,
         3,
     );
     defer stream.deinit();
 
-    var start: usize = 0;
-    for (cuts) |cut| {
-        try testing.expect(cut >= start);
-        try stream.feed(input[start..cut]);
-        try stream.feed("");
-        start = cut;
-    }
-    try stream.feed(input[start..]);
+    try checking.feedPartitions(input, &cuts, &stream, true);
     try stream.finish();
 
     var actual = stream.take();
     defer actual.deinit(testing.allocator);
-    try testing.expectEqual(expected.count, actual.count);
-    try testing.expectEqualSlices(
-        u32,
-        expected.indexes[0 .. expected.count + stream_sentinel_count],
-        actual.indexes[0 .. actual.count + stream_sentinel_count],
-    );
+    try checking.expectIndexParity(expected, &actual, true);
 }
 
 fn expectMarkdownStreamPartitions(
     input: []const u8,
     expected: *const lib.formats.markdown.MarkdownStructuralIndex,
 ) !void {
-    const cuts = fuzzCuts(input.len);
+    const cuts = checking.fuzzCuts(input.len);
     var stream = try lib.formats.markdown.MarkdownStreamIndexer.init(
         testing.allocator,
         3,
     );
     defer stream.deinit();
 
-    var start: usize = 0;
-    for (cuts) |cut| {
-        try testing.expect(cut >= start);
-        try stream.feed(input[start..cut]);
-        try stream.feed("");
-        start = cut;
-    }
-    try stream.feed(input[start..]);
+    try checking.feedPartitions(input, &cuts, &stream, true);
     try stream.finish();
 
     var actual = stream.take();
     defer actual.deinit(testing.allocator);
-    try testing.expectEqual(expected.count, actual.count);
-    try testing.expectEqualSlices(
-        u32,
-        expected.indexes[0 .. expected.count + stream_sentinel_count],
-        actual.indexes[0 .. actual.count + stream_sentinel_count],
-    );
-    try testing.expectEqualSlices(
-        lib.formats.markdown.MarkdownTokenKind,
-        expected.kinds[0..expected.count],
-        actual.kinds[0..actual.count],
-    );
+    try checking.expectTokenParity(expected, &actual, true);
 }
 
 fn expectXmlStreamPartitions(
     input: []const u8,
     expected: *const lib.formats.xml.XmlStructuralIndex,
 ) !void {
-    const cuts = fuzzCuts(input.len);
+    const cuts = checking.fuzzCuts(input.len);
     var stream = try lib.formats.xml.XmlStreamIndexer.init(
         testing.allocator,
         3,
     );
     defer stream.deinit();
 
-    var start: usize = 0;
-    for (cuts) |cut| {
-        try testing.expect(cut >= start);
-        try stream.feed(input[start..cut]);
-        try stream.feed("");
-        start = cut;
-    }
-    try stream.feed(input[start..]);
+    try checking.feedPartitions(input, &cuts, &stream, true);
     try stream.finish();
 
     var actual = stream.take();
     defer actual.deinit(testing.allocator);
-    try testing.expectEqual(expected.count, actual.count);
-    try testing.expectEqualSlices(
-        u32,
-        expected.indexes[0 .. expected.count + stream_sentinel_count],
-        actual.indexes[0 .. actual.count + stream_sentinel_count],
-    );
-    try testing.expectEqualSlices(
-        lib.formats.xml.XmlTokenKind,
-
-        expected.kinds[0..expected.count],
-        actual.kinds[0..actual.count],
-    );
+    try checking.expectTokenParity(expected, &actual, true);
 }
 
 const deterministic_case_count = 2_048;
+const bounded_property_case_count = 256;
 const input_size_max = 512;
 
 fn xorshift64(state: *u64) u64 {
@@ -321,12 +256,17 @@ fn xorshift64(state: *u64) u64 {
     return value;
 }
 
-fn runDeterministicSmithCases(seed: u64, comptime invariant: anytype) !void {
+fn runDeterministicSmithCasesLimited(
+    seed: u64,
+    case_count: usize,
+    comptime invariant: anytype,
+) !void {
     std.debug.assert(seed != 0);
+    std.debug.assert(case_count > 0);
 
     var state = seed;
     var input_buffer: [input_size_max]u8 = undefined;
-    for (0..deterministic_case_count) |case_index| {
+    for (0..case_count) |case_index| {
         const input_len: usize = switch (case_index) {
             0 => 0,
             1 => input_size_max,
@@ -340,6 +280,10 @@ fn runDeterministicSmithCases(seed: u64, comptime invariant: anytype) !void {
         var smith: testing.Smith = .{ .in = input };
         try invariant({}, &smith);
     }
+}
+
+fn runDeterministicSmithCases(seed: u64, comptime invariant: anytype) !void {
+    try runDeterministicSmithCasesLimited(seed, deterministic_case_count, invariant);
 }
 
 // -------------------------------------------------------------------------
@@ -360,7 +304,7 @@ fn testFuzzJson(_: void, smith: *testing.Smith) !void {
     };
     defer idx.deinit(testing.allocator);
 
-    try checkMonotonicBounds(idx.slice(), input.len);
+    try checking.expectMonotonicBounds(idx.slice(), input.len);
 }
 
 // -------------------------------------------------------------------------
@@ -381,7 +325,7 @@ fn testFuzzJsonl(_: void, smith: *testing.Smith) !void {
     };
     defer idx.deinit(testing.allocator);
 
-    try checkMonotonicBounds(idx.slice(), input.len);
+    try checking.expectMonotonicBounds(idx.slice(), input.len);
     try expectJsonlStreamPartitions(input, &idx);
 }
 
@@ -403,7 +347,7 @@ fn testFuzzJsonc(_: void, smith: *testing.Smith) !void {
     };
     defer idx.deinit(testing.allocator);
 
-    try checkMonotonicBounds(idx.slice(), input.len);
+    try checking.expectMonotonicBounds(idx.slice(), input.len);
 }
 
 // -------------------------------------------------------------------------
@@ -424,7 +368,7 @@ fn testFuzzJson5(_: void, smith: *testing.Smith) !void {
     };
     defer idx.deinit(testing.allocator);
 
-    try checkMonotonicBounds(idx.slice(), input.len);
+    try checking.expectMonotonicBounds(idx.slice(), input.len);
 }
 
 // -------------------------------------------------------------------------
@@ -446,7 +390,7 @@ fn testFuzzMarkdown(_: void, smith: *testing.Smith) !void {
     defer idx.deinit(testing.allocator);
 
     const slice = idx.indexes[0..idx.count];
-    try checkMonotonicBounds(slice, input.len);
+    try checking.expectMonotonicBounds(slice, input.len);
     try testing.expect(idx.count <= idx.kinds.len);
     try expectMarkdownStreamPartitions(input, &idx);
 }
@@ -470,7 +414,7 @@ fn testFuzzXml(_: void, smith: *testing.Smith) !void {
     defer idx.deinit(testing.allocator);
 
     const slice = idx.indexes[0..idx.count];
-    try checkMonotonicBounds(slice, input.len);
+    try checking.expectMonotonicBounds(slice, input.len);
     try testing.expect(idx.count <= idx.kinds.len);
     try expectXmlStreamPartitions(input, &idx);
 }
@@ -517,4 +461,290 @@ fn testFuzzSemanticUtf8(_: void, smith: *testing.Smith) !void {
     var xml_payload_buffer: [input_size_max]u8 = undefined;
     const xml_payload = sanitizeXmlUtf8Payload(input, &xml_payload_buffer);
     try expectXmlSemanticUtf8(xml_payload);
+}
+
+const stage2_input_max: usize = 128;
+
+fn appendBytes(output: []u8, offset: *usize, bytes: []const u8) void {
+    @memcpy(output[offset.*..][0..bytes.len], bytes);
+    offset.* += bytes.len;
+}
+
+fn appendSafePayload(raw: []const u8, output: []u8, offset: *usize) void {
+    const payload_len = @max(@as(usize, 1), @min(raw.len, @as(usize, 32)));
+    if (raw.len == 0) {
+        output[offset.*] = 'a';
+        offset.* += 1;
+        return;
+    }
+    for (0..payload_len) |index| {
+        output[offset.*] = 'a' + @as(u8, @truncate(raw[index] % 26));
+        offset.* += 1;
+    }
+}
+
+fn makeJsonCase(raw: []const u8, output: []u8) []const u8 {
+    var offset: usize = 0;
+    appendBytes(output, &offset, "{\"text\":\"");
+    appendSafePayload(raw, output, &offset);
+    appendBytes(output, &offset, "\",\"items\":[0,1,true,null]}");
+    return output[0..offset];
+}
+
+fn makeJsoncCase(raw: []const u8, output: []u8) []const u8 {
+    var offset: usize = 0;
+    appendBytes(output, &offset, "// fuzz comment\n{\"text\":\"");
+    appendSafePayload(raw, output, &offset);
+    appendBytes(output, &offset, "\",\"items\":[0,1,true,null]}");
+    return output[0..offset];
+}
+
+fn makeJson5Case(raw: []const u8, output: []u8) []const u8 {
+    var offset: usize = 0;
+    appendBytes(output, &offset, "{unquotedKey:'");
+    appendSafePayload(raw, output, &offset);
+    appendBytes(output, &offset, "',hex:0x1a,items:[0,1,true,null]}");
+    return output[0..offset];
+}
+
+fn makeJsonlCase(raw: []const u8, output: []u8) []const u8 {
+    var offset: usize = 0;
+    appendBytes(output, &offset, "{\"text\":\"");
+    appendSafePayload(raw, output, &offset);
+    appendBytes(output, &offset, "\"}\n[0,1,true,null]\n");
+    return output[0..offset];
+}
+
+fn makeYamlCase(raw: []const u8, output: []u8) []const u8 {
+    var offset: usize = 0;
+    appendBytes(output, &offset, "name: ");
+    appendSafePayload(raw, output, &offset);
+    appendBytes(output, &offset, "\nitems:\n  - one\n  - two\n");
+    return output[0..offset];
+}
+
+fn expectStage2Json(input: []const u8) !void {
+    var index = lib.formats.json.indexJson(testing.allocator, input) catch |err| {
+        if (checking.isCapacityError(err)) return;
+        return err;
+    };
+    defer index.deinit(testing.allocator);
+    try checking.expectMonotonicBounds(index.slice(), input.len);
+    try checking.expectValidationBuildParity(
+        lib.formats.json.validateJson,
+        lib.formats.json.buildJsonTape,
+        input,
+        checking.expectJsonDocument,
+    );
+}
+
+fn expectStage2Jsonc(input: []const u8) !void {
+    var index = lib.formats.jsonc.indexJsonc(testing.allocator, input) catch |err| {
+        if (checking.isCapacityError(err)) return;
+        return err;
+    };
+    defer index.deinit(testing.allocator);
+    try checking.expectMonotonicBounds(index.slice(), input.len);
+    try checking.expectValidationBuildParity(
+        lib.formats.jsonc.validateJsonc,
+        lib.formats.jsonc.buildJsoncTape,
+        input,
+        checking.expectJsonDocument,
+    );
+}
+
+fn expectStage2Json5(input: []const u8) !void {
+    var index = lib.formats.json5.indexJson5(testing.allocator, input) catch |err| {
+        if (checking.isCapacityError(err)) return;
+        return err;
+    };
+    defer index.deinit(testing.allocator);
+    try checking.expectMonotonicBounds(index.slice(), input.len);
+    try checking.expectValidationBuildParity(
+        lib.formats.json5.validateJson5,
+        lib.formats.json5.buildJson5Tape,
+        input,
+        checking.expectJsonDocument,
+    );
+}
+
+// JSONL keeps its permissive compatibility profile: blank records are accepted.
+fn expectStage2Jsonl(input: []const u8) !void {
+    var index = lib.formats.jsonl.indexJsonl(testing.allocator, input) catch |err| {
+        if (checking.isCapacityError(err)) return;
+        return err;
+    };
+    defer index.deinit(testing.allocator);
+    try checking.expectMonotonicBounds(index.slice(), input.len);
+    try checking.expectValidationBuildParity(
+        lib.formats.jsonl.validateJsonl,
+        lib.formats.jsonl.buildJsonlTape,
+        input,
+        checking.expectJsonlDocument,
+    );
+}
+
+fn expectYamlStreamParity(input: []const u8) !void {
+    const cuts = checking.fuzzCuts(input.len);
+    var expected = lib.formats.yaml.indexYaml(testing.allocator, input) catch |expected_err| {
+        var stream = lib.formats.yaml.YamlStreamIndexer.init(testing.allocator, 3) catch |err| {
+            if (checking.isCapacityError(err)) return;
+            return err;
+        };
+        defer stream.deinit();
+        try checking.feedPartitions(input, &cuts, &stream, true);
+        stream.finish() catch |actual_err| {
+            try testing.expectEqualStrings(@errorName(expected_err), @errorName(actual_err));
+            return;
+        };
+        try testing.expect(false);
+        return;
+    };
+    defer expected.deinit(testing.allocator);
+
+    var stream = try lib.formats.yaml.YamlStreamIndexer.init(testing.allocator, 3);
+    defer stream.deinit();
+    try checking.feedPartitions(input, &cuts, &stream, true);
+    try stream.finish();
+    try stream.finish();
+
+    var actual = stream.take();
+    defer actual.deinit(testing.allocator);
+    try checking.expectYamlParity(&expected, &actual, true);
+}
+
+fn expectStage2Yaml(input: []const u8) !void {
+    var index = lib.formats.yaml.indexYaml(testing.allocator, input) catch |err| {
+        if (checking.isCapacityError(err)) return;
+        try checking.expectValidationBuildParity(
+            lib.formats.yaml.validateYaml,
+            lib.formats.yaml.buildYamlTape,
+            input,
+            checking.expectYamlDocument,
+        );
+        return;
+    };
+    defer index.deinit(testing.allocator);
+    try checking.expectBounds(index.slice(), input.len);
+
+    const indexed_diagnostic = lib.formats.yaml.validateYamlIndex(
+        testing.allocator,
+        input,
+        &index,
+    ) catch |err| {
+        if (checking.isCapacityError(err)) return;
+        return err;
+    };
+    const diagnostic = lib.formats.yaml.validateYaml(testing.allocator, input) catch |err| {
+        if (checking.isCapacityError(err)) return;
+        return err;
+    };
+    try testing.expect((indexed_diagnostic == null) == (diagnostic == null));
+    if (indexed_diagnostic) |indexed| {
+        try testing.expect(diagnostic != null);
+        try testing.expectEqual(indexed.err, diagnostic.?.err);
+        try testing.expectEqual(indexed.kind, diagnostic.?.kind);
+        try testing.expectEqual(indexed.byte_offset, diagnostic.?.byte_offset);
+    }
+    try checking.expectValidationBuildParity(
+        lib.formats.yaml.validateYaml,
+        lib.formats.yaml.buildYamlTape,
+        input,
+        checking.expectYamlDocument,
+    );
+}
+
+test "fuzz: Stage2 JSON family and YAML build validate tape cursor parity" {
+    try runDeterministicSmithCasesLimited(
+        0x517c_c1b7_2722_0a95,
+        bounded_property_case_count,
+        testFuzzStage2,
+    );
+}
+
+fn testFuzzStage2(_: void, smith: *testing.Smith) !void {
+    var raw_buffer: [input_size_max]u8 = undefined;
+    const raw_len = smith.slice(&raw_buffer);
+    const raw = raw_buffer[0..raw_len];
+
+    try expectStage2Json(raw);
+    try expectStage2Jsonc(raw);
+    try expectStage2Json5(raw);
+    try expectStage2Jsonl(raw);
+    try expectStage2Yaml(raw);
+    try expectYamlStreamParity(raw);
+
+    var json_buffer: [stage2_input_max]u8 = undefined;
+    const json = makeJsonCase(raw, &json_buffer);
+    try expectStage2Json(json);
+
+    var jsonc_buffer: [stage2_input_max]u8 = undefined;
+    const jsonc = makeJsoncCase(raw, &jsonc_buffer);
+    try expectStage2Jsonc(jsonc);
+
+    var json5_buffer: [stage2_input_max]u8 = undefined;
+    const json5 = makeJson5Case(raw, &json5_buffer);
+    try expectStage2Json5(json5);
+
+    var jsonl_buffer: [stage2_input_max]u8 = undefined;
+    const jsonl = makeJsonlCase(raw, &jsonl_buffer);
+    try expectStage2Jsonl(jsonl);
+
+    var yaml_buffer: [stage2_input_max]u8 = undefined;
+    const yaml = makeYamlCase(raw, &yaml_buffer);
+    try expectStage2Yaml(yaml);
+    try expectYamlStreamParity(yaml);
+
+    try expectStage2Json("[1,]");
+    try expectStage2Jsonc("{\"a\":1,}");
+    try expectStage2Json5("{value:01}");
+    try expectStage2Jsonl("{}\n[1,]\n");
+    try expectStage2Yaml("name: [Ada,]\n");
+    try expectYamlStreamParity("name: [Ada,]\n");
+}
+
+test "fuzz: SIMD match windows prefix backslash and UTF8 differential" {
+    try runDeterministicSmithCasesLimited(
+        0x8f1b_bcdc_6a7e_11c3,
+        bounded_property_case_count,
+        testFuzzSimd,
+    );
+}
+
+fn testFuzzSimd(_: void, smith: *testing.Smith) !void {
+    var buffer: [input_size_max]u8 = undefined;
+    const len = smith.slice(&buffer);
+    const input = buffer[0..len];
+
+    try checking.expectSimdMatchWindows(input);
+    try checking.expectUtf8Widths(input);
+
+    const mask16 = smith.value(u16);
+    const mask32 = smith.value(u32);
+    const mask64 = smith.value(u64);
+    const previous = smith.boolWeighted(1, 1);
+    try testing.expectEqual(
+        checking.scalarPrefixXor(u16, mask16),
+        lib.prefixXor(u16, mask16),
+    );
+    try testing.expectEqual(
+        checking.scalarPrefixXor(u32, mask32),
+        lib.prefixXor(u32, mask32),
+    );
+    try testing.expectEqual(
+        checking.scalarPrefixXor(u64, mask64),
+        lib.prefixXor(u64, mask64),
+    );
+    try testing.expectEqual(
+        checking.scalarBackslashRunParity(u16, mask16, previous),
+        lib.computeBackslashRuns(u16, mask16, previous),
+    );
+    try testing.expectEqual(
+        checking.scalarBackslashRunParity(u32, mask32, previous),
+        lib.computeBackslashRuns(u32, mask32, previous),
+    );
+    try testing.expectEqual(
+        checking.scalarBackslashRunParity(u64, mask64, previous),
+        lib.computeBackslashRuns(u64, mask64, previous),
+    );
 }

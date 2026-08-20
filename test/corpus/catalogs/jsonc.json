@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "catalog_id": "jsonc-local",
+  "format": "jsonc",
+  "offline": true,
+  "provenance": {
+    "kind": "project-authored-and-pinned-research",
+    "manifest": "upstream/jsonc/MANIFEST.md",
+    "revision": "37e207ed23f544efc33a1893f21e0bf10b250df0",
+    "offline_rule": "Corpus tests must use only checked-in files"
+  },
+  "importer": {
+    "mode": "explicit-local-maintainer",
+    "network": false,
+    "source": "local-directory",
+    "destination": "test/corpus/upstream/jsonc"
+  },
+  "research": null,
+  "profiles": [
+    {
+      "id": "strict-jsonc",
+      "description": "JSON with line and block comments, without JSON5 extensions or trailing commas.",
+      "enabled": true,
+      "default_profile": true,
+      "cases": [
+        {
+          "id": "config",
+          "fixture": "jsonc/config.jsonc",
+          "expected": "accept"
+        },
+        {
+          "id": "trailing-comma",
+          "fixture": "cases/jsonc/trailing-comma.jsonc",
+          "expected": "reject"
+        }
+      ]
+    }
+  ]
+}
