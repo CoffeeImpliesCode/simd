@@ -1,6 +1,7 @@
 const std = @import("std");
 const simd = @import("../core/simd.zig");
 const stage1 = @import("../core/stage1.zig");
+const stage2 = @import("../core/stage2.zig");
 const testing = std.testing;
 
 pub fn indexJsonc(
@@ -8,6 +9,32 @@ pub fn indexJsonc(
     input: []const u8,
 ) !stage1.StructuralIndex {
     return indexJsoncImpl(simd.default_vector_len, allocator, input);
+}
+
+/// Builds an owned, validated JSONC tape from the Stage1 structural index.
+pub fn buildJsoncTape(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+) stage2.BuildError!stage2.Document {
+    var structural_index = indexJsonc(allocator, input) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return error.TapeTooLarge;
+    };
+    defer structural_index.deinit(allocator);
+    return stage2.buildTape(allocator, input, &structural_index, .jsonc);
+}
+
+/// Validates JSONC and returns the first semantic diagnostic, if any.
+pub fn validateJsonc(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+) stage2.ValidationError!?stage2.Diagnostic {
+    var structural_index = indexJsonc(allocator, input) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return error.TapeTooLarge;
+    };
+    defer structural_index.deinit(allocator);
+    return stage2.validate(input, &structural_index, .jsonc);
 }
 
 pub fn indexJsoncImpl(
@@ -29,7 +56,7 @@ pub fn indexJsoncImpl(
     var previous_chunk_ends_in_backslash = false;
     var previous_backslash_run_odd = false;
     var skip_after_multi_comment = false;
-    var previous_atom_candidate = false;
+    var previous_in_atom = false;
     var windows = simd.windows(u8, VLEN, input, ' ');
     var chunk_offset: usize = 0;
 
@@ -78,7 +105,7 @@ pub fn indexJsoncImpl(
             if (in_string) {
                 if ((unescaped_quote_mask & bit) != 0) {
                     in_string = false;
-                    previous_atom_candidate = false;
+                    previous_in_atom = false;
                 }
                 continue;
             }
@@ -86,7 +113,7 @@ pub fn indexJsoncImpl(
             if (in_single_comment) {
                 if (byte == '\n' or byte == '\r') {
                     in_single_comment = false;
-                    previous_atom_candidate = false;
+                    previous_in_atom = false;
                 }
                 continue;
             }
@@ -96,7 +123,7 @@ pub fn indexJsoncImpl(
                     input[absolute_offset + 1] == '/')
                 {
                     in_multi_comment = false;
-                    previous_atom_candidate = false;
+                    previous_in_atom = false;
                     skip_after_multi_comment = true;
                 }
                 continue;
@@ -104,7 +131,7 @@ pub fn indexJsoncImpl(
 
             if ((unescaped_quote_mask & bit) != 0) {
                 in_string = true;
-                previous_atom_candidate = false;
+                previous_in_atom = false;
                 continue;
             }
 
@@ -112,12 +139,12 @@ pub fn indexJsoncImpl(
                 const next_byte = input[absolute_offset + 1];
                 if (next_byte == '/') {
                     in_single_comment = true;
-                    previous_atom_candidate = false;
+                    previous_in_atom = false;
                     continue;
                 }
                 if (next_byte == '*') {
                     in_multi_comment = true;
-                    previous_atom_candidate = false;
+                    previous_in_atom = false;
                     continue;
                 }
             }
@@ -125,20 +152,20 @@ pub fn indexJsoncImpl(
             const is_structural = (structural_mask & bit) != 0;
             if (is_structural) {
                 visible_mask |= bit;
-                previous_atom_candidate = false;
+                previous_in_atom = false;
                 continue;
             }
 
             const is_atom_candidate = (atom_mask & bit) != 0;
             if (is_atom_candidate) {
-                if (!previous_atom_candidate) {
+                if (!previous_in_atom) {
                     visible_mask |= bit;
                 }
-                previous_atom_candidate = true;
+                previous_in_atom = true;
                 continue;
             }
 
-            previous_atom_candidate = false;
+            previous_in_atom = !isJsoncWhitespace(byte);
         }
 
         var indexes: [VLEN]u32 = undefined;
@@ -220,7 +247,7 @@ fn scalarIndexJsonc(
     var in_single_comment = false;
     var in_multi_comment = false;
     var skip_after_multi_comment = false;
-    var previous_atom_candidate = false;
+    var previous_in_atom = false;
     var backslash_run_length: usize = 0;
 
     for (input, 0..) |byte, byte_offset| {
@@ -231,47 +258,47 @@ fn scalarIndexJsonc(
         } else if (in_string) {
             if (unescaped_quote) {
                 in_string = false;
-                previous_atom_candidate = false;
+                previous_in_atom = false;
             }
         } else if (in_single_comment) {
             if (byte == '\n' or byte == '\r') {
                 in_single_comment = false;
-                previous_atom_candidate = false;
+                previous_in_atom = false;
             }
         } else if (in_multi_comment) {
             if (byte == '*' and byte_offset + 1 < input.len and
                 input[byte_offset + 1] == '/')
             {
                 in_multi_comment = false;
-                previous_atom_candidate = false;
+                previous_in_atom = false;
                 skip_after_multi_comment = true;
             }
         } else if (unescaped_quote) {
             in_string = true;
-            previous_atom_candidate = false;
+            previous_in_atom = false;
         } else if (byte == '/' and byte_offset + 1 < input.len) {
             const next_byte = input[byte_offset + 1];
             if (next_byte == '/') {
                 in_single_comment = true;
-                previous_atom_candidate = false;
+                previous_in_atom = false;
             } else if (next_byte == '*') {
                 in_multi_comment = true;
-                previous_atom_candidate = false;
+                previous_in_atom = false;
             } else {
-                previous_atom_candidate = false;
+                previous_in_atom = !isJsoncWhitespace(byte);
             }
         } else if (isJsoncStructuralByte(byte)) {
             result.indexes[result.count] = @intCast(byte_offset);
             result.count += 1;
-            previous_atom_candidate = false;
+            previous_in_atom = false;
         } else if (isJsoncAtomByte(byte)) {
-            if (!previous_atom_candidate) {
+            if (!previous_in_atom) {
                 result.indexes[result.count] = @intCast(byte_offset);
                 result.count += 1;
             }
-            previous_atom_candidate = true;
+            previous_in_atom = true;
         } else {
-            previous_atom_candidate = false;
+            previous_in_atom = !isJsoncWhitespace(byte);
         }
 
         if (byte == '\\') {
@@ -288,6 +315,13 @@ fn scalarIndexJsonc(
 fn isJsoncStructuralByte(byte: u8) bool {
     return switch (byte) {
         '{', '}', '[', ']', ':', ',' => true,
+        else => false,
+    };
+}
+
+fn isJsoncWhitespace(byte: u8) bool {
+    return switch (byte) {
+        ' ', '\t', '\n', '\r' => true,
         else => false,
     };
 }
@@ -405,6 +439,53 @@ test "indexJsonc width differential covers escaped boundary quotes" {
         even_run[vlen + 5] = '1';
         even_run[vlen + 6] = ']';
         try expectJsoncMatchesScalarAtWidth(vlen, even_run[0 .. vlen + 7]);
+    }
+}
+
+test "JSONC Stage2 builds comments and exposes raw values" {
+    const input = "{/* leading */\"name\": [1, // line\n true]}";
+    var document = try buildJsoncTape(testing.allocator, input);
+    defer document.deinit(testing.allocator);
+
+    var cursor = try document.root(input);
+    try testing.expectEqual(stage2.TapeKind.object_start, (try cursor.peek()).tapeKind());
+    try cursor.advance();
+    const raw_name = try cursor.rawValue();
+    try testing.expectEqualStrings("name", raw_name);
+    try testing.expect(
+        raw_name.ptr ==
+            input.ptr + @as(usize, document.tape[cursor.position()].offset) + 1,
+    );
+    try cursor.advance();
+    try cursor.advance();
+    try testing.expectEqualStrings("1", try cursor.rawValue());
+    try cursor.advance();
+    try testing.expectEqual(stage2.TapeKind.true_literal, (try cursor.peek()).tapeKind());
+    try testing.expect((try validateJsonc(testing.allocator, input)) == null);
+}
+
+test "JSONC Stage2 reports dialect diagnostics" {
+    const single_quote = try validateJsonc(testing.allocator, "{'a':1}");
+    if (single_quote) |diagnostic| {
+        try testing.expectEqual(error.UnexpectedToken, diagnostic.err);
+        try testing.expectEqual(@as(usize, 1), diagnostic.byte_offset);
+    } else {
+        return error.ExpectedDiagnostic;
+    }
+
+    const trailing_comma = try validateJsonc(testing.allocator, "{\"a\":1,}");
+    if (trailing_comma) |diagnostic| {
+        try testing.expectEqual(error.TrailingComma, diagnostic.err);
+        try testing.expectEqual(@as(usize, 7), diagnostic.byte_offset);
+    } else {
+        return error.ExpectedDiagnostic;
+    }
+
+    const unterminated_comment = try validateJsonc(testing.allocator, "/*");
+    if (unterminated_comment) |diagnostic| {
+        try testing.expectEqual(@as(usize, 0), diagnostic.byte_offset);
+    } else {
+        return error.ExpectedDiagnostic;
     }
 }
 

@@ -1,8 +1,8 @@
 # simd — Stage 2, On-Demand, and Streaming Architecture
 
-Status: Stage 1 is implemented for JSON, JSONL, JSONC, JSON5, Markdown, and XML.
-JSON also has Stage 2 tape validation, On-Demand traversal, and a chunk-fed
-Stage 1 `StreamIndexer`.
+Status: Stage 1 and Stage 2 are implemented for JSON, JSONL, JSONC, JSON5,
+Markdown, and XML. On-Demand traversal and the chunk-fed Stage 1
+`StreamIndexer` remain JSON-only.
 
 Scope: this document records current contracts and the remaining roadmap.
 Sections marked **Future roadmap** are designs, not current APIs. Sections
@@ -135,12 +135,12 @@ pub const TapeWord = packed struct(u64) {
 comptime { std.debug.assert(@bitSizeOf(TapeWord) == 64); }
 ```
 
-### `Document.root(input)` and `TapeCursor` ownership
+### JSON-family `Document.root(input)` and `TapeCursor` ownership
 
-A Stage 2 `Document` owns only its tape. `Document.root(input)` borrows the
-exact immutable JSON bytes used to build that tape. The input and the
-`Document` must outlive the returned `TapeCursor`. Raw string, number, and
-literal views are zero-copy slices of the borrowed input.
+A JSON-family Stage 2 `Document` owns only its tape and records its `Dialect`.
+`Document.root(input)` borrows the exact immutable bytes used to build that
+tape. The input and the `Document` must outlive the returned `TapeCursor`. Raw
+string, number, and literal views are zero-copy slices of the borrowed input.
 
 Container tape slots are append-only, so back-patch targets are stable. On
 open, Stage 2 emits `{kind=open, payload=0}` and records the tape index. On
@@ -182,25 +182,34 @@ consumed silently. Laziness: events carry raw slices; unescape/convert only on
 
 ### Completed Stage 1 contract (index ↔ cursor bridge)
 
-Stage 1 indexes structural characters, atom starts, and unescaped
-string-opening quotes. This lets JSON parsers find keys and string values
-without a second quote search. The implementation mirrors simdjson
-`json_scanner.h`: opening quotes are pseudo-structural, and closing quotes are
-not.
+Strict JSON and JSONL Stage 1 index structural characters, atom starts, and
+unescaped double-quote string openings. Their Stage 2 parsers can therefore
+find keys and string values without another quote search. For these formats,
+the implementation mirrors simdjson `json_scanner.h`: opening quotes are
+pseudo-structural, but closing quotes are not.
 
 ```zig
+// Strict JSON and JSONL only.
 const string_start_quotes = unescaped_quotes & inside_without_closing;
 const structural_indexes = (structural | atom_starts | string_start_quotes) & outside_string;
 ```
+
+JSONC and JSON5 Stage 1 do not emit opening or closing string quotes in the
+structural index. When Stage 2 reaches an opening quote in the source, it scans
+through the matching closing quote and validates the string. This source scan
+handles JSONC double-quoted strings and JSON5 single-quoted or double-quoted
+strings.
 
 After Stage 1 finishes, each indexer writes three sentinel entries:
 `indexes[n] = len`, `indexes[n+1] = len`, and `indexes[n+2] = 0`. This makes
 `peekLength` well-defined for the last real token and makes EOF detection exact.
 `StructuralIndex` reserves the three sentinel slots.
 
-The quote and sentinel rules are shared by the implemented JSON Stage 2 and
-On-Demand paths. The old assumption that quotes were not indexed is no longer
-current.
+Each JSON-family adapter pairs its Stage 1 quote and comment rules with the
+matching Stage 2 `Dialect`. JSONL applies strict JSON rules to each record.
+JSON On-Demand uses the same strict JSON quote and sentinel rules. Opening
+quote indexing applies only to strict JSON and JSONL. JSONC and JSON5 use the
+Stage 2 source scan described above.
 
 ### Performance: locality and allocation
 
@@ -347,14 +356,16 @@ VLEN instantiation unchanged. Keep them; extend the sweep:
 
 ---
 
-## Item 4 — Stage 2 Structural Validation (implemented for JSON)
+## Item 4 — Stage 2 Structural Validation (implemented for six formats)
 
-`src/core/stage2.zig` is exported from `src/root.zig` as `stage2`. It consumes
-a Stage 1 `StructuralIndex` and produces a validated, owned tape. Stage 2
-drives the scan from the index and reads input bytes for strings and atom
-interiors.
+`src/core/stage2.zig` owns the JSON-family parser, `Dialect`, tape, cursor, and
+shared diagnostic. `Dialect` contains `.json`, `.jsonc`, and `.json5`.
+Each JSON-family adapter runs its Stage 1 indexer and selects the matching
+dialect. JSONL derives record spans from its Stage 1 index and uses `.json` for
+each record. Markdown and XML own format-local documents, tapes, validators,
+errors, and diagnostics. They do not use the JSON `Dialect` or JSON tape.
 
-### Tape layout — `TapeWord` (64-bit packed, shared with Item 1)
+### JSON-family tape layout — `TapeWord` (64-bit packed, shared with Item 1)
 
 The tape allocates at most one word per input byte. Absolute input offsets use
 `u32`. The `u24` payload stores container counts, closing-word jump-back tape
@@ -405,7 +416,7 @@ applies to both values. `TapeCursor.skipValue()` scans and validates each word
 in a forward subtree, so its cost is O(subtree). From a closing word,
 `matchingStart()` uses the stored jump-back index in O(1).
 
-### Error set (confirmed 12)
+### JSON-family error set (confirmed 12)
 
 ```zig
 pub const Error = error{
@@ -415,11 +426,13 @@ pub const Error = error{
 };
 ```
 
-Explicit set, no `anyerror`. `OutOfMemory` is not semantic; unioned at call
-sites only where the option-gated duplicate-key map allocates. Policy: raw
-control bytes < 0x20 inside strings → `InvalidEscape` (RFC 8259 §7); malformed
-literals (`tru`, `nulx`) → `UnexpectedToken` with context
-`expected literal true/false/null`; `InvalidNumber` reserved for number-grammar.
+Explicit set, no `anyerror`. `OutOfMemory` is not semantic. Builders and
+validators union allocation failure only at their public call sites. The
+`DuplicateKey` enum member is reserved and is not emitted by current
+validators. Policy: raw control bytes < 0x20 inside strings → `InvalidEscape`
+(RFC 8259 §7); malformed literals (`tru`, `nulx`) → `UnexpectedToken` with
+context `expected literal true/false/null`; `InvalidNumber` is reserved for
+number grammar.
 
 ### Future roadmap: optional validation policies
 
@@ -431,7 +444,7 @@ literals (`tru`, `nulx`) → `UnexpectedToken` with context
 - Duplicate-key equality and escaped-key normalization need a defined policy
   before duplicate-key checking becomes a supported option.
 
-### `Diagnostic` — fail-fast, first error only
+### JSON-family `Diagnostic` — fail-fast, first error only
 
 ```zig
 pub const Diagnostic = struct {
@@ -446,63 +459,76 @@ pub fn diagnosticAt(input: []const u8, err: Error, byte_offset: usize) Diagnosti
 ```
 
 `diagnosticAt` scans back from `byte_offset` to the previous `\n` (O(offset),
-paid only on the error path, memoized per validator). Snippet =
+paid only on the error path). Snippet =
 `input[max(0,off-16) .. min(len,off+16)]` bounded by newlines, zero-copy.
 Rendering (reusing `core/debug.zig` `printAscii`/`highlightMulti`) is a caller
 concern. `UnclosedObject`/`UnclosedArray` point at the OPENING bracket
 (`DepthEntry.open_offset`), not EOF.
 
-### RFC 8259 state machine — 6 states
+### JSON-family state machine — 7 states
 
 ```zig
-const Expect = enum(u3) { value_after_open, value_after_comma, key_after_open, key_after_comma, colon, after_value };
+const Expect = enum(u3) {
+    value_after_open,
+    value_after_comma,
+    key_after_open,
+    key_after_comma,
+    colon,
+    value_after_colon,
+    after_value,
+};
 ```
 
+The `.json` dialect implements the RFC 8259 grammar. The `.jsonc` dialect
+permits line and block comments between JSON tokens. The `.json5` dialect adds
+JSON5 keys, strings, numbers, whitespace, comments, and trailing commas while
+it uses the same container state machine.
+
 Transitions:
-- `{`/`[`: emit open word (payload 0), push `DepthEntry`, state →
-  `key_after_open` (obj) / `value_after_open` (arr).
-- string/atom: emit word; state → `colon` (key in obj) / `after_value` (value);
-  `peek().count += 1`; at root → `root_done = true`.
-- `:`: only from `colon` → `value_after_open`; close-token check is top-entry
-  matches token (`]` on object top → `UnexpectedToken`), so post-colon values
-  are sound.
-- Empty container: `[`→`]` valid only from `value_after_open` with `count == 0`;
-  `{`→`}` only from `key_after_open` with `count == 0`.
-- `,`: only from `after_value` → `value_after_comma` / `key_after_comma`; else
-  `UnexpectedToken`.
-- `]`: valid from `value_after_open` (empty) or `after_value`; from
-  `value_after_comma` → `TrailingComma`. `}` analogously. Mismatched closer or
-  empty stack: `root_done ? RootNotSingular : UnexpectedToken`.
-- EOF: `depth.top > 0` → `UnclosedArray`/`UnclosedObject` (at `open_offset`);
-  no non-whitespace consumed → `EmptyDocument`; `root_done` with trailing bytes
-  → `RootNotSingular` at first trailing token.
+- `{`/`[`: emit an open word, push `DepthEntry`, then use
+  `key_after_open` for an object or `value_after_open` for an array.
+- A string or atom emits a word. A key moves to `colon`. A value moves to
+  `after_value`. A root value sets `root_done`.
+- `:` is valid only from `colon` and moves to `value_after_colon`.
+- Empty containers close from `key_after_open` or `value_after_open` when
+  their count is zero.
+- `,` is valid only from `after_value` and moves to `value_after_comma` or
+  `key_after_comma`.
+- `]` and `}` close from the matching empty or `after_value` state. JSON5
+  also closes from the matching comma state. Other states fail.
+- EOF reports an unclosed container at its opening bracket. Empty input
+  reports `EmptyDocument`. Trailing root input reports `RootNotSingular`.
 
-### Number validation (RFC 8259 §6)
+### JSON-family number validation
 
-Atom span = maximal run of `[0-9 + - . e E]`; the byte after MUST be a delimiter
-(`ws , ] } :`) else `UnexpectedToken` at that byte (catches `1a`). DFA rejects
-`01`, `1.`, `.5`, `+1`, `1e`, `1e+`, `-`, `--1`; accepts RFC-valid numbers.
-Stage 2 validates number syntax but does not convert numeric values. Consumers
-can convert a valid span lazily. The current `TapeCursor` exposes raw slices,
-so numbers that a caller does not read are not converted.
+The `.json` and `.jsonc` dialects use the RFC 8259 number grammar. Their atom
+span is a maximal run of `[0-9 + - . e E]`. The next byte must be a delimiter
+(`ws , ] } :`) or Stage 2 reports `UnexpectedToken`. The DFA rejects `01`,
+`1.`, `.5`, `+1`, `1e`, `1e+`, `-`, and `--1`.
 
-### String validation
+The `.json5` dialect accepts JSON5 decimal and hexadecimal numbers, leading
+`+`, `Infinity`, and `NaN`. It also accepts leading or trailing decimal points
+and JSON5 exponent forms. Stage 2 validates number syntax but does not convert
+numeric values. Consumers can convert a valid span lazily. `TapeCursor`
+exposes raw slices, so unread numbers are not converted.
 
-Scalar scan from `q+1`: `\` → escape table (`" \ / b f n r t` → advance 2; `u`
-→ exactly 4 hex digits via `std.fmt.charToDigit` else `InvalidEscape`); `"` →
-close; byte < 0x20 → `InvalidEscape`; `i == input.len` → `UnterminatedString` at
-`q`. UTF-8: `std.unicode.utf8ValidateSlice(content)` else `InvalidUtf8` (first
-invalid byte via `Utf8Iterator`). Escape bytes are ASCII, so validating raw
-content is correct. Stage 2 validates escapes but does not decode them. The
-current `TapeCursor` raw string view remains escaped.
+### String and key validation
+
+The `.json` and `.jsonc` dialects accept double-quoted strings with the RFC
+8259 escape table. They reject raw control bytes below `0x20`. The `.json5`
+dialect accepts single-quoted and double-quoted strings, JSON5 escapes, and
+escaped line terminators. It also accepts validated JSON5 identifier names as
+unquoted object keys. All three dialects validate string termination, Unicode
+escapes, and UTF-8. Stage 2 does not decode strings, so `TapeCursor` returns
+escaped raw views.
 
 ### Eager vs lazy (Item 4 verdict)
 
-- **Eager at tape build:** structural validation (bracket matching, colon/comma
-  placement, counts/jumps), string extent scanning (length lives in the tape
-  word), escape/UTF-8/number syntax validation. This gives a sound-tape
-  invariant, deterministic first-error diagnostics, and a validate-only entry
-  point (`validateJson` runs Stage 1 + 2, then discards the tape).
+- **Eager at tape build:** structural validation, string extent scanning,
+  escape and UTF-8 validation, and number syntax validation. This gives a
+  sound-tape invariant and deterministic first-error diagnostics. The
+  validate-only entry points in the support matrix return the first optional
+  diagnostic without retaining a tape.
 - **Lazy at consumption:** raw source views remain zero-copy. Numeric conversion
   and escape decoding belong to consumers and are not done for unread values.
 - Cost: one extra byte walk per atom at build (~1–2 cycles/byte scalar), tape
@@ -517,13 +543,34 @@ current `TapeCursor` raw string view remains escaped.
 The current validator fails at the first `Diagnostic`. Recovery by scanning to
 the next separator or matching close token remains future work.
 
-### Current wiring
+### Current six-format support matrix
 
-- `src/root.zig` exports `stage2`.
-- `json.buildJsonTape(allocator, input)` runs JSON Stage 1 and Stage 2.
-- `json.validateJson(allocator, input)` returns the first optional
-  `stage2.Diagnostic`.
-- JSONL, JSONC, JSON5, Markdown, and XML currently expose Stage 1 only.
+| Format | Builder | Validator and diagnostic | Document and tape | Implemented grammar scope |
+|---|---|---|---|---|
+| JSON | `json.buildJsonTape(allocator, input) -> stage2.BuildError!stage2.Document` | `json.validateJson(allocator, input) -> stage2.ValidationError!?stage2.Diagnostic` | `stage2.Document` with `stage2.TapeWord` and `.json` | Strict RFC 8259 JSON |
+| JSONC | `jsonc.buildJsoncTape(allocator, input) -> stage2.BuildError!stage2.Document` | `jsonc.validateJsonc(allocator, input) -> stage2.ValidationError!?stage2.Diagnostic` | `stage2.Document` with `stage2.TapeWord` and `.jsonc` | Strict JSON plus `//` and `/* ... */` comments. It accepts no other JSON5 syntax. |
+| JSON5 | `json5.buildJson5Tape(allocator, input) -> stage2.BuildError!stage2.Document` | `json5.validateJson5(allocator, input) -> stage2.ValidationError!?stage2.Diagnostic` | `stage2.Document` with `stage2.TapeWord` and `.json5` | JSON5 grammar, including comments, single quotes, identifier keys, trailing commas, JSON5 numbers, whitespace, and escapes |
+| JSONL | `jsonl.buildJsonlTape(allocator, input) -> stage2.BuildError!JsonlDocument` | `jsonl.validateJsonl(allocator, input) -> stage2.ValidationError!?JsonlDiagnostic` | `JsonlDocument` owns `JsonlRecord` metadata and one `stage2.Document` tape per record | Strict JSON for each nonblank record. A Stage 1-indexed LF outside strings ends a record. Blank and trailing records are skipped. |
+| Markdown | `markdown.buildMarkdownTape(allocator, input) -> MarkdownBuildError!MarkdownDocument` | `markdown.validateMarkdown(allocator, input) -> MarkdownValidationError!?MarkdownDiagnostic` | Format-local `MarkdownDocument` with `MarkdownTapeWord` | Stage 1 token integrity for the Markdown marker stream. It is not CommonMark validation or a CommonMark AST. |
+| XML | `xml.buildXmlTape(allocator, input) -> XmlBuildError!XmlDocument` | `xml.validateXml(input) -> XmlValidationError!?XmlDiagnostic` | Format-local `XmlDocument` with `XmlTapeWord` | The supported XML well-formedness subset covers one root, UTF-8 XML characters, names, attributes, built-in and numeric entities, comments, CDATA, processing instructions, and an XML 1.0 declaration. DTD and DOCTYPE declarations are unsupported. |
+
+Markdown preserves these Stage 1 token kinds in its local tape: headings,
+code fences, list items, blockquotes, inline code, link open and close
+markers, and thematic breaks. XML accepts an XML declaration only with version
+`1.0`, optional `UTF-8` encoding, and optional `yes` or `no` standalone values.
+
+All six validators fail at the first format error and return `null` for valid
+input. `stage2.Diagnostic` and `JsonlDiagnostic` use `stage2.Error`.
+`MarkdownDiagnostic` uses `MarkdownError`. `XmlDiagnostic` uses `XmlError`.
+All four diagnostic types contain an error, byte offset, line, column, snippet,
+and snippet start. `JsonlDiagnostic` adds the record index and record source
+bounds. Its byte, line, column, and snippet coordinates refer to the complete
+JSONL input.
+
+Each builder returns owned tape storage and borrows source bytes from the
+caller. `JsonlDocument` keeps each record cursor inside its record source.
+`MarkdownDocument` and `XmlDocument` are format-local token tapes. They are
+not JSON documents, JSON tape cursors, or JSON DOMs.
 
 ---
 
@@ -692,15 +739,18 @@ implement per-stream generic `Reader` types):
 
 ## Current cross-cutting decisions
 
-1. Stage 1 indexes JSON string-opening quotes and writes `(len, len, 0)`
-   sentinel padding.
+1. Strict JSON and JSONL Stage 1 index unescaped double-quote string openings.
+   JSONC and JSON5 suppress quote positions, so Stage 2 scans their strings
+   from the source. All Stage 1 indexers write `(len, len, 0)` sentinel padding.
 2. `simd.default_vector_len` is the current vector-width source for the six
    Stage 1 indexers.
-3. JSON Stage 2 owns its tape and borrows source bytes only when
-   `Document.root(input)` creates a cursor.
-4. JSON On-Demand consumes complete resident input through parser-owned
+3. JSON, JSONC, and JSON5 use `stage2.Document` with a core-owned `Dialect`.
+4. JSONL uses Stage 1-indexed LF boundaries outside strings. Each nonblank
+   record owns an independent strict JSON tape.
+5. Markdown and XML use format-local documents and tapes, not JSON DOMs.
+6. JSON On-Demand consumes complete resident input through parser-owned
    structural storage.
-5. JSON streaming currently ends at Stage 1 `StructuralIndex` production.
+7. JSON streaming currently ends at Stage 1 `StructuralIndex` production.
 
 ## Future roadmap
 

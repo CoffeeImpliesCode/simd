@@ -112,6 +112,289 @@ test "corpus: XML indexing on catalog.xml" {
     const xml_data = @embedFile("corpus/xml/catalog.xml");
     try expectTokenWidths(lib.formats.xml.indexXmlImpl, xml_data);
 }
+test "public Stage 2 JSON corpus builds validates and exposes raw spans" {
+    const input = @embedFile("corpus/json/example_config.json");
+    try testing.expect((try lib.formats.json.validateJson(testing.allocator, input)) == null);
+
+    var document = try lib.formats.json.buildJsonTape(testing.allocator, input);
+    defer document.deinit(testing.allocator);
+
+    try testing.expectEqual(lib.stage2.Dialect.json, document.dialect);
+    try testing.expect(document.tape.len > 0);
+
+    var cursor = try document.root(input);
+    try testing.expectEqual(
+        lib.stage2.TapeKind.object_start,
+        (try cursor.peek()).tapeKind(),
+    );
+    try cursor.advance();
+    try testing.expectEqual(lib.stage2.TapeKind.key, (try cursor.peek()).tapeKind());
+    const key_word = try cursor.peek();
+    const raw_key = try cursor.rawValue();
+    try testing.expectEqualStrings("app_name", raw_key);
+    try testing.expect(
+        raw_key.ptr == input.ptr + @as(usize, key_word.offset) + 1,
+    );
+    try cursor.advance();
+    try testing.expectEqualStrings("MyApp", try cursor.rawValue());
+
+    const invalid_input = "[1,]";
+    const diagnostic = (try lib.formats.json.validateJson(
+        testing.allocator,
+        invalid_input,
+    )).?;
+    try testing.expectEqual(error.TrailingComma, diagnostic.err);
+    try testing.expectEqual(
+        std.mem.indexOfScalar(u8, invalid_input, ']').?,
+        diagnostic.byte_offset,
+    );
+}
+
+test "public Stage 2 JSONC corpus accepts comments and rejects trailing commas" {
+    const input = @embedFile("corpus/jsonc/config.jsonc");
+    try testing.expect((try lib.formats.jsonc.validateJsonc(
+        testing.allocator,
+        input,
+    )) == null);
+
+    var document = try lib.formats.jsonc.buildJsoncTape(testing.allocator, input);
+    defer document.deinit(testing.allocator);
+
+    try testing.expectEqual(lib.stage2.Dialect.jsonc, document.dialect);
+    var cursor = try document.root(input);
+    try cursor.advance();
+    const key_word = try cursor.peek();
+    try testing.expectEqual(lib.stage2.TapeKind.key, key_word.tapeKind());
+    const raw_key = try cursor.rawValue();
+    try testing.expectEqualStrings("name", raw_key);
+    try testing.expect(
+        raw_key.ptr == input.ptr + @as(usize, key_word.offset) + 1,
+    );
+
+    const invalid_input = "{\"a\":1,}";
+    const diagnostic = (try lib.formats.jsonc.validateJsonc(
+        testing.allocator,
+        invalid_input,
+    )).?;
+    try testing.expectEqual(error.TrailingComma, diagnostic.err);
+    try testing.expectEqual(
+        std.mem.indexOfScalar(u8, invalid_input, '}').?,
+        diagnostic.byte_offset,
+    );
+}
+
+test "public Stage 2 JSON5 corpus preserves extended grammar raw spans" {
+    const input = @embedFile("corpus/json5/sample.json5");
+    try testing.expect((try lib.formats.json5.validateJson5(
+        testing.allocator,
+        input,
+    )) == null);
+
+    var document = try lib.formats.json5.buildJson5Tape(testing.allocator, input);
+    defer document.deinit(testing.allocator);
+
+    try testing.expectEqual(lib.stage2.Dialect.json5, document.dialect);
+    var cursor = try document.root(input);
+    var saw_unquoted_key = false;
+    var saw_single_quoted_string = false;
+    var saw_hex_number = false;
+
+    while (cursor.position() < document.tape.len) {
+        const word = try cursor.peek();
+        switch (word.tapeKind()) {
+            .key, .string, .number, .true_literal, .false_literal, .null_literal => {
+                const raw = try cursor.rawValue();
+                const source_offset: usize = @intCast(word.offset);
+                const raw_start = if (input[source_offset] == '\'' or
+                    input[source_offset] == '"')
+                    source_offset + 1
+                else
+                    source_offset;
+                try testing.expect(raw.ptr == input.ptr + raw_start);
+                if (std.mem.eql(u8, raw, "unquotedKey")) saw_unquoted_key = true;
+                if (std.mem.eql(u8, raw, "single quoted value with \"nested double quotes\"")) {
+                    saw_single_quoted_string = true;
+                }
+                if (std.mem.eql(u8, raw, "0xDEADBEEF")) saw_hex_number = true;
+            },
+            else => {},
+        }
+        try cursor.advance();
+    }
+
+    try testing.expect(saw_unquoted_key);
+    try testing.expect(saw_single_quoted_string);
+    try testing.expect(saw_hex_number);
+
+    const invalid_input = "{value:01}";
+    const diagnostic = (try lib.formats.json5.validateJson5(
+        testing.allocator,
+        invalid_input,
+    )).?;
+    try testing.expectEqual(error.InvalidNumber, diagnostic.err);
+    try testing.expectEqual(@as(usize, 8), diagnostic.byte_offset);
+}
+
+test "public Stage 2 JSONL corpus exposes records and global diagnostics" {
+    const corpus = @embedFile("corpus/jsonl/amazon_cellphones.ndjson");
+    try testing.expect((try lib.formats.jsonl.validateJsonl(
+        testing.allocator,
+        corpus,
+    )) == null);
+
+    var corpus_document = try lib.formats.jsonl.buildJsonlTape(
+        testing.allocator,
+        corpus,
+    );
+    defer corpus_document.deinit(testing.allocator);
+    try testing.expect(corpus_document.records.len > 0);
+    const first_corpus_record = corpus_document.record(0).?;
+    try testing.expectEqual(@as(usize, 0), first_corpus_record.source_start);
+    try testing.expect(first_corpus_record.source_end > first_corpus_record.source_start);
+    var corpus_cursor = try first_corpus_record.root();
+    try testing.expectEqual(
+        lib.stage2.TapeKind.array_start,
+        (try corpus_cursor.peek()).tapeKind(),
+    );
+
+    const input = " \r\n\n{\"a\":1}\r\n2\r\n\n";
+    try testing.expect((try lib.formats.jsonl.validateJsonl(
+        testing.allocator,
+        input,
+    )) == null);
+    var document = try lib.formats.jsonl.buildJsonlTape(testing.allocator, input);
+    defer document.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), document.records.len);
+    try testing.expectEqualStrings("{\"a\":1}\r", document.records[0].source);
+    try testing.expectEqualStrings("2\r", document.records[1].source);
+    try testing.expectEqual(@as(usize, 4), document.records[0].source_start);
+    try testing.expectEqual(@as(usize, 13), document.records[1].source_start);
+    try testing.expect(document.record(2) == null);
+
+    var record_cursor = try document.cursor(0);
+    try record_cursor.advance();
+    const record_key_word = try record_cursor.peek();
+    const record_key = try record_cursor.rawValue();
+    try testing.expectEqualStrings("a", record_key);
+    try testing.expect(
+        record_key.ptr ==
+            input.ptr + document.records[0].source_start +
+                @as(usize, record_key_word.offset) + 1,
+    );
+
+    const invalid_input = "{}\n  [1,]\n{}\n";
+    const close_bracket = std.mem.indexOfScalar(u8, invalid_input, ']').?;
+    const diagnostic = (try lib.formats.jsonl.validateJsonl(
+        testing.allocator,
+        invalid_input,
+    )).?;
+    try testing.expectEqual(@as(usize, 1), diagnostic.record_index);
+    try testing.expectEqual(@as(usize, 3), diagnostic.source_start);
+    try testing.expectEqual(close_bracket + 1, diagnostic.source_end);
+    try testing.expectEqual(error.TrailingComma, diagnostic.err);
+    try testing.expectEqual(close_bracket, diagnostic.byte_offset);
+    try testing.expectEqual(@as(u32, 2), diagnostic.line);
+    try testing.expectEqual(@as(u32, 6), diagnostic.column);
+    try testing.expect(
+        diagnostic.snippet.ptr == invalid_input.ptr + diagnostic.snippet_start,
+    );
+}
+
+test "public Stage 2 Markdown corpus preserves token parity and local limits" {
+    const input = @embedFile("corpus/markdown/document.md");
+    var index = try lib.formats.markdown.indexMarkdown(testing.allocator, input);
+    defer index.deinit(testing.allocator);
+    try testing.expect((try lib.formats.markdown.validateMarkdown(
+        testing.allocator,
+        input,
+    )) == null);
+
+    var document = try lib.formats.markdown.buildMarkdownTape(
+        testing.allocator,
+        input,
+    );
+    defer document.deinit(testing.allocator);
+    try testing.expectEqual(index.count, document.tape.len);
+    for (document.tape, 0..) |word, tape_index| {
+        try testing.expectEqual(index.kinds[tape_index], word.tapeKind());
+        try testing.expectEqual(index.indexes[tape_index], word.offset);
+        try testing.expect(@as(usize, word.offset) < input.len);
+    }
+
+    const unclosed_fence = "```zig\n# hidden [x](y)";
+    try testing.expect((try lib.formats.markdown.validateMarkdown(
+        testing.allocator,
+        unclosed_fence,
+    )) == null);
+    var fence_document = try lib.formats.markdown.buildMarkdownTape(
+        testing.allocator,
+        unclosed_fence,
+    );
+    defer fence_document.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), fence_document.tape.len);
+    try testing.expectEqual(
+        lib.formats.markdown.MarkdownTokenKind.code_fence,
+        fence_document.tape[0].tapeKind(),
+    );
+
+    const invalid_input = "#";
+    var indexes = [_]u32{@intCast(invalid_input.len)};
+    var kinds = [_]lib.formats.markdown.MarkdownTokenKind{.heading};
+    const forged = lib.formats.markdown.MarkdownStructuralIndex{
+        .indexes = &indexes,
+        .kinds = &kinds,
+        .count = 1,
+    };
+    const diagnostic = (try lib.formats.markdown.validateMarkdownIndex(
+        invalid_input,
+        &forged,
+    )).?;
+    try testing.expectEqual(error.InvalidTokenIndex, diagnostic.err);
+    try testing.expectEqual(invalid_input.len, diagnostic.byte_offset);
+}
+
+test "public Stage 2 XML catalog exposes source spans and matching errors" {
+    const input = @embedFile("corpus/xml/catalog.xml");
+    try testing.expect((try lib.formats.xml.validateXml(input)) == null);
+
+    var document = try lib.formats.xml.buildXmlTape(testing.allocator, input);
+    defer document.deinit(testing.allocator);
+    try testing.expect(document.tape.len > 0);
+
+    var saw_declaration = false;
+    var saw_comment = false;
+    var saw_attribute = false;
+    var saw_text = false;
+    var saw_cdata = false;
+    var saw_self_close = false;
+    for (document.tape, 0..) |word, tape_index| {
+        const span = try document.sourceSpan(input, tape_index);
+        try testing.expect(span.ptr == input.ptr + @as(usize, word.offset));
+        try testing.expectEqual(word.sourceLength(), span.len);
+        switch (word.tapeKind()) {
+            .xml_declaration => saw_declaration = true,
+            .comment => saw_comment = true,
+            .attribute => saw_attribute = true,
+            .text => saw_text = true,
+            .cdata => saw_cdata = true,
+            .self_closing_element => saw_self_close = true,
+            else => {},
+        }
+    }
+    try testing.expect(saw_declaration);
+    try testing.expect(saw_comment);
+    try testing.expect(saw_attribute);
+    try testing.expect(saw_text);
+    try testing.expect(saw_cdata);
+    try testing.expect(saw_self_close);
+
+    const invalid_input = "<a><b></a>";
+    const diagnostic = (try lib.formats.xml.validateXml(invalid_input)).?;
+    try testing.expectEqual(error.MismatchedTag, diagnostic.err);
+    try testing.expectEqual(@as(usize, 8), diagnostic.byte_offset);
+    try testing.expectEqual(@as(u32, 1), diagnostic.line);
+    try testing.expectEqual(@as(u32, 9), diagnostic.column);
+}
 
 test "public JSON cursor keeps exact input and document live through nested navigation" {
     const input =
@@ -190,7 +473,10 @@ test "public JSON cursor rejects malformed borrowed source and public tape" {
     try testing.expectError(error.InvalidSource, malformed_escape_cursor.rawValue());
 
     var empty_tape: [0]lib.stage2.TapeWord = .{};
-    const empty_document = lib.stage2.Document{ .tape = empty_tape[0..] };
+    const empty_document = lib.stage2.Document{
+        .tape = empty_tape[0..],
+        .dialect = .json,
+    };
     try testing.expectError(error.TapeOutOfBounds, empty_document.root(""));
 
     var invalid_kind_tape = [_]lib.stage2.TapeWord{.{
@@ -198,7 +484,10 @@ test "public JSON cursor rejects malformed borrowed source and public tape" {
         .payload = 0,
         .offset = 0,
     }};
-    const invalid_kind_document = lib.stage2.Document{ .tape = invalid_kind_tape[0..] };
+    const invalid_kind_document = lib.stage2.Document{
+        .tape = invalid_kind_tape[0..],
+        .dialect = .json,
+    };
     try testing.expectError(error.InvalidTapeKind, invalid_kind_document.root("0"));
 
     var wrong_end_tape = [_]lib.stage2.TapeWord{
@@ -213,7 +502,10 @@ test "public JSON cursor rejects malformed borrowed source and public tape" {
             .offset = 1,
         },
     };
-    const wrong_end_document = lib.stage2.Document{ .tape = wrong_end_tape[0..] };
+    const wrong_end_document = lib.stage2.Document{
+        .tape = wrong_end_tape[0..],
+        .dialect = .json,
+    };
     var wrong_end_cursor = try wrong_end_document.root("[]");
     try testing.expectError(error.InvalidTapeOrder, wrong_end_cursor.skipValue());
 
@@ -236,6 +528,7 @@ test "public JSON cursor rejects malformed borrowed source and public tape" {
     };
     const malformed_interior_document = lib.stage2.Document{
         .tape = malformed_interior_tape[0..],
+        .dialect = .json,
     };
     var malformed_interior_end = try malformed_interior_document.root("[0]");
     try malformed_interior_end.advance();

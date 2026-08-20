@@ -27,6 +27,47 @@ pub const MarkdownStructuralIndex = struct {
     }
 };
 
+const MarkdownIndexSink = struct {
+    indexes: *stage1.StructuralIndex,
+    kinds: []MarkdownTokenKind,
+
+    fn append(self: *@This(), offset: usize, kind: MarkdownTokenKind) void {
+        appendToken(self.indexes, self.kinds, offset, kind);
+    }
+};
+
+const MarkdownValidationSink = struct {
+    input: []const u8,
+    structural_index: *const MarkdownStructuralIndex,
+    token_index: usize = 0,
+    diagnostic: ?MarkdownDiagnostic = null,
+
+    fn append(self: *@This(), offset: usize, kind: MarkdownTokenKind) void {
+        if (self.diagnostic != null) return;
+        if (self.token_index >= self.structural_index.count) {
+            self.diagnostic = markdownDiagnosticAt(self.input, error.InvalidTokenIndex, offset);
+            return;
+        }
+
+        const supplied_offset: usize = @intCast(self.structural_index.indexes[self.token_index]);
+        if (supplied_offset != offset) {
+            self.diagnostic = markdownDiagnosticAt(self.input, error.InvalidTokenIndex, supplied_offset);
+            return;
+        }
+        if (self.structural_index.kinds[self.token_index] != kind) {
+            self.diagnostic = markdownDiagnosticAt(self.input, error.InvalidTokenKind, offset);
+            return;
+        }
+        self.token_index += 1;
+    }
+
+    fn finish(self: *@This()) void {
+        if (self.diagnostic != null or self.token_index >= self.structural_index.count) return;
+        const offset: usize = @intCast(self.structural_index.indexes[self.token_index]);
+        self.diagnostic = markdownDiagnosticAt(self.input, error.InvalidTokenKind, offset);
+    }
+};
+
 pub fn indexMarkdown(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -39,15 +80,27 @@ pub fn indexMarkdownImpl(
     allocator: std.mem.Allocator,
     input: []const u8,
 ) !MarkdownStructuralIndex {
-    const Mask = simd.Mask(VLEN);
-
-    if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
-
     var indexes = try stage1.StructuralIndex.init(allocator, input.len);
     errdefer indexes.deinit(allocator);
     const kinds = try allocator.alloc(MarkdownTokenKind, input.len);
     errdefer allocator.free(kinds);
 
+    var sink = MarkdownIndexSink{
+        .indexes = &indexes,
+        .kinds = kinds,
+    };
+    scanMarkdown(VLEN, input, &sink);
+    try indexes.finish(input.len);
+
+    return .{
+        .indexes = indexes.indexes,
+        .kinds = kinds,
+        .count = indexes.count,
+    };
+}
+
+fn scanMarkdown(comptime VLEN: usize, input: []const u8, sink: anytype) void {
+    const Mask = simd.Mask(VLEN);
     var state = MarkdownScanState{
         .in_code_fence = false,
         .in_inline_code = false,
@@ -79,16 +132,191 @@ pub fn indexMarkdownImpl(
         for (candidate_indexes[0..candidate_count]) |candidate_index| {
             const offset: usize = @intCast(candidate_index);
             advanceLinePrefix(input, scan_offset, offset, &state);
-            processMarkdownCandidate(input, offset, &state, &indexes, kinds);
+            processMarkdownCandidate(input, offset, &state, sink);
             scan_offset = offset + 1;
         }
     }
-    try indexes.finish(input.len);
+}
+
+pub const MarkdownError = error{
+    InvalidIndexCount,
+    InvalidTokenIndex,
+    InvalidTokenOrder,
+    InvalidTokenKind,
+};
+
+pub const MarkdownValidationError = std.mem.Allocator.Error || error{TapeTooLarge};
+pub const MarkdownBuildError = std.mem.Allocator.Error || MarkdownError || error{TapeTooLarge};
+
+/// A compact validated Markdown token. The offset points at the Stage1 marker.
+pub const MarkdownTapeWord = packed struct(u64) {
+    kind: u8,
+    payload: u24,
+    offset: u32,
+
+    pub fn tapeKind(self: MarkdownTapeWord) MarkdownTokenKind {
+        return @enumFromInt(self.kind);
+    }
+};
+
+comptime {
+    assert(@bitSizeOf(MarkdownTapeWord) == 64);
+    assert(@sizeOf(MarkdownTapeWord) == 8);
+}
+
+/// An owned Markdown token tape. The source input remains borrowed.
+pub const MarkdownDocument = struct {
+    tape: []MarkdownTapeWord,
+
+    pub fn deinit(self: *MarkdownDocument, allocator: std.mem.Allocator) void {
+        allocator.free(self.tape);
+        self.* = undefined;
+    }
+};
+
+pub const MarkdownDiagnostic = struct {
+    err: MarkdownError,
+    byte_offset: usize,
+    line: u32,
+    column: u32,
+    snippet: []const u8,
+    snippet_start: usize,
+};
+
+/// Builds an owned, validated tape while preserving the Stage1 token stream.
+pub fn buildMarkdownTape(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+) MarkdownBuildError!MarkdownDocument {
+    var structural_index = indexMarkdown(allocator, input) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return error.TapeTooLarge;
+    };
+    defer structural_index.deinit(allocator);
+
+    if (try validateMarkdownIndex(input, &structural_index)) |diagnostic| {
+        return diagnostic.err;
+    }
+
+    const tape = try allocator.alloc(MarkdownTapeWord, structural_index.count);
+    errdefer allocator.free(tape);
+    for (tape, 0..) |*word, tape_index| {
+        word.* = .{
+            .kind = @intFromEnum(structural_index.kinds[tape_index]),
+            .payload = 0,
+            .offset = structural_index.indexes[tape_index],
+        };
+    }
+    return .{ .tape = tape };
+}
+
+/// Validates the Stage1 stream and returns only its first invariant failure.
+pub fn validateMarkdown(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+) MarkdownValidationError!?MarkdownDiagnostic {
+    var structural_index = indexMarkdown(allocator, input) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return error.TapeTooLarge;
+    };
+    defer structural_index.deinit(allocator);
+    return validateMarkdownIndex(input, &structural_index);
+}
+
+/// Validates a copied or otherwise externally supplied Markdown index.
+pub fn validateMarkdownIndex(
+    input: []const u8,
+    structural_index: *const MarkdownStructuralIndex,
+) MarkdownValidationError!?MarkdownDiagnostic {
+    const max_offset = @as(usize, std.math.maxInt(u32));
+    if (input.len > max_offset) return error.TapeTooLarge;
+    if (structural_index.count > max_offset) return error.TapeTooLarge;
+    const tape_size = std.math.mul(
+        usize,
+        structural_index.count,
+        @sizeOf(MarkdownTapeWord),
+    ) catch return error.TapeTooLarge;
+
+    if (structural_index.count > structural_index.indexes.len or
+        structural_index.count > structural_index.kinds.len or
+        structural_index.count > input.len)
+    {
+        return markdownDiagnosticAt(input, error.InvalidIndexCount, input.len);
+    }
+
+    _ = tape_size;
+    var previous_offset: usize = 0;
+    var has_previous = false;
+    for (0..structural_index.count) |token_index| {
+        const offset: usize = @intCast(structural_index.indexes[token_index]);
+        if (offset >= input.len) {
+            return markdownDiagnosticAt(input, error.InvalidTokenIndex, offset);
+        }
+        if (has_previous and offset <= previous_offset) {
+            return markdownDiagnosticAt(input, error.InvalidTokenOrder, offset);
+        }
+        if (!markdownSourceMatchesKind(input[offset], structural_index.kinds[token_index])) {
+            return markdownDiagnosticAt(input, error.InvalidTokenKind, offset);
+        }
+        previous_offset = offset;
+        has_previous = true;
+    }
+
+    var sink = MarkdownValidationSink{
+        .input = input,
+        .structural_index = structural_index,
+    };
+    scanMarkdown(simd.default_vector_len, input, &sink);
+    sink.finish();
+    if (sink.diagnostic) |diagnostic| return diagnostic;
+    return null;
+}
+
+/// Creates a zero-copy diagnostic view into the source input.
+pub fn markdownDiagnosticAt(
+    input: []const u8,
+    err: MarkdownError,
+    byte_offset: usize,
+) MarkdownDiagnostic {
+    const offset = @min(byte_offset, input.len);
+    var line_start: usize = 0;
+    var line_number: usize = 1;
+    var scan_offset: usize = 0;
+    while (scan_offset < offset) : (scan_offset += 1) {
+        if (input[scan_offset] == '\n') {
+            line_start = scan_offset + 1;
+            line_number += 1;
+        }
+    }
+
+    var line_end = offset;
+    while (line_end < input.len and input[line_end] != '\n') : (line_end += 1) {}
+    const snippet_start = @max(line_start, offset -| 16);
+    const snippet_limit = std.math.add(usize, offset, 16) catch input.len;
+    const snippet_end = @min(line_end, snippet_limit);
+    const max_line_value: usize = std.math.maxInt(u32);
 
     return .{
-        .indexes = indexes.indexes,
-        .kinds = kinds,
-        .count = indexes.count,
+        .err = err,
+        .byte_offset = offset,
+        .line = @intCast(@min(line_number, max_line_value)),
+        .column = @intCast(@min(offset - line_start + 1, max_line_value)),
+        .snippet = input[snippet_start..snippet_end],
+        .snippet_start = snippet_start,
+    };
+}
+
+fn markdownSourceMatchesKind(character: u8, kind: MarkdownTokenKind) bool {
+    return switch (kind) {
+        .heading => character == '#',
+        .code_fence => character == '`' or character == '~',
+        .list_item => character == '-' or character == '*' or character == '+' or
+            std.ascii.isDigit(character),
+        .blockquote => character == '>',
+        .inline_code => character == '`',
+        .link_open => character == '[' or character == '(',
+        .link_close => character == ']' or character == ')',
+        .thematic_break => character == '-' or character == '*' or character == '_',
     };
 }
 
@@ -153,8 +381,7 @@ fn processMarkdownCandidate(
     input: []const u8,
     offset: usize,
     state: *MarkdownScanState,
-    indexes: *stage1.StructuralIndex,
-    kinds: []MarkdownTokenKind,
+    sink: anytype,
 ) void {
     const character = input[offset];
     if (character == '\r' or character == '\n') {
@@ -167,23 +394,23 @@ fn processMarkdownCandidate(
     if (state.skip_line) return;
 
     if (state.in_code_fence) {
-        processFenceCandidate(input, offset, state, indexes, kinds);
+        processFenceCandidate(input, offset, state, sink);
         return;
     }
 
     if (state.inline_code_run_remaining > 0) {
-        appendToken(indexes, kinds, offset, .inline_code);
+        sink.append(offset, .inline_code);
         state.inline_code_run_remaining -= 1;
         return;
     }
     if (state.line_marker_pending and !state.in_inline_code) {
-        if (processLineMarker(input, offset, state, indexes, kinds)) return;
+        if (processLineMarker(input, offset, state, sink)) return;
     }
 
     state.line_marker_pending = false;
     if (character == '`') {
         const run_length = scalarRunLength(input, offset, input.len, '`');
-        appendToken(indexes, kinds, offset, .inline_code);
+        sink.append(offset, .inline_code);
         state.inline_code_run_remaining = run_length - 1;
         if (state.in_inline_code) {
             if (run_length == state.inline_code_length) {
@@ -199,8 +426,8 @@ fn processMarkdownCandidate(
     if (state.in_inline_code) return;
 
     switch (character) {
-        '[', '(' => appendToken(indexes, kinds, offset, .link_open),
-        ']', ')' => appendToken(indexes, kinds, offset, .link_close),
+        '[', '(' => sink.append(offset, .link_open),
+        ']', ')' => sink.append(offset, .link_close),
         else => {},
     }
 }
@@ -209,8 +436,7 @@ fn processFenceCandidate(
     input: []const u8,
     offset: usize,
     state: *MarkdownScanState,
-    indexes: *stage1.StructuralIndex,
-    kinds: []MarkdownTokenKind,
+    sink: anytype,
 ) void {
     if (!state.line_marker_pending) return;
     if (input[offset] != state.fence_character) {
@@ -229,7 +455,7 @@ fn processFenceCandidate(
         return;
     }
 
-    appendToken(indexes, kinds, offset, .code_fence);
+    sink.append(offset, .code_fence);
     state.in_code_fence = false;
     state.fence_character = 0;
     state.fence_length = 0;
@@ -241,15 +467,14 @@ fn processLineMarker(
     input: []const u8,
     offset: usize,
     state: *MarkdownScanState,
-    indexes: *stage1.StructuralIndex,
-    kinds: []MarkdownTokenKind,
+    sink: anytype,
 ) bool {
     const character = input[offset];
     const line_end = scalarLineEnd(input, offset);
     if (character == '`' or character == '~') {
         const run_length = scalarRunLength(input, offset, line_end, character);
         if (run_length >= 3) {
-            appendToken(indexes, kinds, offset, .code_fence);
+            sink.append(offset, .code_fence);
             state.in_code_fence = true;
             state.in_inline_code = false;
             state.inline_code_length = 0;
@@ -265,22 +490,22 @@ fn processLineMarker(
     if ((character == '-' or character == '*' or character == '_') and
         scalarIsThematicBreak(input, offset, line_end, character))
     {
-        appendToken(indexes, kinds, offset, .thematic_break);
+        sink.append(offset, .thematic_break);
         state.line_marker_pending = false;
         return true;
     }
 
     switch (character) {
-        '#' => appendToken(indexes, kinds, offset, .heading),
-        '>' => appendToken(indexes, kinds, offset, .blockquote),
-        '-', '*', '+' => appendToken(indexes, kinds, offset, .list_item),
+        '#' => sink.append(offset, .heading),
+        '>' => sink.append(offset, .blockquote),
+        '-', '*', '+' => sink.append(offset, .list_item),
         '0'...'9' => {
             var digit_end = offset;
             while (digit_end < line_end and std.ascii.isDigit(input[digit_end])) {
                 digit_end += 1;
             }
             if (digit_end < line_end and input[digit_end] == '.') {
-                appendToken(indexes, kinds, offset, .list_item);
+                sink.append(offset, .list_item);
             } else {
                 state.line_marker_pending = false;
                 return false;
@@ -901,4 +1126,146 @@ test "Markdown SIMD and scalar parity survives adversarial candidate streams" {
     for (all_byte_lengths) |length| {
         try expectMatchesScalarOracle(all_bytes[0..length]);
     }
+}
+
+test "Markdown document tape preserves corpus Stage1 tokens" {
+    const input = @embedFile("../../test/corpus/markdown/document.md");
+    var index = try indexMarkdown(testing.allocator, input);
+    defer index.deinit(testing.allocator);
+    var document = try buildMarkdownTape(testing.allocator, input);
+    defer document.deinit(testing.allocator);
+
+    try testing.expectEqual(index.count, document.tape.len);
+    for (document.tape, 0..) |word, tape_index| {
+        try testing.expectEqual(index.kinds[tape_index], word.tapeKind());
+        try testing.expectEqual(index.indexes[tape_index], word.offset);
+    }
+}
+
+test "Markdown Stage2 accepts empty input and unclosed fences" {
+    try testing.expect((try validateMarkdown(testing.allocator, "")) == null);
+    var empty_document = try buildMarkdownTape(testing.allocator, "");
+    defer empty_document.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), empty_document.tape.len);
+
+    const input = "```zig\n# hidden [x](y)";
+    try testing.expect((try validateMarkdown(testing.allocator, input)) == null);
+    var document = try buildMarkdownTape(testing.allocator, input);
+    defer document.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), document.tape.len);
+    try testing.expectEqual(MarkdownTokenKind.code_fence, document.tape[0].tapeKind());
+    try testing.expectEqual(@as(u32, 0), document.tape[0].offset);
+}
+
+test "Markdown Stage2 rejects forged index count and tape size" {
+    var indexes = [_]u32{0};
+    var kinds = [_]MarkdownTokenKind{.heading};
+
+    const oversized_count = if (@sizeOf(usize) > @sizeOf(u32))
+        @as(usize, std.math.maxInt(u32)) + 1
+    else
+        std.math.maxInt(usize);
+    const oversized_tape = MarkdownStructuralIndex{
+        .indexes = &indexes,
+        .kinds = &kinds,
+        .count = oversized_count,
+    };
+    try testing.expectError(
+        error.TapeTooLarge,
+        validateMarkdownIndex("#", &oversized_tape),
+    );
+
+    const invalid_count = MarkdownStructuralIndex{
+        .indexes = &indexes,
+        .kinds = &kinds,
+        .count = 2,
+    };
+    const diagnostic = (try validateMarkdownIndex("#", &invalid_count)).?;
+    try testing.expectEqual(error.InvalidIndexCount, diagnostic.err);
+    try testing.expectEqual(@as(usize, 1), diagnostic.byte_offset);
+}
+
+test "Markdown Stage2 rejects forged out-of-range offsets" {
+    const input = "# heading";
+    var indexes = [_]u32{@intCast(input.len)};
+    var kinds = [_]MarkdownTokenKind{.heading};
+    const forged = MarkdownStructuralIndex{
+        .indexes = &indexes,
+        .kinds = &kinds,
+        .count = 1,
+    };
+
+    const diagnostic = (try validateMarkdownIndex(input, &forged)).?;
+    try testing.expectEqual(error.InvalidTokenIndex, diagnostic.err);
+    try testing.expectEqual(input.len, diagnostic.byte_offset);
+    try testing.expectEqual(@as(u32, 1), diagnostic.line);
+    try testing.expectEqual(@as(u32, @intCast(input.len + 1)), diagnostic.column);
+    try testing.expectEqual(@as(usize, 0), diagnostic.snippet_start);
+    try testing.expectEqualStrings(input, diagnostic.snippet);
+    try testing.expect(diagnostic.snippet.ptr == input.ptr);
+}
+
+test "Markdown Stage2 rejects forged non-increasing offsets" {
+    const input = "# >";
+    var indexes = [_]u32{ 2, 0 };
+    var kinds = [_]MarkdownTokenKind{ .blockquote, .heading };
+    const forged = MarkdownStructuralIndex{
+        .indexes = &indexes,
+        .kinds = &kinds,
+        .count = 2,
+    };
+
+    const diagnostic = (try validateMarkdownIndex(input, &forged)).?;
+    try testing.expectEqual(error.InvalidTokenOrder, diagnostic.err);
+    try testing.expectEqual(@as(usize, 0), diagnostic.byte_offset);
+}
+
+test "Markdown Stage2 rejects forged kind and source mismatches" {
+    const input = "\n  # heading";
+    var indexes = [_]u32{3};
+    var kinds = [_]MarkdownTokenKind{.blockquote};
+    const forged = MarkdownStructuralIndex{
+        .indexes = &indexes,
+        .kinds = &kinds,
+        .count = 1,
+    };
+
+    const diagnostic = (try validateMarkdownIndex(input, &forged)).?;
+    try testing.expectEqual(error.InvalidTokenKind, diagnostic.err);
+    try testing.expectEqual(@as(usize, 3), diagnostic.byte_offset);
+    try testing.expectEqual(@as(u32, 2), diagnostic.line);
+    try testing.expectEqual(@as(u32, 3), diagnostic.column);
+    try testing.expectEqual(@as(usize, 1), diagnostic.snippet_start);
+    try testing.expectEqualStrings("  # heading", diagnostic.snippet);
+    try testing.expect(diagnostic.snippet.ptr == input.ptr + diagnostic.snippet_start);
+}
+
+test "Markdown Stage2 rejects forged thematic break at list marker" {
+    const input = "- item\n";
+    var indexes = [_]u32{0};
+    var kinds = [_]MarkdownTokenKind{.thematic_break};
+    const forged = MarkdownStructuralIndex{
+        .indexes = &indexes,
+        .kinds = &kinds,
+        .count = 1,
+    };
+
+    const diagnostic = (try validateMarkdownIndex(input, &forged)).?;
+    try testing.expectEqual(error.InvalidTokenKind, diagnostic.err);
+    try testing.expectEqual(@as(usize, 0), diagnostic.byte_offset);
+}
+
+test "Markdown Stage2 rejects forged mid-line heading" {
+    const input = "text # heading\n";
+    var indexes = [_]u32{5};
+    var kinds = [_]MarkdownTokenKind{.heading};
+    const forged = MarkdownStructuralIndex{
+        .indexes = &indexes,
+        .kinds = &kinds,
+        .count = 1,
+    };
+
+    const diagnostic = (try validateMarkdownIndex(input, &forged)).?;
+    try testing.expectEqual(error.InvalidTokenKind, diagnostic.err);
+    try testing.expectEqual(@as(usize, 5), diagnostic.byte_offset);
 }

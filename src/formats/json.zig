@@ -102,7 +102,7 @@ pub fn buildJsonTape(
         return error.TapeTooLarge;
     };
     defer structural_index.deinit(allocator);
-    return stage2.buildTape(allocator, input, &structural_index);
+    return stage2.buildTape(allocator, input, &structural_index, .json);
 }
 
 /// Validates RFC JSON and returns the first semantic diagnostic, if any.
@@ -115,7 +115,7 @@ pub fn validateJson(
         return error.TapeTooLarge;
     };
     defer structural_index.deinit(allocator);
-    return stage2.validate(input, &structural_index);
+    return stage2.validate(input, &structural_index, .json);
 }
 
 pub fn indexJson(

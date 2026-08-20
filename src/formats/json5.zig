@@ -1,6 +1,7 @@
 const std = @import("std");
 const simd = @import("../core/simd.zig");
 const stage1 = @import("../core/stage1.zig");
+const stage2 = @import("../core/stage2.zig");
 const testing = std.testing;
 
 pub fn indexJson5(
@@ -8,6 +9,32 @@ pub fn indexJson5(
     input: []const u8,
 ) !stage1.StructuralIndex {
     return indexJson5Impl(simd.default_vector_len, allocator, input);
+}
+
+/// Builds an owned, validated JSON5 tape from the Stage1 structural index.
+pub fn buildJson5Tape(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+) stage2.BuildError!stage2.Document {
+    var structural_index = indexJson5(allocator, input) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return error.TapeTooLarge;
+    };
+    defer structural_index.deinit(allocator);
+    return stage2.buildTape(allocator, input, &structural_index, .json5);
+}
+
+/// Validates JSON5 and returns the first semantic diagnostic, if any.
+pub fn validateJson5(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+) stage2.ValidationError!?stage2.Diagnostic {
+    var structural_index = indexJson5(allocator, input) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return error.TapeTooLarge;
+    };
+    defer structural_index.deinit(allocator);
+    return stage2.validate(input, &structural_index, .json5);
 }
 
 pub fn indexJson5Impl(
@@ -86,11 +113,9 @@ pub fn indexJson5Impl(
             'z',
         ) | simd.matchRange(VLEN, chunk, 'A', 'Z') |
             simd.matchAny2(VLEN, chunk, '_', '$')) & valid_mask;
-        const atom_mask: Mask = (simd.matchByte(
-            VLEN,
-            chunk,
-            '-',
-        ) | simd.matchRange(VLEN, chunk, '0', '9') |
+        const atom_mask: Mask = (simd.matchAny2(VLEN, chunk, '-', '+') |
+            simd.matchByte(VLEN, chunk, '.') |
+            simd.matchRange(VLEN, chunk, '0', '9') |
             identifier_mask) & valid_mask;
         var trailing_backslash_parity = previous_backslash_run_odd;
 
@@ -126,7 +151,7 @@ pub fn indexJson5Impl(
             }
 
             if (in_single_comment) {
-                if (byte == '\n' or byte == '\r') {
+                if (json5LineTerminatorWidth(input, absolute_offset) != null) {
                     in_single_comment = false;
                     previous_atom_candidate = false;
                 }
@@ -243,7 +268,8 @@ fn isJson5AtomByte(
     byte_offset: usize,
 ) bool {
     return switch (byte) {
-        '-', '0'...'9', 'a'...'z', 'A'...'Z', '_', '$' => true,
+        '-', '+', '.', '0'...'9', 'a'...'z', 'A'...'Z', '_', '$' => true,
+        '\\' => byte_offset + 1 < input.len and input[byte_offset + 1] == 'u',
         0x80...0xbf => previous_atom_candidate,
         0xc0...0xff => !isJson5UnicodeWhitespace(input, byte_offset),
         else => false,
@@ -279,6 +305,25 @@ fn isJson5UnicodeWhitespace(input: []const u8, byte_offset: usize) bool {
     return false;
 }
 
+fn json5LineTerminatorWidth(input: []const u8, byte_offset: usize) ?usize {
+    if (byte_offset >= input.len) return null;
+    const byte = input[byte_offset];
+    if (byte == '\n') return 1;
+    if (byte == '\r') {
+        return if (byte_offset + 1 < input.len and input[byte_offset + 1] == '\n')
+            2
+        else
+            1;
+    }
+    if (byte == 0xe2 and byte_offset + 2 < input.len and
+        input[byte_offset + 1] == 0x80 and
+        (input[byte_offset + 2] == 0xa8 or input[byte_offset + 2] == 0xa9))
+    {
+        return 3;
+    }
+    return null;
+}
+
 fn scalarIndexJson5(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -311,7 +356,7 @@ fn scalarIndexJson5(
                 previous_atom_candidate = false;
             }
         } else if (in_single_comment) {
-            if (byte == '\n' or byte == '\r') {
+            if (json5LineTerminatorWidth(input, byte_offset) != null) {
                 in_single_comment = false;
                 previous_atom_candidate = false;
             }
@@ -450,6 +495,78 @@ test "indexJson5 implementations match scalar around vector boundaries" {
         line_input[VLEN * 2 .. VLEN * 2 + 5].* = "0xf,]".*;
         try expectJson5ImplMatchesScalar(VLEN, &line_input);
     }
+}
+
+test "JSON5 Stage2 builds extended values and raw views" {
+    const input =
+        "{unquoted:'single', escaped\\u004b:+.5, hex:-0x2A, inf:Infinity, nan:NaN, trailing:[1,2,],}";
+    var document = try buildJson5Tape(testing.allocator, input);
+    defer document.deinit(testing.allocator);
+
+    var cursor = try document.root(input);
+    try cursor.advance();
+    const raw_key = try cursor.rawValue();
+    try testing.expectEqualStrings("unquoted", raw_key);
+    try testing.expect(
+        raw_key.ptr == input.ptr + @as(usize, document.tape[cursor.position()].offset),
+    );
+    try cursor.advance();
+    const raw_string = try cursor.rawValue();
+    try testing.expectEqualStrings("single", raw_string);
+    try testing.expect(
+        raw_string.ptr ==
+            input.ptr + @as(usize, document.tape[cursor.position()].offset) + 1,
+    );
+    try testing.expect((try validateJson5(testing.allocator, input)) == null);
+    try cursor.advance();
+    const escaped_key = try cursor.rawValue();
+    try testing.expectEqualStrings("escaped\\u004b", escaped_key);
+    try testing.expect(
+        escaped_key.ptr ==
+            input.ptr + @as(usize, document.tape[cursor.position()].offset),
+    );
+    try cursor.advance();
+    const signed_number = try cursor.rawValue();
+    try testing.expectEqualStrings("+.5", signed_number);
+    try testing.expect(
+        signed_number.ptr ==
+            input.ptr + @as(usize, document.tape[cursor.position()].offset),
+    );
+    try cursor.advance();
+    try cursor.advance();
+    try testing.expectEqualStrings("-0x2A", try cursor.rawValue());
+    try cursor.advance();
+    try cursor.advance();
+    try testing.expectEqualStrings("Infinity", try cursor.rawValue());
+}
+
+test "JSON5 Stage2 reports numeric and identifier diagnostics" {
+    const invalid_number = try validateJson5(testing.allocator, "{value:01}");
+    if (invalid_number) |diagnostic| {
+        try testing.expectEqual(error.InvalidNumber, diagnostic.err);
+        try testing.expectEqual(@as(usize, 8), diagnostic.byte_offset);
+    } else {
+        return error.ExpectedDiagnostic;
+    }
+
+    const invalid_key = try validateJson5(testing.allocator, "{\\u0030foo:1}");
+    if (invalid_key) |diagnostic| {
+        try testing.expectEqual(error.UnexpectedToken, diagnostic.err);
+        try testing.expectEqual(@as(usize, 1), diagnostic.byte_offset);
+    } else {
+        return error.ExpectedDiagnostic;
+    }
+}
+
+test "JSON5 Stage2 accepts control whitespace and non-digit escapes" {
+    const input = [_]u8{
+        '{',  0x0b, 'k',  'e', 'y',  ':', 0x0c, '\'',
+        '\\', 'A',  '\\', 'C', '\\', '/', '\\', 'D',
+        '\\', 'C',  '\'', '}',
+    };
+    var document = try buildJson5Tape(testing.allocator, &input);
+    defer document.deinit(testing.allocator);
+    try testing.expect((try validateJson5(testing.allocator, &input)) == null);
 }
 
 test "refAllDecls" {
