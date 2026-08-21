@@ -693,6 +693,52 @@ fn expectOnDemandEvent(
     }
 }
 
+fn expectOnDemandRawStringEvent(
+    expected_raw: []const u8,
+    actual: lib.ondemand.Event,
+) !void {
+    try expectOnDemandEvent(.{ .string = expected_raw }, actual);
+    switch (actual) {
+        .string => |raw| try testing.expect(raw.ptr == expected_raw.ptr),
+        else => unreachable,
+    }
+}
+
+fn expectOnDemandStringDocument(
+    input: []const u8,
+    expected_raw: []const u8,
+) !void {
+    var parser = try lib.ondemand.Parser.init(testing.allocator, input.len);
+    defer parser.deinit();
+
+    var document = try lib.formats.json.initOnDemandDocument(&parser, input);
+    defer document.deinit();
+    var reader = try document.eventReader();
+
+    const event = (try reader.next()) orelse return error.TestUnexpectedResult;
+    try expectOnDemandRawStringEvent(expected_raw, event);
+    try testing.expect((try reader.next()) == null);
+}
+
+fn expectOnDemandErrorAfterEvents(
+    input: []const u8,
+    expected_events: []const lib.ondemand.Event,
+    expected_error: anyerror,
+) !void {
+    var parser = try lib.ondemand.Parser.init(testing.allocator, input.len);
+    defer parser.deinit();
+
+    var document = try lib.formats.json.initOnDemandDocument(&parser, input);
+    defer document.deinit();
+    var reader = try document.eventReader();
+
+    for (expected_events) |expected| {
+        const event = (try reader.next()) orelse return error.TestUnexpectedResult;
+        try expectOnDemandEvent(expected, event);
+    }
+    try testing.expectError(expected_error, reader.next());
+}
+
 test "on-demand Parser emits JSON events from quote-aware indexes" {
     const input =
         \\{"syntax{}[],:":"text { [ ] } , :","items":[42,true,false,null]}
@@ -745,6 +791,333 @@ test "on-demand EventReader skips one nested JSON value" {
     try expectOnDemandEvent(.null, (try reader.next()).?);
     try expectOnDemandEvent(.object_end, (try reader.next()).?);
     try testing.expect((try reader.next()) == null);
+}
+
+test "on-demand EventReader preserves long ASCII raw string slices" {
+    const raw_len = 1024;
+    var input: [raw_len + 2]u8 = undefined;
+    input[0] = '"';
+    @memset(input[1 .. input.len - 1], 'a');
+    input[input.len - 1] = '"';
+
+    try expectOnDemandStringDocument(&input, input[1 .. input.len - 1]);
+}
+
+test "on-demand EventReader scans quotes and backslashes at SIMD boundaries" {
+    const widths = [_]usize{ 16, 32, 64, 128, 256, 512 };
+
+    inline for (widths) |width| {
+        const boundary_offsets = [_]usize{ width - 1, width, width + 1 };
+        inline for (boundary_offsets) |boundary_offset| {
+            var quote_input: [520]u8 = undefined;
+            const quote_input_len = boundary_offset + 1;
+            @memset(quote_input[0..quote_input_len], 'a');
+            quote_input[0] = '"';
+            quote_input[boundary_offset] = '"';
+            try expectOnDemandStringDocument(
+                quote_input[0..quote_input_len],
+                quote_input[1..boundary_offset],
+            );
+
+            var backslash_input: [520]u8 = undefined;
+            const closing_quote_offset = boundary_offset + 3;
+            const backslash_input_len = closing_quote_offset + 1;
+            @memset(backslash_input[0..backslash_input_len], 'a');
+            backslash_input[0] = '"';
+            backslash_input[boundary_offset] = '\\';
+            backslash_input[boundary_offset + 1] = '"';
+            backslash_input[boundary_offset + 2] = 'z';
+            backslash_input[closing_quote_offset] = '"';
+            try expectOnDemandStringDocument(
+                backslash_input[0..backslash_input_len],
+                backslash_input[1..closing_quote_offset],
+            );
+        }
+    }
+}
+
+test "on-demand EventReader rejects raw controls and malformed escapes" {
+    const cases = [_]struct {
+        input: []const u8,
+        expected_error: anyerror,
+    }{
+        .{ .input = "\"\x00\"", .expected_error = error.InvalidEscape },
+        .{ .input = "\"\x1f\"", .expected_error = error.InvalidEscape },
+        .{ .input = "\"\n\"", .expected_error = error.InvalidEscape },
+        .{ .input = "\"\\q\"", .expected_error = error.InvalidEscape },
+        .{ .input = "\"\\u12G4\"", .expected_error = error.InvalidEscape },
+        .{ .input = "\"\\u123\"", .expected_error = error.InvalidEscape },
+    };
+
+    for (cases) |case| {
+        try expectOnDemandErrorAfterEvents(
+            case.input,
+            &.{},
+            case.expected_error,
+        );
+    }
+}
+
+test "on-demand EventReader accepts multibyte UTF-8 across SIMD boundaries" {
+    const widths = [_]usize{ 16, 32, 64, 128, 256, 512 };
+    const sequences = [_][]const u8{
+        "\xc2\xa2",
+        "\xe2\x82\xac",
+        "\xf0\x9f\x98\x80",
+    };
+
+    inline for (widths) |width| {
+        for (sequences) |sequence| {
+            var input: [520]u8 = undefined;
+            const sequence_start = width - 1;
+            const closing_quote_offset = sequence_start + sequence.len;
+            const input_len = closing_quote_offset + 1;
+            @memset(input[0..input_len], 'a');
+            input[0] = '"';
+            @memcpy(
+                input[sequence_start..closing_quote_offset],
+                sequence,
+            );
+            input[closing_quote_offset] = '"';
+
+            try expectOnDemandStringDocument(
+                input[0..input_len],
+                input[1..closing_quote_offset],
+            );
+        }
+    }
+}
+
+test "on-demand EventReader rejects invalid UTF-8 across SIMD boundaries" {
+    const widths = [_]usize{ 16, 32, 64, 128, 256, 512 };
+    const invalid_sequences = [_][]const u8{
+        &.{0x80},
+        &.{ 0xc0, 0xaf },
+        &.{ 0xe2, 0x82 },
+        &.{ 0xed, 0xa0, 0x80 },
+        &.{ 0xf4, 0x90, 0x80, 0x80 },
+    };
+
+    inline for (widths) |width| {
+        for (invalid_sequences) |sequence| {
+            var input: [520]u8 = undefined;
+            const sequence_start = width - 1;
+            const closing_quote_offset = sequence_start + sequence.len;
+            const input_len = closing_quote_offset + 1;
+            @memset(input[0..input_len], 'a');
+            input[0] = '"';
+            @memcpy(
+                input[sequence_start..closing_quote_offset],
+                sequence,
+            );
+            input[closing_quote_offset] = '"';
+
+            try expectOnDemandErrorAfterEvents(
+                input[0..input_len],
+                &.{},
+                error.InvalidUtf8,
+            );
+        }
+    }
+}
+
+test "on-demand EventReader reports string syntax before UTF-8 errors" {
+    const cases = [_]struct {
+        input: []const u8,
+        expected_error: anyerror,
+    }{
+        .{
+            .input = &.{ '"', 0x80, '\\', 'q', '"' },
+            .expected_error = error.InvalidEscape,
+        },
+        .{
+            .input = &.{ '"', '\\', 'q', 0x80, '"' },
+            .expected_error = error.InvalidEscape,
+        },
+        .{
+            .input = &.{ '"', 0x80, 0x1f, '"' },
+            .expected_error = error.InvalidEscape,
+        },
+        .{
+            .input = &.{ '"', 0x80 },
+            .expected_error = error.UnterminatedString,
+        },
+    };
+
+    for (cases) |case| {
+        try expectOnDemandErrorAfterEvents(
+            case.input,
+            &.{},
+            case.expected_error,
+        );
+    }
+}
+
+test "on-demand EventReader preserves valid events before string errors" {
+    const input = "{\"ok\":\"value\",\"bad\":\"\\q\"}";
+    var parser = try lib.ondemand.Parser.init(testing.allocator, input.len);
+    defer parser.deinit();
+
+    var document = try lib.formats.json.initOnDemandDocument(&parser, input);
+    defer document.deinit();
+    var reader = try document.eventReader();
+
+    try expectOnDemandEvent(.object_start, (try reader.next()).?);
+    try expectOnDemandEvent(.{ .key = "ok" }, (try reader.next()).?);
+    try expectOnDemandRawStringEvent(input[7..12], (try reader.next()).?);
+    try expectOnDemandEvent(.{ .key = "bad" }, (try reader.next()).?);
+    try testing.expectError(error.InvalidEscape, reader.next());
+}
+
+fn appendBoundaryTestBytes(
+    buffer: []u8,
+    length: *usize,
+    bytes: []const u8,
+) void {
+    std.debug.assert(length.* <= buffer.len);
+    std.debug.assert(bytes.len <= buffer.len - length.*);
+    @memcpy(buffer[length.*..][0..bytes.len], bytes);
+    length.* += bytes.len;
+}
+
+fn appendBoundaryTestWhitespace(
+    buffer: []u8,
+    length: *usize,
+    count: usize,
+) void {
+    const whitespace = " \t\n\r";
+    std.debug.assert(length.* <= buffer.len);
+    std.debug.assert(count <= buffer.len - length.*);
+    for (buffer[length.*..][0..count], 0..) |*byte, index| {
+        byte.* = whitespace[index % whitespace.len];
+    }
+    length.* += count;
+}
+
+fn expectOnDemandEvents(
+    input: []const u8,
+    expected_events: []const lib.ondemand.Event,
+) !void {
+    var parser = try lib.ondemand.Parser.init(testing.allocator, input.len);
+    defer parser.deinit();
+
+    var document = try lib.formats.json.initOnDemandDocument(&parser, input);
+    defer document.deinit();
+    var reader = try document.eventReader();
+
+    for (expected_events) |expected| {
+        const actual = (try reader.next()) orelse return error.TestUnexpectedResult;
+        try expectOnDemandEvent(expected, actual);
+    }
+    try testing.expect((try reader.next()) == null);
+}
+
+test "on-demand EventReader preserves events across long whitespace boundaries" {
+    const widths = [_]usize{ 16, 32, 64, 128, 256, 512 };
+    const expected_events = [_]lib.ondemand.Event{
+        .object_start,
+        .{ .key = "outer" },
+        .array_start,
+        .{ .number = "0" },
+        .{ .number = "1" },
+        .array_end,
+        .object_end,
+    };
+
+    for (widths) |width| {
+        const gap_lengths = [_]usize{ width - 1, width, width + 1 };
+        for (gap_lengths) |gap_length| {
+            var input_buffer: [2600]u8 = undefined;
+            var input_length: usize = 0;
+            appendBoundaryTestWhitespace(&input_buffer, &input_length, gap_length);
+            appendBoundaryTestBytes(&input_buffer, &input_length, "{\"outer\"");
+            appendBoundaryTestWhitespace(&input_buffer, &input_length, gap_length);
+            appendBoundaryTestBytes(&input_buffer, &input_length, ":[0");
+            appendBoundaryTestWhitespace(&input_buffer, &input_length, gap_length);
+            appendBoundaryTestBytes(&input_buffer, &input_length, ",1");
+            appendBoundaryTestWhitespace(&input_buffer, &input_length, gap_length);
+            appendBoundaryTestBytes(&input_buffer, &input_length, "]");
+            appendBoundaryTestWhitespace(&input_buffer, &input_length, gap_length);
+            appendBoundaryTestBytes(&input_buffer, &input_length, "}");
+
+            try expectOnDemandEvents(input_buffer[0..input_length], &expected_events);
+        }
+    }
+}
+
+test "on-demand EventReader rejects non-whitespace at block boundaries" {
+    const widths = [_]usize{ 16, 32, 64, 128, 256, 512 };
+    const positions = [_]struct {
+        prefix: []const u8,
+        suffix: []const u8,
+        expected_events: []const lib.ondemand.Event,
+    }{
+        .{
+            .prefix = "",
+            .suffix = " {}",
+            .expected_events = &.{},
+        },
+        .{
+            .prefix = "{\"outer\"",
+            .suffix = " :0}",
+            .expected_events = &.{
+                .object_start,
+                .{ .key = "outer" },
+            },
+        },
+        .{
+            .prefix = "[0",
+            .suffix = " ,1]",
+            .expected_events = &.{
+                .array_start,
+                .{ .number = "0" },
+            },
+        },
+        .{
+            .prefix = "{\"outer\":0",
+            .suffix = " }",
+            .expected_events = &.{
+                .object_start,
+                .{ .key = "outer" },
+                .{ .number = "0" },
+            },
+        },
+        .{
+            .prefix = "[0",
+            .suffix = " ]",
+            .expected_events = &.{
+                .array_start,
+                .{ .number = "0" },
+            },
+        },
+    };
+    const invalid_bytes = [_]struct {
+        byte: u8,
+        expected_error: anyerror,
+    }{
+        .{ .byte = '@', .expected_error = error.UnexpectedToken },
+        .{ .byte = '+', .expected_error = error.InvalidNumber },
+    };
+
+    for (widths) |width| {
+        for (positions) |position| {
+            for (invalid_bytes) |invalid| {
+                var input_buffer: [540]u8 = undefined;
+                var input_length: usize = 0;
+                appendBoundaryTestBytes(&input_buffer, &input_length, position.prefix);
+                appendBoundaryTestWhitespace(&input_buffer, &input_length, width);
+                input_buffer[input_length] = invalid.byte;
+                input_length += 1;
+                appendBoundaryTestBytes(&input_buffer, &input_length, position.suffix);
+
+                try expectOnDemandErrorAfterEvents(
+                    input_buffer[0..input_length],
+                    position.expected_events,
+                    invalid.expected_error,
+                );
+            }
+        }
+    }
 }
 
 fn expectJsonStreamParity(

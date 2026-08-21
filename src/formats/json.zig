@@ -418,6 +418,84 @@ test "indexJson width differential covers vector boundaries" {
     }
 }
 
+test "indexJson matches scalar for sparse and dense masks at wide widths" {
+    inline for ([_]usize{ 16, 32, 64, 128, 256, 512 }) |vlen| {
+        const input_length = 2 * vlen + 3;
+
+        var sparse: [2 * 512 + 3]u8 = @splat(' ');
+        sparse[0] = '{';
+        sparse[vlen - 1] = '[';
+        sparse[vlen] = ']';
+        sparse[vlen + 1] = ':';
+        sparse[2 * vlen - 1] = ',';
+        sparse[2 * vlen] = '}';
+        sparse[input_length - 1] = 'n';
+        try expectMatchesScalarAtWidth(vlen, sparse[0..input_length]);
+
+        const structural_bytes = "{[,:]}";
+        var dense: [2 * 512 + 3]u8 = undefined;
+        for (dense[0..input_length], 0..) |*byte, offset| {
+            byte.* = structural_bytes[offset % structural_bytes.len];
+        }
+        try expectMatchesScalarAtWidth(vlen, dense[0..input_length]);
+    }
+}
+
+test "indexJson matches scalar for quote runs crossing wide boundaries" {
+    inline for ([_]usize{ 16, 32, 64, 128, 256, 512 }) |vlen| {
+        inline for ([_]usize{ vlen, 2 * vlen }) |boundary| {
+            for (4..10) |run_length| {
+                var input: [2 * 512 + 16]u8 = @splat(' ');
+                input[0] = '[';
+
+                const run_start = boundary - 3;
+                for (run_start..run_start + run_length) |offset| {
+                    input[offset] = '"';
+                }
+
+                var next_offset = run_start + run_length;
+                if (run_length % 2 != 0) {
+                    input[next_offset] = '"';
+                    next_offset += 1;
+                }
+                input[next_offset] = '0';
+                input[next_offset + 1] = ']';
+                try expectMatchesScalarAtWidth(vlen, input[0 .. next_offset + 2]);
+            }
+        }
+    }
+}
+
+test "indexJson matches scalar for backslash runs crossing wide boundaries" {
+    inline for ([_]usize{ 16, 32, 64, 128, 256, 512 }) |vlen| {
+        inline for ([_]usize{ vlen, 2 * vlen }) |boundary| {
+            for (1..5) |left_count| {
+                for (1..5) |right_count| {
+                    var input: [2 * 512 + 16]u8 = @splat(' ');
+                    input[0] = '[';
+                    input[1] = '"';
+
+                    const run_start = boundary - left_count;
+                    const quote_offset = boundary + right_count;
+                    for (run_start..quote_offset) |offset| {
+                        input[offset] = '\\';
+                    }
+                    input[quote_offset] = '"';
+
+                    var next_offset = quote_offset + 1;
+                    if ((left_count + right_count) % 2 != 0) {
+                        input[next_offset] = '"';
+                        next_offset += 1;
+                    }
+                    input[next_offset] = '0';
+                    input[next_offset + 1] = ']';
+                    try expectMatchesScalarAtWidth(vlen, input[0 .. next_offset + 2]);
+                }
+            }
+        }
+    }
+}
+
 test "indexJson matches scalar structural indexes" {
     // The scalar implementation defines the byte-exact Stage 1 contract.
     const cases = [_][]const u8{

@@ -1,4 +1,5 @@
 const std = @import("std");
+const simd = @import("simd.zig");
 const stage1 = @import("stage1.zig");
 
 const testing = std.testing;
@@ -442,7 +443,7 @@ pub const EventReader = struct {
         while (separator_steps <= self.cursor.document.token_count) : (separator_steps += 1) {
             const token = try self.cursor.peek() orelse return self.finishDocument();
             try self.consumeWhitespaceBefore(token.offset);
-            _ = (try self.cursor.advance()).?;
+            try self.advanceLoaded(token);
             self.byte_position = @intCast(token.offset);
             self.byte_position += 1;
             switch (token.byte) {
@@ -462,6 +463,13 @@ pub const EventReader = struct {
             }
         }
         return error.UnexpectedToken;
+    }
+
+    fn advanceLoaded(self: *EventReader, token: Token) Error!void {
+        try self.cursor.ensureFocused();
+        try self.cursor.applyDepth(token.byte);
+        self.cursor.expected_position += 1;
+        self.cursor.document.position_index = self.cursor.expected_position;
     }
 
     fn openContainer(
@@ -631,9 +639,31 @@ pub const EventReader = struct {
     fn consumeWhitespaceBefore(self: *EventReader, offset: u32) Error!void {
         const target: usize = @intCast(offset);
         if (target < self.byte_position) return error.InvalidStructuralIndex;
+
+        const input = self.cursor.document.input;
+        if (target > input.len) return error.InvalidStructuralIndex;
+        const VLEN = simd.default_vector_len;
+        const Mask = simd.Mask(VLEN);
+
+        while (target - self.byte_position >= VLEN) {
+            const block: simd.Vec(VLEN, u8) =
+                input[self.byte_position..target][0..VLEN].*;
+            const whitespace_mask: Mask =
+                simd.matchAny4(VLEN, block, ' ', '\t', '\n', '\r');
+            const candidate_mask: Mask = ~whitespace_mask;
+            if (candidate_mask == 0) {
+                self.byte_position += VLEN;
+                continue;
+            }
+
+            const candidate_offset: usize = @intCast(@ctz(candidate_mask));
+            self.byte_position += candidate_offset;
+            break;
+        }
+
         while (self.byte_position < target) : (self.byte_position += 1) {
-            if (!isWhitespace(self.cursor.document.input[self.byte_position])) {
-                return classifyUnindexed(self.cursor.document.input[self.byte_position]);
+            if (!isWhitespace(input[self.byte_position])) {
+                return classifyUnindexed(input[self.byte_position]);
             }
         }
     }
@@ -725,11 +755,48 @@ fn validateString(input: []const u8, quote_offset: u32) Error!StringToken {
 
     const content_start = quote + 1;
     var index = content_start;
+    const VLEN = simd.default_vector_len;
+    const Mask = simd.Mask(VLEN);
+    const Shift = std.math.Log2Int(Mask);
+    var has_high_bit = false;
     while (index < input.len) {
+        if (input.len - index >= VLEN) {
+            const block: simd.Vec(VLEN, u8) = input[index..][0..VLEN].*;
+            const candidate_mask: Mask =
+                simd.matchAny2(VLEN, block, '"', '\\') |
+                simd.matchRange(VLEN, block, 0, 0x1f);
+            if (candidate_mask == 0) {
+                has_high_bit = has_high_bit or simd.matchRange(VLEN, block, 0x80, 0xff) != 0;
+                index += VLEN;
+                continue;
+            }
+
+            const candidate_offset: usize = @intCast(@ctz(candidate_mask));
+            const candidate_index = index + candidate_offset;
+            const prefix_mask: Mask =
+                (@as(Mask, 1) << @as(Shift, @intCast(candidate_offset))) - 1;
+            const high_bit_mask: Mask = simd.matchRange(VLEN, block, 0x80, 0xff);
+            has_high_bit = has_high_bit or (high_bit_mask & prefix_mask) != 0;
+            if (input[candidate_index] == '"') {
+                const content = input[content_start..candidate_index];
+                if (has_high_bit and !std.unicode.utf8ValidateSlice(content)) {
+                    return error.InvalidUtf8;
+                }
+                return .{
+                    .content_start = content_start,
+                    .content_end = candidate_index,
+                    .end_offset = candidate_index + 1,
+                };
+            }
+            index = candidate_index;
+        }
+
         const byte = input[index];
         if (byte == '"') {
             const content = input[content_start..index];
-            if (!std.unicode.utf8ValidateSlice(content)) return error.InvalidUtf8;
+            if (has_high_bit and !std.unicode.utf8ValidateSlice(content)) {
+                return error.InvalidUtf8;
+            }
             return .{
                 .content_start = content_start,
                 .content_end = index,
@@ -738,6 +805,7 @@ fn validateString(input: []const u8, quote_offset: u32) Error!StringToken {
         }
         if (byte < 0x20) return error.InvalidEscape;
         if (byte != '\\') {
+            if (byte >= 0x80) has_high_bit = true;
             index += 1;
             continue;
         }

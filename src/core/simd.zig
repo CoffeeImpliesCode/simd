@@ -179,6 +179,14 @@ pub fn extractBitIndexes(
 
     var mask = bitmask;
     var written: usize = 0;
+    inline for (0..4) |_| {
+        if (mask != 0 and written < out_indexes.len) {
+            const bit_pos: usize = @ctz(mask);
+            out_indexes[written] = @intCast(base_offset + bit_pos);
+            written += 1;
+            mask &= mask - 1;
+        }
+    }
     while (mask != 0 and written < out_indexes.len) {
         const bit_pos: usize = @ctz(mask);
         out_indexes[written] = @intCast(base_offset + bit_pos);
