@@ -83,9 +83,32 @@ pub fn windows(
     return ChunkIterator(T, len, fill != null).init(data, fill);
 }
 
+const PrefixXorPclmul = struct {
+    fn multiply(bitmask: u64) u64 {
+        const product = asm (
+            \\ vpclmulqdq $0x00, %[bitmask], %[ones], %[out]
+            : [out] "=x" (-> @Vector(2, u64)),
+            : [bitmask] "x" (@as(@Vector(2, u64), @bitCast(@as(u128, bitmask)))),
+              [ones] "x" (@as(@Vector(2, u64), @bitCast(@as(u128, std.math.maxInt(u64))))),
+        );
+        return @truncate(@as(u128, @bitCast(product)));
+    }
+};
+
 pub fn prefixXor(comptime T: type, bitmask: T) T {
     const bits = @typeInfo(T).int.bits;
     comptime assert(bits > 0);
+    if (comptime bits <= 64 and
+        builtin.cpu.arch == .x86_64 and
+        builtin.zig_backend != .stage2_c and
+        builtin.cpu.has(.x86, .avx) and
+        builtin.cpu.has(.x86, .pclmul))
+    {
+        const Unsigned = @Int(.unsigned, bits);
+        const extended: u64 = @as(Unsigned, @bitCast(bitmask));
+        const prefix = PrefixXorPclmul.multiply(extended);
+        return @bitCast(@as(Unsigned, @truncate(prefix)));
+    }
     var x = bitmask;
     const steps = @typeInfo(std.math.Log2Int(T)).int.bits;
     inline for (0..steps) |step| {
@@ -412,8 +435,11 @@ fn utf8BlockIsValid(
 
 fn utf8SuspectOffset(comptime len: usize, input: []const u8) ?usize {
     comptime {
-        if (len < 3) {
-            @compileError("UTF-8 SIMD vector width must be at least 3 bytes");
+        if (len < 4) {
+            @compileError(
+                "UTF-8 SIMD vector width must be at least 4 bytes for four-byte UTF-8 " ++
+                    "and mask-shift algorithms",
+            );
         }
     }
     var state: Utf8BlockState = .{};
@@ -459,11 +485,8 @@ fn validateUtf8Replay(input: []const u8, suspect_offset: usize) Utf8Result {
 }
 
 pub fn validateUtf8WithWidth(comptime len: usize, input: []const u8) Utf8Result {
-    comptime {
-        if (len < 3) {
-            @compileError("UTF-8 SIMD vector width must be at least 3 bytes");
-        }
-    }
+    if (comptime len < 4) return validateUtf8Scalar(input);
+
     // SIMD identifies a suspect block; scalar replay establishes the first
     // failure class and offset without exposing internal mask bits.
     const suspect_offset = utf8SuspectOffset(len, input) orelse return .valid;
@@ -525,6 +548,22 @@ fn expectUtf8InvalidSequenceAtBoundary(
         expected,
         validateUtf8WithWidth(width, input[0 .. start + sequence.len]),
     );
+}
+
+test "UTF-8 widths below four match scalar validation" {
+    const cases = [_][]const u8{
+        "ASCII only",
+        &[_]u8{ 0xf0, 0x90, 0x8d, 0x88 },
+        &[_]u8{ 'x', 0x80 },
+        &[_]u8{ 'x', 0xf0, 0x90, 0x8d },
+    };
+
+    for (cases) |input| {
+        const expected = validateUtf8Scalar(input);
+        inline for ([_]usize{ 1, 2, 3 }) |width| {
+            try testing.expectEqual(expected, validateUtf8WithWidth(width, input));
+        }
+    }
 }
 
 test "UTF-8 accepts ASCII and valid sequences at every SIMD width" {
@@ -693,6 +732,102 @@ test "UTF-8 carries valid and invalid sequences across SIMD blocks" {
 
 test "refAllDecls" {
     testing.refAllDecls(@This());
+}
+
+fn scalarPrefixXor(comptime T: type, bitmask: T) T {
+    comptime validateMaskType(T);
+
+    const bit_count: usize = @typeInfo(T).int.bits;
+    const Shift = std.math.Log2Int(T);
+    const one: T = 1;
+    var parity = false;
+    var result: T = 0;
+    var bit_index: usize = 0;
+    while (bit_index < bit_count) : (bit_index += 1) {
+        const bit = (bitmask & (one << @as(Shift, @intCast(bit_index)))) != 0;
+        parity = parity != bit;
+        if (parity) result |= one << @as(Shift, @intCast(bit_index));
+    }
+    return result;
+}
+
+fn prefixXorAlternatingMask(comptime T: type, comptime even_bits_set: bool) T {
+    comptime validateMaskType(T);
+
+    const bit_count: usize = @typeInfo(T).int.bits;
+    const Shift = std.math.Log2Int(T);
+    const one: T = 1;
+    var mask: T = 0;
+    inline for (0..bit_count) |bit_index| {
+        if ((bit_index % 2 == 0) == even_bits_set) {
+            mask |= one << @as(Shift, @intCast(bit_index));
+        }
+    }
+    return mask;
+}
+
+fn prefixXorQuotePairMask(
+    comptime T: type,
+    comptime first_bit_index: usize,
+    comptime second_bit_index: usize,
+) T {
+    comptime validateMaskType(T);
+    const bit_count: usize = @typeInfo(T).int.bits;
+    const Shift = std.math.Log2Int(T);
+    comptime assert(first_bit_index < second_bit_index);
+    comptime assert(second_bit_index < bit_count);
+
+    const one: T = 1;
+    return (one << @as(Shift, @intCast(first_bit_index))) |
+        (one << @as(Shift, @intCast(second_bit_index)));
+}
+
+fn expectPrefixXorMask(comptime T: type, bitmask: T) !void {
+    const expected = scalarPrefixXor(T, bitmask);
+    const actual = prefixXor(T, bitmask);
+    try testing.expectEqual(expected, actual);
+}
+
+fn expectPrefixXorMasks(comptime T: type) !void {
+    comptime validateMaskType(T);
+
+    const bit_count: usize = @typeInfo(T).int.bits;
+    const one: T = 1;
+    try expectPrefixXorMask(T, 0);
+    try expectPrefixXorMask(T, std.math.maxInt(T));
+    try expectPrefixXorMask(T, prefixXorAlternatingMask(T, true));
+    try expectPrefixXorMask(T, prefixXorAlternatingMask(T, false));
+    const Shift = std.math.Log2Int(T);
+    inline for ([_]usize{ 0, bit_count / 2, bit_count - 1 }) |bit_index| {
+        try expectPrefixXorMask(T, one << @as(Shift, @intCast(bit_index)));
+    }
+
+    if (bit_count > 1) {
+        try expectPrefixXorMask(T, prefixXorQuotePairMask(T, 0, 1));
+        try expectPrefixXorMask(
+            T,
+            prefixXorQuotePairMask(T, bit_count - 2, bit_count - 1),
+        );
+        try expectPrefixXorMask(T, prefixXorQuotePairMask(T, 0, bit_count - 1));
+    }
+
+    inline for ([_]usize{ 1, 2, 4, 8, 16, 32, 64, 128, 256 }) |boundary| {
+        if (boundary < bit_count) {
+            try expectPrefixXorMask(
+                T,
+                prefixXorQuotePairMask(T, boundary - 1, boundary),
+            );
+        }
+    }
+}
+
+test "prefixXor matches scalar prefix parity across arbitrary mask widths" {
+    inline for ([_]usize{
+        1,  2,  3,  7,   8,   15,  16,  31,  32,
+        63, 64, 65, 127, 128, 255, 256, 511, 512,
+    }) |bit_count| {
+        try expectPrefixXorMasks(Mask(bit_count));
+    }
 }
 
 fn scalarBackslashRunParity(

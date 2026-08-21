@@ -645,12 +645,20 @@ pub const EventReader = struct {
         if (target > input.len) return error.InvalidStructuralIndex;
         const VLEN = simd.default_vector_len;
         const Mask = simd.Mask(VLEN);
+        const Vec = simd.Vec(VLEN, u8);
 
         while (target - self.byte_position >= VLEN) {
-            const block: simd.Vec(VLEN, u8) =
-                input[self.byte_position..target][0..VLEN].*;
-            const whitespace_mask: Mask =
-                simd.matchAny4(VLEN, block, ' ', '\t', '\n', '\r');
+            const block: Vec = input[self.byte_position..target][0..VLEN].*;
+
+            // Subtraction maps tab, LF, and CR to 0, 1, and 4.
+            // Folding bit 1 into bit 2 maps VT and FF from 2/3 to 6/7,
+            // so the comparison accepts only JSON control whitespace.
+            const distance_from_tab = block -% @as(Vec, @splat(0x09));
+            const folded_distance = distance_from_tab |
+                ((distance_from_tab & @as(Vec, @splat(0x02))) << @as(Vec, @splat(1)));
+            const control_whitespace = folded_distance <= @as(Vec, @splat(0x04));
+            const whitespace = control_whitespace | (block == @as(Vec, @splat(0x20)));
+            const whitespace_mask: Mask = @bitCast(whitespace);
             const candidate_mask: Mask = ~whitespace_mask;
             if (candidate_mask == 0) {
                 self.byte_position += VLEN;
@@ -784,8 +792,11 @@ fn validateString(input: []const u8, quote_offset: u32) Error!StringToken {
             has_high_bit = has_high_bit or (high_bit_mask & prefix_mask) != 0;
             if (input[candidate_index] == '"') {
                 const content = input[content_start..candidate_index];
-                if (has_high_bit and !std.unicode.utf8ValidateSlice(content)) {
-                    return error.InvalidUtf8;
+                if (has_high_bit) {
+                    switch (simd.validateUtf8(content)) {
+                        .valid => {},
+                        .invalid => return error.InvalidUtf8,
+                    }
                 }
                 return .{
                     .content_start = content_start,
@@ -801,8 +812,11 @@ fn validateString(input: []const u8, quote_offset: u32) Error!StringToken {
         const byte = input[index];
         if (byte == '"') {
             const content = input[content_start..index];
-            if (has_high_bit and !std.unicode.utf8ValidateSlice(content)) {
-                return error.InvalidUtf8;
+            if (has_high_bit) {
+                switch (simd.validateUtf8(content)) {
+                    .valid => {},
+                    .invalid => return error.InvalidUtf8,
+                }
             }
             return .{
                 .content_start = content_start,

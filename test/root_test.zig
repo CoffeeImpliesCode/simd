@@ -1120,6 +1120,72 @@ test "on-demand EventReader rejects non-whitespace at block boundaries" {
     }
 }
 
+test "on-demand EventReader accepts exact JSON whitespace around block boundaries" {
+    const widths = [_]usize{ 1, 3, 7, 16, 31, 32, 63, 64, 65, 128, 256, 512 };
+    const whitespace_bytes = [_]u8{ 0x09, 0x0a, 0x0d, 0x20 };
+    const expected_events = [_]lib.ondemand.Event{
+        .object_start,
+        .{ .key = "x" },
+        .{ .number = "0" },
+        .object_end,
+    };
+
+    for (widths) |width| {
+        const candidate_offsets = [_]usize{ width - 1, width, width + 1 };
+        for (candidate_offsets) |candidate_offset| {
+            for (whitespace_bytes) |whitespace_byte| {
+                var input_buffer: [528]u8 = undefined;
+                var input_length: usize = 0;
+                appendBoundaryTestBytes(&input_buffer, &input_length, "{\"x\"");
+                appendBoundaryTestWhitespace(
+                    &input_buffer,
+                    &input_length,
+                    candidate_offset,
+                );
+                input_buffer[input_length] = whitespace_byte;
+                input_length += 1;
+                appendBoundaryTestBytes(&input_buffer, &input_length, ":0}");
+
+                try expectOnDemandEvents(input_buffer[0..input_length], &expected_events);
+            }
+        }
+    }
+}
+
+test "on-demand EventReader rejects nearby bytes around whitespace block boundaries" {
+    const widths = [_]usize{ 1, 3, 7, 16, 31, 32, 63, 64, 65, 128, 256, 512 };
+    const non_whitespace_bytes = [_]u8{ 0x0b, 0x0c, 0x1f, 0x21, 0x80 };
+    const expected_events = [_]lib.ondemand.Event{
+        .object_start,
+        .{ .key = "x" },
+    };
+
+    for (widths) |width| {
+        const candidate_offsets = [_]usize{ width - 1, width, width + 1 };
+        for (candidate_offsets) |candidate_offset| {
+            for (non_whitespace_bytes) |non_whitespace_byte| {
+                var input_buffer: [528]u8 = undefined;
+                var input_length: usize = 0;
+                appendBoundaryTestBytes(&input_buffer, &input_length, "{\"x\"");
+                appendBoundaryTestWhitespace(
+                    &input_buffer,
+                    &input_length,
+                    candidate_offset,
+                );
+                input_buffer[input_length] = non_whitespace_byte;
+                input_length += 1;
+                appendBoundaryTestBytes(&input_buffer, &input_length, ":0}");
+
+                try expectOnDemandErrorAfterEvents(
+                    input_buffer[0..input_length],
+                    &expected_events,
+                    error.UnexpectedToken,
+                );
+            }
+        }
+    }
+}
+
 fn expectJsonStreamParity(
     input: []const u8,
     actual: *const lib.StructuralIndex,

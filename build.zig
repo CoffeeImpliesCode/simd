@@ -17,8 +17,19 @@ pub fn build(b: *std.Build) void {
     const vector_len = b.option(
         usize,
         "vector_len",
-        "Override SIMD vector width",
+        "Override SIMD vector width (minimum 4 bytes for four-byte UTF-8 " ++
+            "and mask-shift algorithms)",
     );
+    if (vector_len) |len| {
+        if (len < 4) {
+            std.log.err(
+                "-Dvector_len must be at least 4 bytes because four-byte UTF-8 " ++
+                    "and mask-shift algorithms require it",
+                .{},
+            );
+            b.invalid_user_input = true;
+        }
+    }
 
     const build_options = b.addOptions();
     build_options.addOption(?usize, "vector_len", vector_len);

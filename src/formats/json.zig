@@ -177,6 +177,10 @@ fn indexJsonInto(
     var prev_ends_in_backslash = false;
     var prev_backslash_run_odd = false;
     var prev_in_atom = false;
+    var candidate_indexes: [VLEN]u32 = undefined;
+    var pending_structural_indexes: Mask = 0;
+    var pending_base_offset: usize = 0;
+    var has_pending_structural_indexes = false;
 
     while (base_offset < input.len) {
         const chunk = windows.next().?;
@@ -222,19 +226,24 @@ fn indexJsonInto(
                 if (prev_in_atom) @as(Mask, 1) else 0);
         const structural_indexes = ((structural | atom_starts) & outside_string) |
             opening_quotes;
-        var candidate_indexes: [VLEN]u32 = undefined;
-        const candidate_count = simd.extractBitIndexes(
-            Mask,
-            structural_indexes,
-            base_offset,
-            &candidate_indexes,
-        );
-        if (candidate_count > indexes.len - index_count) return error.CapacityExceeded;
-        @memcpy(
-            indexes[index_count..][0..candidate_count],
-            candidate_indexes[0..candidate_count],
-        );
-        index_count += candidate_count;
+
+        if (has_pending_structural_indexes) {
+            const candidate_count = simd.extractBitIndexes(
+                Mask,
+                pending_structural_indexes,
+                pending_base_offset,
+                &candidate_indexes,
+            );
+            if (candidate_count > indexes.len - index_count) return error.CapacityExceeded;
+            @memcpy(
+                indexes[index_count..][0..candidate_count],
+                candidate_indexes[0..candidate_count],
+            );
+            index_count += candidate_count;
+        }
+        pending_structural_indexes = structural_indexes;
+        pending_base_offset = base_offset;
+        has_pending_structural_indexes = true;
 
         prev_in_string = (inside_without_closing & top_bit) != 0;
         prev_ends_in_backslash = valid_count == VLEN and
@@ -249,6 +258,21 @@ fn indexJsonInto(
             (atom_active & (@as(Mask, 1) <<
                 @as(Shift, @intCast(valid_count - 1)))) != 0;
         base_offset += VLEN;
+    }
+
+    if (has_pending_structural_indexes) {
+        const candidate_count = simd.extractBitIndexes(
+            Mask,
+            pending_structural_indexes,
+            pending_base_offset,
+            &candidate_indexes,
+        );
+        if (candidate_count > indexes.len - index_count) return error.CapacityExceeded;
+        @memcpy(
+            indexes[index_count..][0..candidate_count],
+            candidate_indexes[0..candidate_count],
+        );
+        index_count += candidate_count;
     }
 
     return index_count;
@@ -383,6 +407,152 @@ fn expectMatchesScalarAtWidth(comptime VLEN: usize, input: []const u8) !void {
     try expectValidIndexes(input.len, actual.slice());
 }
 
+fn expectSameDiagnostic(
+    input: []const u8,
+    expected_index: *const stage1.StructuralIndex,
+    actual_index: *const stage1.StructuralIndex,
+) !void {
+    const expected_diagnostic = try stage2.validate(input, expected_index, .json);
+    const actual_diagnostic = try stage2.validate(input, actual_index, .json);
+
+    if (expected_diagnostic == null) {
+        try testing.expect(actual_diagnostic == null);
+        return;
+    }
+
+    try testing.expect(actual_diagnostic != null);
+    const expected = expected_diagnostic.?;
+    const actual = actual_diagnostic.?;
+    try testing.expectEqual(expected.err, actual.err);
+    try testing.expectEqual(expected.byte_offset, actual.byte_offset);
+    try testing.expectEqual(expected.line, actual.line);
+    try testing.expectEqual(expected.column, actual.column);
+    try testing.expectEqual(expected.snippet_start, actual.snippet_start);
+    try testing.expectEqualSlices(u8, expected.snippet, actual.snippet);
+}
+
+fn expectHandoffMatchesScalarAtWidth(
+    comptime VLEN: usize,
+    input: []const u8,
+    expected_indexes: []const u32,
+) !void {
+    var scalar = try scalarIndexJson(testing.allocator, input);
+    defer scalar.deinit(testing.allocator);
+    // The explicit offsets lock the ordered scan/extract contract.
+    try testing.expectEqualSlices(u32, expected_indexes, scalar.slice());
+    try expectValidIndexes(input.len, scalar.slice());
+
+    var actual = try indexJsonImpl(VLEN, testing.allocator, input);
+    defer actual.deinit(testing.allocator);
+    try testing.expectEqualSlices(u32, scalar.slice(), actual.slice());
+    try expectValidIndexes(input.len, actual.slice());
+    try expectSameDiagnostic(input, &scalar, &actual);
+}
+
+const HandoffPriorMask = enum {
+    empty,
+    sparse,
+    dense,
+};
+
+const HandoffCarry = enum {
+    quote,
+    backslash_odd,
+    backslash_even,
+};
+
+fn expectConsecutiveBlockHandoffAtWidth(
+    comptime VLEN: usize,
+    prior_mask: HandoffPriorMask,
+    carry: HandoffCarry,
+) !void {
+    // Keep two full blocks followed by a short borrowed tail.
+    const tail_length = 6;
+    const input_length = 2 * VLEN + tail_length;
+    var input: [2 * 512 + tail_length]u8 = @splat(' ');
+    var expected: [2 * 512 + tail_length]u32 = undefined;
+    var expected_count: usize = 0;
+
+    switch (prior_mask) {
+        .empty => {},
+        .sparse => {
+            const offsets = [_]usize{ 1, VLEN / 2, VLEN - 2, VLEN - 1 };
+            const bytes = [_]u8{ '{', ':', ',', 'n' };
+            for (offsets, bytes) |offset, byte| {
+                input[offset] = byte;
+                expected[expected_count] = @intCast(offset);
+                expected_count += 1;
+            }
+        },
+        .dense => {
+            const structural_bytes = "{[,:]}";
+            for (input[0..VLEN], 0..) |*byte, offset| {
+                byte.* = structural_bytes[offset % structural_bytes.len];
+                expected[expected_count] = @intCast(offset);
+                expected_count += 1;
+            }
+        },
+    }
+
+    input[VLEN] = '"';
+    expected[expected_count] = @intCast(VLEN);
+    expected_count += 1;
+
+    switch (carry) {
+        .quote => {
+            input[2 * VLEN - 2] = '"';
+            input[2 * VLEN - 1] = '"';
+            expected[expected_count] = @intCast(2 * VLEN - 1);
+            expected_count += 1;
+
+            input[2 * VLEN] = '"';
+            input[2 * VLEN + 1] = ']';
+            input[2 * VLEN + 2] = '0';
+            input[2 * VLEN + 4] = '[';
+            expected[expected_count] = @intCast(2 * VLEN + 1);
+            expected_count += 1;
+            expected[expected_count] = @intCast(2 * VLEN + 2);
+            expected_count += 1;
+            expected[expected_count] = @intCast(2 * VLEN + 4);
+            expected_count += 1;
+        },
+        .backslash_odd => {
+            input[2 * VLEN - 1] = '\\';
+            input[2 * VLEN] = '"';
+            input[2 * VLEN + 1] = '"';
+            input[2 * VLEN + 2] = ']';
+            input[2 * VLEN + 3] = '0';
+            input[2 * VLEN + 5] = '{';
+            expected[expected_count] = @intCast(2 * VLEN + 2);
+            expected_count += 1;
+            expected[expected_count] = @intCast(2 * VLEN + 3);
+            expected_count += 1;
+            expected[expected_count] = @intCast(2 * VLEN + 5);
+            expected_count += 1;
+        },
+        .backslash_even => {
+            input[2 * VLEN - 2] = '\\';
+            input[2 * VLEN - 1] = '\\';
+            input[2 * VLEN] = '"';
+            input[2 * VLEN + 1] = ']';
+            input[2 * VLEN + 2] = '0';
+            input[2 * VLEN + 4] = '{';
+            expected[expected_count] = @intCast(2 * VLEN + 1);
+            expected_count += 1;
+            expected[expected_count] = @intCast(2 * VLEN + 2);
+            expected_count += 1;
+            expected[expected_count] = @intCast(2 * VLEN + 4);
+            expected_count += 1;
+        },
+    }
+
+    try expectHandoffMatchesScalarAtWidth(
+        VLEN,
+        input[0..input_length],
+        expected[0..expected_count],
+    );
+}
+
 test "indexJson matches scalar at all SIMD widths" {
     const cases = [_][]const u8{
         "",
@@ -474,6 +644,23 @@ test "indexJson matches scalar for sparse and dense masks at wide widths" {
             byte.* = structural_bytes[offset % structural_bytes.len];
         }
         try expectMatchesScalarAtWidth(vlen, dense[0..input_length]);
+    }
+}
+
+test "indexJson preserves scalar oracle across consecutive block handoffs" {
+    const prior_masks = [_]HandoffPriorMask{ .empty, .sparse, .dense };
+    const carries = [_]HandoffCarry{
+        .quote,
+        .backslash_odd,
+        .backslash_even,
+    };
+
+    inline for ([_]usize{ 16, 32, 64, 128, 256, 512 }) |vlen| {
+        inline for (prior_masks) |prior_mask| {
+            inline for (carries) |carry| {
+                try expectConsecutiveBlockHandoffAtWidth(vlen, prior_mask, carry);
+            }
+        }
     }
 }
 
