@@ -436,8 +436,10 @@ pub const EventReader = struct {
     }
 
     fn readNext(self: *EventReader) Error!?Event {
-        try self.cursor.ensureFocused();
-        if (self.root_done) return self.finishRoot();
+        if (self.root_done) {
+            try self.cursor.ensureFocused();
+            return self.finishRoot();
+        }
 
         var separator_steps: usize = 0;
         while (separator_steps <= self.cursor.document.token_count) : (separator_steps += 1) {
@@ -466,7 +468,6 @@ pub const EventReader = struct {
     }
 
     fn advanceLoaded(self: *EventReader, token: Token) Error!void {
-        try self.cursor.ensureFocused();
         try self.cursor.applyDepth(token.byte);
         self.cursor.expected_position += 1;
         self.cursor.document.position_index = self.cursor.expected_position;
@@ -758,9 +759,13 @@ fn validateString(input: []const u8, quote_offset: u32) Error!StringToken {
     const VLEN = simd.default_vector_len;
     const Mask = simd.Mask(VLEN);
     const Shift = std.math.Log2Int(Mask);
+    const full_block_limit: usize = if (input.len >= VLEN)
+        input.len - VLEN + 1
+    else
+        0;
     var has_high_bit = false;
     while (index < input.len) {
-        if (input.len - index >= VLEN) {
+        while (index < full_block_limit) {
             const block: simd.Vec(VLEN, u8) = input[index..][0..VLEN].*;
             const candidate_mask: Mask =
                 simd.matchAny2(VLEN, block, '"', '\\') |
@@ -789,8 +794,10 @@ fn validateString(input: []const u8, quote_offset: u32) Error!StringToken {
                 };
             }
             index = candidate_index;
+            break;
         }
 
+        if (index >= input.len) break;
         const byte = input[index];
         if (byte == '"') {
             const content = input[content_start..index];

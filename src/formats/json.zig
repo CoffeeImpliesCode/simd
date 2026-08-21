@@ -419,7 +419,44 @@ test "indexJson width differential covers vector boundaries" {
 }
 
 test "indexJson matches scalar for sparse and dense masks at wide widths" {
+    const structural_bytes = "{[,:]}";
+    const sparse_densities = [_]usize{ 0, 1, 2, 4, 8, 16, 24 };
+
     inline for ([_]usize{ 16, 32, 64, 128, 256, 512 }) |vlen| {
+        for (sparse_densities) |density| {
+            if (density > vlen) continue;
+
+            var input: [512]u8 = @splat(' ');
+            var expected: [512]u32 = undefined;
+            for (0..density) |position| {
+                const offset = if (density == 1)
+                    vlen - 1
+                else
+                    @divFloor(position * (vlen - 1), density - 1);
+                input[offset] = structural_bytes[position % structural_bytes.len];
+                expected[position] = @intCast(offset);
+            }
+
+            var actual = try indexJsonImpl(vlen, testing.allocator, input[0..vlen]);
+            defer actual.deinit(testing.allocator);
+            try testing.expectEqualSlices(u32, expected[0..density], actual.slice());
+            try expectValidIndexes(vlen, actual.slice());
+            try expectMatchesScalarAtWidth(vlen, input[0..vlen]);
+        }
+
+        var dense_input: [512]u8 = undefined;
+        var dense_expected: [512]u32 = undefined;
+        for (dense_input[0..vlen], 0..) |*byte, offset| {
+            byte.* = structural_bytes[offset % structural_bytes.len];
+            dense_expected[offset] = @intCast(offset);
+        }
+
+        var dense_actual = try indexJsonImpl(vlen, testing.allocator, dense_input[0..vlen]);
+        defer dense_actual.deinit(testing.allocator);
+        try testing.expectEqualSlices(u32, dense_expected[0..vlen], dense_actual.slice());
+        try expectValidIndexes(vlen, dense_actual.slice());
+        try expectMatchesScalarAtWidth(vlen, dense_input[0..vlen]);
+
         const input_length = 2 * vlen + 3;
 
         var sparse: [2 * 512 + 3]u8 = @splat(' ');
@@ -432,7 +469,6 @@ test "indexJson matches scalar for sparse and dense masks at wide widths" {
         sparse[input_length - 1] = 'n';
         try expectMatchesScalarAtWidth(vlen, sparse[0..input_length]);
 
-        const structural_bytes = "{[,:]}";
         var dense: [2 * 512 + 3]u8 = undefined;
         for (dense[0..input_length], 0..) |*byte, offset| {
             byte.* = structural_bytes[offset % structural_bytes.len];
