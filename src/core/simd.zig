@@ -16,14 +16,6 @@ pub const default_vector_len: usize = build_options.vector_len orelse
         else => 16,
     };
 
-comptime {
-    assert(
-        default_vector_len == 16 or
-            default_vector_len == 32 or
-            default_vector_len == 64,
-    );
-}
-
 pub fn Vec(comptime len: usize, comptime T: type) type {
     comptime assert(len > 0);
     return @Vector(len, T);
@@ -37,14 +29,13 @@ pub fn Mask(comptime bit_count: usize) type {
 fn validateMaskType(comptime T: type) void {
     const int_info = switch (@typeInfo(T)) {
         .int => |info| info,
-        else => @compileError("mask type must be u16, u32, or u64"),
+        else => @compileError("mask type must be an unsigned integer"),
     };
-    if (int_info.signedness != .unsigned or
-        !std.math.isPowerOfTwo(int_info.bits) or
-        int_info.bits < 16 or
-        int_info.bits > 64)
-    {
-        @compileError("mask type must be u16, u32, or u64");
+    if (int_info.signedness != .unsigned) {
+        @compileError("mask type must be an unsigned integer");
+    }
+    if (int_info.bits == 0) {
+        @compileError("mask type must contain at least one bit");
     }
 }
 
@@ -95,8 +86,6 @@ pub fn windows(
 pub fn prefixXor(comptime T: type, bitmask: T) T {
     const bits = @typeInfo(T).int.bits;
     comptime assert(bits > 0);
-    comptime assert(std.math.isPowerOfTwo(bits));
-
     var x = bitmask;
     const steps = @typeInfo(std.math.Log2Int(T)).int.bits;
     inline for (0..steps) |step| {
@@ -414,8 +403,11 @@ fn utf8BlockIsValid(
 // classifier so short input is never over-read.
 
 fn utf8SuspectOffset(comptime len: usize, input: []const u8) ?usize {
-    comptime assert(len == 16 or len == 32 or len == 64);
-
+    comptime {
+        if (len < 3) {
+            @compileError("UTF-8 SIMD vector width must be at least 3 bytes");
+        }
+    }
     var state: Utf8BlockState = .{};
     var offset: usize = 0;
     while (input.len - offset >= len) : (offset += len) {
@@ -459,7 +451,11 @@ fn validateUtf8Replay(input: []const u8, suspect_offset: usize) Utf8Result {
 }
 
 pub fn validateUtf8WithWidth(comptime len: usize, input: []const u8) Utf8Result {
-    comptime assert(len == 16 or len == 32 or len == 64);
+    comptime {
+        if (len < 3) {
+            @compileError("UTF-8 SIMD vector width must be at least 3 bytes");
+        }
+    }
     // SIMD identifies a suspect block; scalar replay establishes the first
     // failure class and offset without exposing internal mask bits.
     const suspect_offset = utf8SuspectOffset(len, input) orelse return .valid;

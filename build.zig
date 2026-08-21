@@ -17,15 +17,8 @@ pub fn build(b: *std.Build) void {
     const vector_len = b.option(
         usize,
         "vector_len",
-        "Override SIMD vector width (16, 32, or 64)",
+        "Override SIMD vector width",
     );
-    if (vector_len) |len| switch (len) {
-        16, 32, 64 => {},
-        else => std.debug.panic(
-            "invalid -Dvector_len={d}: expected 16, 32, or 64",
-            .{len},
-        ),
-    };
 
     const build_options = b.addOptions();
     build_options.addOption(?usize, "vector_len", vector_len);

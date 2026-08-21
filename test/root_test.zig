@@ -808,10 +808,11 @@ test "stream: empty feeds and SIMD boundary cuts match JSON indexing" {
     const input =
         \\{"padding":"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz","tail":[false,null,-987654321]}
     ;
+    const cut_center = @max(2, @min(vector_len, input.len -| 2));
     const cuts = [_]usize{
-        vector_len - 1,
-        vector_len,
-        vector_len + 1,
+        cut_center - 1,
+        cut_center,
+        cut_center + 1,
     };
 
     try expectJsonStreamWithCuts(input, &cuts, true);
@@ -957,15 +958,15 @@ test "public Markdown stream preserves output, sentinels, and token kinds" {
         "> quote\n" ++
         "```zig\n# hidden\n```\n" ++
         "`inline` ***\n";
-    const cuts = [_]usize{
-        0,
-        1,
-        std.mem.indexOf(u8, input, "\r\n").? + 1,
-        vector_len,
-        input.len - 1,
-    };
+    const crlf_cut = std.mem.indexOf(u8, input, "\r\n").? + 1;
+    const final_cut = input.len -| 1;
+    const vector_cut = @min(vector_len, final_cut);
+    const cuts: []const usize = if (vector_cut > crlf_cut and vector_cut < final_cut)
+        &.{ 0, 1, crlf_cut, vector_cut, final_cut }
+    else
+        &.{ 0, 1, crlf_cut, final_cut };
 
-    try expectMarkdownStreamParity(input, &cuts);
+    try expectMarkdownStreamParity(input, cuts);
     try expectMarkdownStreamParity("", &.{});
 }
 
@@ -975,35 +976,18 @@ test "public XML stream preserves output, sentinels, and token kinds" {
         "<!-- comment --><![CDATA[text]]></root>";
     const processing_instruction_cut = std.mem.indexOf(u8, input, "?>").? + 1;
     const cdata_cut = std.mem.indexOf(u8, input, "<![CDATA[").? + 1;
-    const cuts = if (vector_len <= processing_instruction_cut)
-        [_]usize{
-            0,
-            1,
-            vector_len,
-            processing_instruction_cut,
-            cdata_cut,
-            input.len - 1,
-        }
-    else if (vector_len <= cdata_cut)
-        [_]usize{
-            0,
-            1,
-            processing_instruction_cut,
-            vector_len,
-            cdata_cut,
-            input.len - 1,
-        }
+    const final_cut = input.len -| 1;
+    const vector_cut = @min(vector_len, final_cut);
+    const cuts: []const usize = if (vector_cut > 1 and vector_cut < processing_instruction_cut)
+        &.{ 0, 1, vector_cut, processing_instruction_cut, cdata_cut, final_cut }
+    else if (vector_cut > processing_instruction_cut and vector_cut < cdata_cut)
+        &.{ 0, 1, processing_instruction_cut, vector_cut, cdata_cut, final_cut }
+    else if (vector_cut > cdata_cut and vector_cut < final_cut)
+        &.{ 0, 1, processing_instruction_cut, cdata_cut, vector_cut, final_cut }
     else
-        [_]usize{
-            0,
-            1,
-            processing_instruction_cut,
-            cdata_cut,
-            vector_len,
-            input.len - 1,
-        };
+        &.{ 0, 1, processing_instruction_cut, cdata_cut, final_cut };
 
-    try expectXmlStreamParity(input, &cuts);
+    try expectXmlStreamParity(input, cuts);
     try expectXmlStreamParity("", &.{});
 }
 

@@ -780,11 +780,6 @@ pub fn indexYamlImpl(
     allocator: std.mem.Allocator,
     input: []const u8,
 ) YamlIndexError!YamlStructuralIndex {
-    comptime {
-        if (VLEN != 16 and VLEN != 32 and VLEN != 64) {
-            @compileError("YAML Stage1 requires a 16, 32, or 64 byte vector width");
-        }
-    }
     if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
     yamlSimdCandidateScan(VLEN, input);
     return parseYamlIndex(allocator, input, null);
