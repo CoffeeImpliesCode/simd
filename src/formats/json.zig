@@ -177,7 +177,6 @@ fn indexJsonInto(
     var prev_ends_in_backslash = false;
     var prev_backslash_run_odd = false;
     var prev_in_atom = false;
-    var candidate_indexes: [VLEN]u32 = undefined;
     var pending_structural_indexes: Mask = 0;
     var pending_base_offset: usize = 0;
     var has_pending_structural_indexes = false;
@@ -228,18 +227,13 @@ fn indexJsonInto(
             opening_quotes;
 
         if (has_pending_structural_indexes) {
-            const candidate_count = simd.extractBitIndexes(
+            const emitted_count = try simd.extractBitIndexesChecked(
                 Mask,
                 pending_structural_indexes,
                 pending_base_offset,
-                &candidate_indexes,
+                indexes[index_count..],
             );
-            if (candidate_count > indexes.len - index_count) return error.CapacityExceeded;
-            @memcpy(
-                indexes[index_count..][0..candidate_count],
-                candidate_indexes[0..candidate_count],
-            );
-            index_count += candidate_count;
+            index_count += emitted_count;
         }
         pending_structural_indexes = structural_indexes;
         pending_base_offset = base_offset;
@@ -261,18 +255,13 @@ fn indexJsonInto(
     }
 
     if (has_pending_structural_indexes) {
-        const candidate_count = simd.extractBitIndexes(
+        const emitted_count = try simd.extractBitIndexesChecked(
             Mask,
             pending_structural_indexes,
             pending_base_offset,
-            &candidate_indexes,
+            indexes[index_count..],
         );
-        if (candidate_count > indexes.len - index_count) return error.CapacityExceeded;
-        @memcpy(
-            indexes[index_count..][0..candidate_count],
-            candidate_indexes[0..candidate_count],
-        );
-        index_count += candidate_count;
+        index_count += emitted_count;
     }
 
     return index_count;

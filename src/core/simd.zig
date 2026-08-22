@@ -4,17 +4,18 @@ const build_options = @import("build_options");
 const assert = std.debug.assert;
 const testing = std.testing;
 
-pub const default_vector_len: usize = build_options.vector_len orelse
-    switch (builtin.cpu.arch) {
-        .x86, .x86_64 => if (std.Target.x86.featureSetHas(builtin.cpu.features, .avx512f) and
-            std.Target.x86.featureSetHas(builtin.cpu.features, .avx512bw))
-            64
-        else if (std.Target.x86.featureSetHas(builtin.cpu.features, .avx2))
-            32
-        else
-            16,
-        else => 16,
-    };
+pub const native_vector_len: usize = switch (builtin.cpu.arch) {
+    .x86, .x86_64 => if (std.Target.x86.featureSetHas(builtin.cpu.features, .avx512f) and
+        std.Target.x86.featureSetHas(builtin.cpu.features, .avx512bw))
+        64
+    else if (std.Target.x86.featureSetHas(builtin.cpu.features, .avx2))
+        32
+    else
+        16,
+    else => 16,
+};
+
+pub const default_vector_len: usize = build_options.vector_len orelse native_vector_len;
 
 pub fn Vec(comptime len: usize, comptime T: type) type {
     comptime assert(len > 0);
@@ -191,6 +192,19 @@ pub fn matchRange(comptime len: usize, v: Vec(len, u8), min: u8, max: u8) Mask(l
     const in_range: Vec(len, bool) = ge_min & le_max;
     return @bitCast(in_range);
 }
+pub fn matchJsonWhitespace(comptime len: usize, v: Vec(len, u8)) Mask(len) {
+    const ByteVector = Vec(len, u8);
+    const distance_from_tab = v -% @as(ByteVector, @splat(0x09));
+    const folded_distance = distance_from_tab |
+        ((distance_from_tab & @as(ByteVector, @splat(0x02))) <<
+            @as(ByteVector, @splat(1)));
+    const control_whitespace =
+        folded_distance <= @as(ByteVector, @splat(0x04));
+    const whitespace = control_whitespace |
+        (v == @as(ByteVector, @splat(0x20)));
+    return @bitCast(whitespace);
+}
+
 
 pub fn extractBitIndexes(
     comptime T: type,
@@ -217,6 +231,19 @@ pub fn extractBitIndexes(
         mask &= mask - 1;
     }
     return written;
+}
+
+pub fn extractBitIndexesChecked(
+    comptime T: type,
+    bitmask: T,
+    base_offset: usize,
+    out_indexes: []u32,
+) error{CapacityExceeded}!usize {
+    comptime validateMaskType(T);
+
+    const required: usize = @intCast(@popCount(bitmask));
+    if (required > out_indexes.len) return error.CapacityExceeded;
+    return extractBitIndexes(T, bitmask, base_offset, out_indexes[0..required]);
 }
 
 pub const Utf8ErrorKind = enum(u8) {

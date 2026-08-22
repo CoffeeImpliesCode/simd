@@ -41,6 +41,50 @@ test "core: prefixXor matches mathematical parity" {
     }
 }
 
+test "core: direct bit extraction preserves capacity order and JSON sentinels" {
+    const mask = (@as(u16, 1) << 1) |
+        (@as(u16, 1) << 5) |
+        (@as(u16, 1) << 11);
+    const guard_before: u32 = 0xA5A5_A5A5;
+    const guard_after: u32 = 0x5A5A_5A5A;
+    var insufficient = [_]u32{
+        guard_before,
+        0xDEAD_BEEF,
+        0xDEAD_BEEF,
+        guard_after,
+    };
+    try testing.expectError(
+        error.CapacityExceeded,
+        lib.simd.extractBitIndexesChecked(u16, mask, 100, insufficient[1..3]),
+    );
+    try testing.expectEqual(@as(u32, 0xDEAD_BEEF), insufficient[1]);
+    try testing.expectEqual(@as(u32, 0xDEAD_BEEF), insufficient[2]);
+    try testing.expectEqual(guard_before, insufficient[0]);
+    try testing.expectEqual(guard_after, insufficient[3]);
+
+    var extracted: [3]u32 = undefined;
+    const extracted_count = try lib.simd.extractBitIndexesChecked(
+        u16,
+        mask,
+        100,
+        &extracted,
+    );
+    try testing.expectEqual(@as(usize, extracted.len), extracted_count);
+    try testing.expectEqualSlices(u32, &.{ 101, 105, 111 }, &extracted);
+
+    const input = "{}[],:{}[],:{}[],:{}[],:{}[],:{}[],:{}[],:{}[],:";
+    var index = try lib.formats.json.indexJsonImpl(16, testing.allocator, input);
+    defer index.deinit(testing.allocator);
+
+    try testing.expectEqual(input.len, index.count);
+    for (index.indexes[0..index.count], 0..) |offset, expected_offset| {
+        try testing.expectEqual(@as(u32, @intCast(expected_offset)), offset);
+    }
+    try testing.expectEqual(@as(u32, @intCast(input.len)), index.indexes[index.count]);
+    try testing.expectEqual(@as(u32, @intCast(input.len)), index.indexes[index.count + 1]);
+    try testing.expectEqual(@as(u32, 0), index.indexes[index.count + 2]);
+}
+
 test "upstream corpus manifests pin provenance for offline tests" {
     const manifests = [_]struct {
         contents: []const u8,
