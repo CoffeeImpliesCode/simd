@@ -107,10 +107,30 @@ pub const Parser = struct {
         input: []const u8,
         token_count: usize,
     ) Error!Document {
+        return self.completeOwnedDocument(input, token_count, .checked);
+    }
+
+    /// Completes indexes emitted by a parser-owned generated indexer.
+    ///
+    /// Public callers must use `completeDocument`, which validates indexes.
+    pub fn completeGeneratedDocument(
+        self: *Parser,
+        input: []const u8,
+        token_count: usize,
+    ) Error!Document {
+        return self.completeOwnedDocument(input, token_count, .generated);
+    }
+
+    fn completeOwnedDocument(
+        self: *Parser,
+        input: []const u8,
+        token_count: usize,
+        mode: CompletionMode,
+    ) Error!Document {
         if (self.document_active) return error.DocumentActive;
         if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
         try self.ensureCapacity(input.len, token_count);
-        return self.finishOwnedDocument(input, token_count);
+        return self.finishOwnedDocument(input, token_count, mode);
     }
 
     pub fn initDocument(
@@ -137,7 +157,7 @@ pub const Parser = struct {
             self.indexes[0..source_count],
             structural_index.indexes[0..source_count],
         );
-        return self.finishOwnedDocument(input, structural_index.count);
+        return self.finishOwnedDocument(input, structural_index.count, .checked);
     }
 
     pub fn iterate(
@@ -148,10 +168,16 @@ pub const Parser = struct {
         return self.initDocument(input, structural_index);
     }
 
+    const CompletionMode = enum {
+        checked,
+        generated,
+    };
+
     fn finishOwnedDocument(
         self: *Parser,
         input: []const u8,
         token_count: usize,
+        mode: CompletionMode,
     ) Error!Document {
         if (token_count > input.len) return error.InvalidStructuralIndex;
         const source_count = std.math.add(
@@ -169,7 +195,9 @@ pub const Parser = struct {
             sentinel,
             0,
         };
-        try validateIndexes(input, self.indexes, token_count);
+        if (mode == .checked) {
+            try validateIndexes(input, self.indexes, token_count);
+        }
 
         self.generation +%= 1;
         if (self.generation == 0) self.generation = 1;
