@@ -52,6 +52,9 @@ pub const CarryState = struct {
     pending_unicode: [3]u8 = .{ 0, 0, 0 },
     pending_unicode_offset: u32 = 0,
     block_comment_ends_in_star: bool = false,
+    // JSON5 line comments carry at most the E2 80 prefix of a separator.
+    pending_line_comment_unicode_len: u2 = 0,
+    pending_line_comment_unicode: [2]u8 = .{ 0, 0 },
 };
 
 /// Incrementally builds a JSON-family StructuralIndex. Input bytes are copied
@@ -458,12 +461,20 @@ pub const StreamIndexer = struct {
     fn processByteNow(self: *Self, offset: usize, byte: u8) void {
         switch (self.carry.comment) {
             .line => {
+                if (self.carry.pending_line_comment_unicode_len != 0) {
+                    if (self.appendPendingLineCommentUnicode(byte)) return;
+                }
                 if (byte == '\n' or byte == '\r') {
                     self.carry.comment = .none;
                     self.carry.in_atom = false;
                     if (self.options.mode == .jsonl and byte == '\n') {
                         self.record(offset);
                     }
+                    return;
+                }
+                if (self.options.dialect == .json5 and byte == 0xe2) {
+                    self.carry.pending_line_comment_unicode[0] = byte;
+                    self.carry.pending_line_comment_unicode_len = 1;
                 }
                 return;
             },
@@ -483,7 +494,6 @@ pub const StreamIndexer = struct {
             },
             .none => {},
         }
-
         if (self.carry.quote_delimiter != 0) {
             if (byte == self.carry.quote_delimiter and
                 !self.carry.backslash_run_odd)
@@ -507,7 +517,10 @@ pub const StreamIndexer = struct {
 
         if (self.isQuote(byte)) {
             if (!self.carry.backslash_run_odd) {
-                self.record(offset);
+                // JSONC and JSON5 discover opening quotes in their Stage2 source scan.
+                if (self.options.dialect == .json) {
+                    self.record(offset);
+                }
                 self.carry.in_string = true;
                 self.carry.quote_delimiter = byte;
                 self.carry.in_atom = false;
@@ -608,6 +621,28 @@ pub const StreamIndexer = struct {
         return true;
     }
 
+    fn appendPendingLineCommentUnicode(self: *Self, byte: u8) bool {
+        const len: usize = self.carry.pending_line_comment_unicode_len;
+        if (len == 1) {
+            if (byte != 0x80) {
+                self.carry.pending_line_comment_unicode_len = 0;
+                return false;
+            }
+            self.carry.pending_line_comment_unicode[1] = byte;
+            self.carry.pending_line_comment_unicode_len = 2;
+            return true;
+        }
+
+        assert(len == 2);
+        self.carry.pending_line_comment_unicode_len = 0;
+        if (byte == 0xa8 or byte == 0xa9) {
+            self.carry.comment = .none;
+            self.carry.in_atom = false;
+            return true;
+        }
+        return false;
+    }
+
     fn flushDeferred(self: *Self) void {
         if (self.carry.pending_slash) {
             self.carry.pending_slash = false;
@@ -622,6 +657,7 @@ pub const StreamIndexer = struct {
             self.carry.in_atom = true;
             self.carry.pending_unicode_len = 0;
         }
+        self.carry.pending_line_comment_unicode_len = 0;
     }
 
     fn record(self: *Self, offset: usize) void {
@@ -1015,18 +1051,25 @@ test "JSON stream matches one-shot indexes at quote and escape boundaries" {
     try expectEveryFeedPartition(&input, .{ .dialect = .json });
 }
 
-test "JSON stream matches one-shot indexes for split atoms and sentinels" {
-    const input = "[true,false,null,-1234567890,0,{\"tail\":42}]";
-    try expectEveryFeedPartition(input, .{ .dialect = .json });
+test "JSONC stream carries comments without quote offsets" {
+    const input = "{/*a*/\"x\":true,//tail\n\"y\":2}";
+    // JSONC and JSON5 one-shot indexes intentionally omit quote offsets.
+    const expected = [_]u32{ 0, 9, 10, 14, 25, 26, 27 };
+    try expectEveryFeedPartitionAgainst(
+        input,
+        .{ .dialect = .jsonc },
+        &expected,
+    );
 }
 
-test "JSON stream carries state across SIMD slots" {
-    const input =
-        "{\"alpha\":\"abcdefghijklmnopqrstuvwxyz0123456789" ++
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZ\\\\\\\"tail\"," ++
-        "\"values\":[true,false,null,-12345678901234567890]," ++
-        "\"nested\":{\"punctuation\":\"{}[],:\"}}";
-    try expectEveryFeedPartition(input, .{ .dialect = .json });
+test "JSON5 stream carries atom boundaries without quote offsets" {
+    const input = "{'x':+1,foo:0x2A}";
+    const expected = [_]u32{ 0, 4, 5, 7, 8, 11, 12, 16 };
+    try expectEveryFeedPartitionAgainst(
+        input,
+        .{ .dialect = .json5 },
+        &expected,
+    );
 }
 
 test "JSONL stream indexes LF records but not quoted LF" {
@@ -1044,26 +1087,6 @@ test "JSONL stream carries CRLF and LF across arbitrary feeds" {
     try expectEveryFeedPartition(
         input,
         .{ .dialect = .json, .mode = .jsonl },
-    );
-}
-
-test "JSONC stream carries comments across feeds" {
-    const input = "{/*a*/\"x\":true,//tail\n\"y\":2}";
-    const expected = [_]u32{ 0, 6, 9, 10, 14, 22, 25, 26, 27 };
-    try expectEveryFeedPartitionAgainst(
-        input,
-        .{ .dialect = .jsonc },
-        &expected,
-    );
-}
-
-test "JSON5 stream carries quote delimiters and atom boundaries" {
-    const input = "{'x':+1,foo:0x2A}";
-    const expected = [_]u32{ 0, 1, 4, 5, 7, 8, 11, 12, 16 };
-    try expectEveryFeedPartitionAgainst(
-        input,
-        .{ .dialect = .json5 },
-        &expected,
     );
 }
 

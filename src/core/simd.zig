@@ -141,7 +141,15 @@ pub fn computeBackslashRuns(
         };
     }
 
-    const even_bits: T = std.math.maxInt(T) / 3;
+    const bit_count: usize = @typeInfo(T).int.bits;
+    const Shift = std.math.Log2Int(T);
+    // maxInt(T) / 3 starts on the wrong lane for odd-width masks.
+    var even_bits: T = 0;
+    inline for (0..bit_count) |bit_index| {
+        if (bit_index % 2 == 0) {
+            even_bits |= one << @as(Shift, @intCast(bit_index));
+        }
+    }
     const odd_bits: T = ~even_bits;
     const prev_start: T = @intFromBool(prev_ends_in_backslash);
     const starts = (b & ~((b << 1) | prev_start)) |
@@ -200,7 +208,20 @@ pub fn extractBitIndexes(
 ) usize {
     comptime validateMaskType(T);
 
-    var mask = bitmask;
+    const bit_count: usize = @typeInfo(T).int.bits;
+    // Widen before ctz because non-byte-aligned integers carry spare storage bits.
+    const Storage = if (bit_count <= 8)
+        u8
+    else if (bit_count <= 16)
+        u16
+    else if (bit_count <= 32)
+        u32
+    else if (bit_count <= 64)
+        u64
+    else
+        @Int(.unsigned, (bit_count + 7) / 8 * 8);
+    const logical_bits: Storage = @intCast(std.math.maxInt(T));
+    var mask: Storage = @as(Storage, @intCast(bitmask)) & logical_bits;
     var written: usize = 0;
     inline for (0..8) |_| {
         if (mask != 0 and written < out_indexes.len) {
@@ -950,17 +971,34 @@ test "computeBackslashRuns handles u64 escaped-run parity" {
     try expectBackslashRunParity(u64);
 }
 
-fn expectCtzResultType(comptime T: type) void {
-    comptime validateMaskType(T);
-    const ctz_result_type = @TypeOf(@ctz(@as(T, 1)));
-    comptime assert(ctz_result_type == std.math.Log2IntCeil(T));
+fn expectExhaustiveBackslashRunParity(comptime T: type) !void {
+    const bit_count: usize = @typeInfo(T).int.bits;
+    comptime assert(bit_count < @bitSizeOf(usize));
+    const mask_count = @as(usize, 1) << bit_count;
+
+    var mask_value: usize = 0;
+    while (mask_value < mask_count) : (mask_value += 1) {
+        const backslash_mask: T = @intCast(mask_value);
+        for ([_]bool{ false, true }) |prev_ends_in_backslash| {
+            const expected = scalarBackslashRunParity(
+                T,
+                backslash_mask,
+                prev_ends_in_backslash,
+            );
+            const actual = computeBackslashRuns(
+                T,
+                backslash_mask,
+                prev_ends_in_backslash,
+            );
+            try testing.expectEqual(expected.odd_length_ends, actual.odd_length_ends);
+            try testing.expectEqual(expected.ends_in_backslash, actual.ends_in_backslash);
+        }
+    }
 }
 
-test "@ctz returns Log2IntCeil for every mask width" {
-    comptime {
-        expectCtzResultType(u16);
-        expectCtzResultType(u32);
-        expectCtzResultType(u64);
+test "computeBackslashRuns matches scalar parity for every small mask" {
+    inline for (.{ u4, u5, u7 }) |T| {
+        try expectExhaustiveBackslashRunParity(T);
     }
 }
 
@@ -984,6 +1022,53 @@ fn expectBitIndexExtraction(comptime T: type) !void {
 
     var empty: [0]u32 = .{};
     try testing.expectEqual(@as(usize, 0), extractBitIndexes(T, mask, 0, &empty));
+}
+
+test "extractBitIndexes handles arbitrary mask widths" {
+    inline for (.{ u4, u5, u7, u16, u32, u64 }) |T| {
+        try expectBitIndexExtraction(T);
+    }
+}
+
+fn expectMatchedByteIndexExtraction(comptime len: usize) !void {
+    const base_offset: usize = 500;
+    var matching_lane: usize = 0;
+    while (matching_lane < len) : (matching_lane += 1) {
+        var bytes: [len]u8 = @splat(0);
+        bytes[matching_lane] = '<';
+
+        const vector: Vec(len, u8) = bytes;
+        const punctuation_mask = matchAny4(len, vector, '<', '>', '=', '"') |
+            matchByte(len, vector, '\'');
+        var indexes: [len]u32 = undefined;
+        const count = extractBitIndexes(Mask(len), punctuation_mask, base_offset, &indexes);
+
+        try testing.expectEqual(@as(usize, 1), count);
+        try testing.expectEqual(
+            @as(u32, @intCast(base_offset + matching_lane)),
+            indexes[0],
+        );
+    }
+}
+
+test "comparison masks extract only matching vector lanes" {
+    inline for (.{ 4, 5, 7, 16, 32, 64 }) |len| {
+        try expectMatchedByteIndexExtraction(len);
+    }
+}
+
+fn expectCtzResultType(comptime T: type) void {
+    comptime validateMaskType(T);
+    const ctz_result_type = @TypeOf(@ctz(@as(T, 1)));
+    comptime assert(ctz_result_type == std.math.Log2IntCeil(T));
+}
+
+test "@ctz returns Log2IntCeil for every mask width" {
+    comptime {
+        expectCtzResultType(u16);
+        expectCtzResultType(u32);
+        expectCtzResultType(u64);
+    }
 }
 
 test "extractBitIndexes handles u16 masks" {

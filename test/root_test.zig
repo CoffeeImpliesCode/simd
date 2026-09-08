@@ -1247,7 +1247,7 @@ test "stream: empty feeds and SIMD boundary cuts match JSON indexing" {
     const input =
         \\{"padding":"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz","tail":[false,null,-987654321]}
     ;
-    const cut_center = @max(2, @min(vector_len, input.len -| 2));
+    const cut_center: usize = @max(2, @min(vector_len, input.len -| 2));
     const cuts = [_]usize{
         cut_center - 1,
         cut_center,

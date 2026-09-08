@@ -3,6 +3,9 @@ const lib = @import("simd_lib");
 const checking = @import("checking.zig");
 const testing = std.testing;
 
+// Mirror the core scalar contract without calling parser code: an invalid
+// byte (including sequence constraints) reports its own offset; truncation
+// reports the sequence lead byte.
 fn scalarUtf8FailureOffset(input: []const u8) ?usize {
     var index: usize = 0;
     while (index < input.len) {
@@ -13,18 +16,21 @@ fn scalarUtf8FailureOffset(input: []const u8) ?usize {
         }
 
         const sequence_length: usize = switch (first) {
-            0xC2...0xDF => 2,
+            0xC0...0xDF => 2,
             0xE0...0xEF => 3,
             0xF0...0xF4 => 4,
             else => return index,
         };
-        if (input.len - index < sequence_length) return index;
+        if (input.len - index == 1) return index;
 
         if (!scalarUtf8SecondByteValid(first, input[index + 1])) {
             return index + 1;
         }
+        // C0/C1 classify the next byte before reporting an overlong lead.
+        if (first <= 0xC1) return index;
         var continuation_offset: usize = 2;
         while (continuation_offset < sequence_length) : (continuation_offset += 1) {
+            if (continuation_offset >= input.len - index) return index;
             const byte = input[index + continuation_offset];
             if (byte < 0x80 or byte > 0xBF) return index + continuation_offset;
         }
@@ -43,6 +49,8 @@ fn scalarUtf8SecondByteValid(first: u8, second: u8) bool {
     };
 }
 
+// XML reports malformed scalars at their sequence start, unlike the JSON
+// string/comment byte diagnostics checked above.
 fn scalarUtf8SequenceStart(input: []const u8, invalid_offset: usize) usize {
     var sequence_start = @min(invalid_offset, input.len);
     var continuation_count: usize = 0;

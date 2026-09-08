@@ -699,7 +699,7 @@ fn expectMatchesScalarAtWidth(comptime VLEN: usize, input: []const u8) !void {
 }
 
 fn expectMatchesScalar(input: []const u8) !void {
-    inline for (.{ 16, 32, 64 }) |VLEN| {
+    inline for (.{ 4, 5, 7, 16, 32, 64 }) |VLEN| {
         try expectMatchesScalarAtWidth(VLEN, input);
     }
 }
@@ -801,8 +801,15 @@ fn expectFragmentAnchorAtVectorBoundaries(
     std.debug.assert(anchor_in_fragment < fragment.len);
 
     for (boundary_offsets) |boundary_offset| {
-        std.debug.assert(anchor_in_fragment <= boundary_offset);
-        const fragment_offset = boundary_offset - anchor_in_fragment;
+        // Keep an anchor near the fragment's end at a block-relative boundary
+        // even when the first boundary is before the anchor in the fragment.
+        const preceding_block_count = if (boundary_offset < anchor_in_fragment)
+            (anchor_in_fragment - boundary_offset + VLEN - 1) / VLEN
+        else
+            0;
+        const anchor_offset = boundary_offset + preceding_block_count * VLEN;
+        const fragment_offset = anchor_offset - anchor_in_fragment;
+        std.debug.assert(anchor_offset >= anchor_in_fragment);
         var input: [160]u8 = @splat('x');
         std.debug.assert(fragment_offset + fragment.len <= input.len);
         @memcpy(input[fragment_offset..][0..fragment.len], fragment);
@@ -855,7 +862,7 @@ test "indexXml matches scalar oracle across the exact width matrix" {
         0,  1,  14, 15, 16, 17, 30, 31,
         32, 33, 62, 63, 64, 65, 66,
     };
-    inline for ([_]usize{ 16, 32, 64 }) |vlen| {
+    inline for ([_]usize{ 4, 5, 7, 16, 32, 64 }) |vlen| {
         for (input_lengths) |input_length| {
             try expectMatchesScalarAtWidth(vlen, document[0..input_length]);
         }
@@ -1087,6 +1094,12 @@ test "indexXml matches scalar oracle at every vector width boundary" {
         try expectFragmentAnchorAtVectorBoundaries(VLEN, instruction, 0);
         try expectFragmentAnchorAtVectorBoundaries(VLEN, instruction, instruction.len - 2);
     }
+}
+
+test "indexXml matches scalar at the end of an irregular-width block" {
+    var input: [508]u8 = @splat('x');
+    input[504] = '<';
+    try expectMatchesScalar(&input);
 }
 
 test "indexXml preserves invariants for adversarial bytes and tails" {

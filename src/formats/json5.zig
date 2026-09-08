@@ -939,3 +939,64 @@ test "JSON5 stream wrapper reset and finish lifecycle preserve offsets" {
     try expectJson5StreamIndexEqual(&expected_first, &first);
     try expectJson5StreamIndexEqual(&expected_second, &second);
 }
+
+test "JSON5 stream terminates comments at split Unicode separators" {
+    const separators = [_][3]u8{
+        .{ 0xe2, 0x80, 0xa8 },
+        .{ 0xe2, 0x80, 0xa9 },
+    };
+    const separator_offsets = [_]usize{
+        2 * simd.default_vector_len - 2,
+        2 * simd.default_vector_len - 1,
+    };
+
+    var indexer = try initStreamIndexer(testing.allocator, 1);
+    defer indexer.deinit();
+
+    var case_index: usize = 0;
+    for (separators) |separator| {
+        for (separator_offsets) |separator_offset| {
+            if (case_index != 0) indexer.reset();
+            case_index += 1;
+
+            var input: [2 * simd.default_vector_len + 7]u8 = @splat('x');
+            input[0] = '[';
+            input[1] = '/';
+            input[2] = '/';
+            @memcpy(
+                input[separator_offset .. separator_offset + separator.len],
+                separator[0..],
+            );
+            @memcpy(
+                input[separator_offset + separator.len .. separator_offset + separator.len + 5],
+                "true]",
+            );
+            const source = input[0 .. separator_offset + separator.len + 5];
+            const expected_offsets = [_]u32{
+                0,
+                @intCast(separator_offset + separator.len),
+                @intCast(source.len - 1),
+            };
+
+            var expected = try indexJson5(testing.allocator, source);
+            defer expected.deinit(testing.allocator);
+            try testing.expectEqualSlices(
+                u32,
+                &expected_offsets,
+                expected.slice(),
+            );
+
+            // Bytewise feeds force both UTF-8 continuation boundaries.
+            for (source) |byte| {
+                try indexer.feed("");
+                try indexer.feed(&.{byte});
+            }
+            try indexer.feed("");
+            try indexer.finish();
+            try indexer.finish();
+            var actual = indexer.take();
+            defer actual.deinit(testing.allocator);
+            try expectJson5StreamIndexEqual(&expected, &actual);
+        }
+    }
+}

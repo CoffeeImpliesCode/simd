@@ -1033,42 +1033,15 @@ const Parser = struct {
 };
 
 fn firstInvalidUtf8Byte(input: []const u8) ?usize {
+    // The core validator owns the first-error policy: an invalid byte
+    // (including sequence constraints) reports its own offset, while
+    // truncation reports the sequence lead byte.
+    // Callers invoke this only on a content span selected by lexical rules;
+    // this helper does not change the surrounding grammar-error ordering.
     return switch (simd.validateUtf8(input)) {
         .valid => null,
-        .invalid => |error_info| switch (error_info.kind) {
-            .missing_continuation => legacyMissingContinuationOffset(
-                input,
-                error_info.offset,
-            ),
-            else => error_info.offset,
-        },
+        .invalid => |error_info| error_info.offset,
     };
-}
-
-fn legacyMissingContinuationOffset(input: []const u8, missing_offset: usize) usize {
-    if (missing_offset == 0 or missing_offset >= input.len) return missing_offset;
-
-    var sequence_start = missing_offset;
-    while (sequence_start > 0) {
-        const previous = input[sequence_start - 1];
-        if (previous < 0x80 or previous > 0xBF) break;
-        sequence_start -= 1;
-    }
-    if (sequence_start == 0) return missing_offset;
-
-    const header_offset = sequence_start - 1;
-    const sequence_length: usize = switch (input[header_offset]) {
-        0xC0...0xC1 => return header_offset,
-        0xC2...0xDF => 2,
-        0xE0...0xEF => 3,
-        0xF0...0xF4 => 4,
-        else => return missing_offset,
-    };
-
-    // The legacy UTF-8 validator checked total sequence length before
-    // continuation bytes, so an incomplete sequence points at its header.
-    if (input.len - header_offset < sequence_length) return header_offset;
-    return missing_offset;
 }
 
 fn validateString(
@@ -2115,6 +2088,28 @@ test "validate carries lexical and container diagnostic offsets" {
         "[0 \"\\q\"]",
     );
     try testing.expectEqual(@as(usize, 3), string_without_separator.byte_offset);
+}
+
+test "UTF-8 diagnostics distinguish invalid continuation from truncation" {
+    // A present malformed continuation takes precedence over a later missing byte.
+    const cases = [_]struct {
+        input: []const u8,
+        expected_offset: usize,
+    }{
+        .{ .input = "[\"\xe2(\"]", .expected_offset = 3 },
+        .{ .input = "[\"\xe2\"]", .expected_offset = 2 },
+        .{ .input = "[\"\xe2\x82\"]", .expected_offset = 2 },
+        .{ .input = "[\"\xc0Y\"]", .expected_offset = 3 },
+        .{ .input = "[\"\xc0\x80\"]", .expected_offset = 2 },
+    };
+
+    for (cases) |case| {
+        const diagnostic = try expectStage2Diagnostic(error.InvalidUtf8, case.input);
+        try testing.expectEqual(
+            case.expected_offset,
+            diagnostic.byte_offset,
+        );
+    }
 }
 
 test "validate locates the first invalid UTF-8 byte" {
