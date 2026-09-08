@@ -200,6 +200,61 @@ pub fn matchRange(comptime len: usize, v: Vec(len, u8), min: u8, max: u8) Mask(l
     return @bitCast(in_range);
 }
 
+pub fn validMask(comptime bits: usize, valid_count: usize) Mask(bits) {
+    comptime assert(bits > 0);
+    assert(valid_count <= bits);
+
+    const Result = Mask(bits);
+    if (valid_count == bits) return std.math.maxInt(Result);
+    if (valid_count == 0) return 0;
+
+    const Shift = std.math.Log2Int(Result);
+    return (@as(Result, 1) << @as(Shift, @intCast(valid_count))) - 1;
+}
+
+pub fn matchJsonWhitespace(comptime len: usize, v: Vec(len, u8)) Mask(len) {
+    comptime assert(len > 0);
+
+    const tab: Vec(len, u8) = @splat(0x09);
+    const distance_from_tab = v -% tab;
+    const folded_distance = distance_from_tab |
+        ((distance_from_tab & @as(Vec(len, u8), @splat(0x02))) <<
+            @as(Vec(len, u8), @splat(1)));
+    const control_whitespace = folded_distance <= @as(Vec(len, u8), @splat(0x04));
+    const whitespace = control_whitespace | (v == @as(Vec(len, u8), @splat(0x20)));
+    if (comptime len % 8 != 0) {
+        var result: Mask(len) = 0;
+        inline for (0..len) |lane| {
+            result |= @as(Mask(len), @intFromBool(whitespace[lane])) << lane;
+        }
+        return result;
+    }
+    return @bitCast(whitespace);
+}
+
+pub fn trailingRunOdd(
+    comptime bits: usize,
+    mask: Mask(bits),
+    valid_count: usize,
+    previous_odd: bool,
+) bool {
+    comptime assert(bits > 0);
+    assert(valid_count <= bits);
+    if (valid_count == 0) return false;
+
+    const valid = validMask(bits, valid_count);
+    const masked = mask & valid;
+    const non_matching = (~masked) & valid;
+    if (non_matching == 0) {
+        return (valid_count % 2 == 0) == previous_odd;
+    }
+
+    const Shift = std.math.Log2Int(Mask(bits));
+    const alignment: Shift = @intCast(bits - valid_count);
+    const trailing_count: usize = @intCast(@clz(non_matching << alignment));
+    return trailing_count % 2 != 0;
+}
+
 pub fn extractBitIndexes(
     comptime T: type,
     bitmask: T,
@@ -233,6 +288,37 @@ pub fn extractBitIndexes(
     }
     while (mask != 0 and written < out_indexes.len) {
         const bit_pos: usize = @ctz(mask);
+        out_indexes[written] = @intCast(base_offset + bit_pos);
+        written += 1;
+        mask &= mask - 1;
+    }
+    return written;
+}
+
+pub fn extractBitIndexesChecked(
+    comptime T: type,
+    bitmask: T,
+    base_offset: usize,
+    out_indexes: []u32,
+) error{CapacityExceeded, InputTooLarge}!usize {
+    comptime validateMaskType(T);
+
+    const required_count: usize = @intCast(@popCount(bitmask));
+    if (out_indexes.len < required_count) return error.CapacityExceeded;
+    if (required_count == 0) return 0;
+
+    const bit_count: usize = @typeInfo(T).int.bits;
+    const leading_zero_count: usize = @intCast(@clz(bitmask));
+    const highest_bit: usize = bit_count - leading_zero_count - 1;
+    const highest_offset = std.math.add(usize, base_offset, highest_bit) catch {
+        return error.InputTooLarge;
+    };
+    if (highest_offset > std.math.maxInt(u32)) return error.InputTooLarge;
+
+    var mask = bitmask;
+    var written: usize = 0;
+    while (mask != 0) {
+        const bit_pos: usize = @intCast(@ctz(mask));
         out_indexes[written] = @intCast(base_offset + bit_pos);
         written += 1;
         mask &= mask - 1;
@@ -1081,4 +1167,214 @@ test "extractBitIndexes handles u32 masks" {
 
 test "extractBitIndexes handles u64 masks" {
     try expectBitIndexExtraction(u64);
+}
+
+fn scalarJsonWhitespace(byte: u8) bool {
+    return byte == ' ' or byte == '\t' or byte == '\n' or byte == '\r';
+}
+
+fn expectJsonWhitespaceForWidth(comptime len: usize) !void {
+    var bytes: [len]u8 = undefined;
+    var byte_start: usize = 0;
+    while (byte_start < 256) : (byte_start += 1) {
+        for (0..len) |lane| {
+            bytes[lane] = @intCast((byte_start + lane) % 256);
+        }
+
+        const vector: Vec(len, u8) = bytes;
+        const actual = matchJsonWhitespace(len, vector);
+        var expected: Mask(len) = 0;
+        for (bytes, 0..) |byte, lane| {
+            if (scalarJsonWhitespace(byte)) {
+                expected |= @as(Mask(len), 1) <<
+                    @as(std.math.Log2Int(Mask(len)), @intCast(lane));
+            }
+        }
+        try testing.expectEqual(expected, actual);
+    }
+}
+
+test "matchJsonWhitespace agrees with scalar classification for every byte" {
+    inline for (.{ 4, 5, 7, 16, 32, 64 }) |len| {
+        try expectJsonWhitespaceForWidth(len);
+    }
+}
+
+fn expectValidMasks(comptime bits: usize) !void {
+    var valid_count: usize = 0;
+    while (valid_count <= bits) : (valid_count += 1) {
+        const expected: Mask(bits) = if (valid_count == bits)
+            std.math.maxInt(Mask(bits))
+        else if (valid_count == 0)
+            0
+        else
+            (@as(Mask(bits), 1) <<
+                @as(std.math.Log2Int(Mask(bits)), @intCast(valid_count))) - 1;
+        try testing.expectEqual(expected, validMask(bits, valid_count));
+    }
+}
+
+test "validMask canonicalizes every width and tail count" {
+    inline for (.{ 4, 5, 7, 16, 32, 64 }) |bits| {
+        try expectValidMasks(bits);
+    }
+}
+
+fn scalarTrailingRunOdd(
+    comptime T: type,
+    mask: T,
+    valid_count: usize,
+    previous_odd: bool,
+) bool {
+    const Shift = std.math.Log2Int(T);
+    const one: T = 1;
+    if (valid_count == 0) return false;
+
+    var run_length: usize = 0;
+    var bit_index = valid_count;
+    while (bit_index > 0 and
+        (mask & (one << @as(Shift, @intCast(bit_index - 1)))) != 0)
+    {
+        bit_index -= 1;
+        run_length += 1;
+    }
+    if (bit_index == 0) return (run_length % 2 == 0) == previous_odd;
+    return run_length % 2 != 0;
+}
+
+fn expectTrailingRunOddSmall(comptime T: type) !void {
+    const bits: usize = @typeInfo(T).int.bits;
+    const mask_count: usize = @as(usize, 1) << bits;
+    var mask_value: usize = 0;
+    while (mask_value < mask_count) : (mask_value += 1) {
+        const mask: T = @intCast(mask_value);
+        var valid_count: usize = 0;
+        while (valid_count <= bits) : (valid_count += 1) {
+            for ([_]bool{ false, true }) |previous_odd| {
+                try testing.expectEqual(
+                    scalarTrailingRunOdd(T, mask, valid_count, previous_odd),
+                    trailingRunOdd(bits, mask, valid_count, previous_odd),
+                );
+            }
+        }
+    }
+}
+
+fn alternatingMask(comptime T: type) T {
+    const bits: usize = @typeInfo(T).int.bits;
+    const Shift = std.math.Log2Int(T);
+    const one: T = 1;
+    var result: T = 0;
+    inline for (0..bits) |bit_index| {
+        if (bit_index % 2 == 0) {
+            result |= one << @as(Shift, @intCast(bit_index));
+        }
+    }
+    return result;
+}
+
+fn expectTrailingRunOddWide(comptime T: type) !void {
+    const bits: usize = @typeInfo(T).int.bits;
+    const masks = [_]T{
+        0,
+        std.math.maxInt(T),
+        alternatingMask(T),
+        @as(T, 1),
+        std.math.maxInt(T) ^ @as(T, 1),
+    };
+    for (masks) |mask| {
+        var valid_count: usize = 0;
+        while (valid_count <= bits) : (valid_count += 1) {
+            for ([_]bool{ false, true }) |previous_odd| {
+                try testing.expectEqual(
+                    scalarTrailingRunOdd(T, mask, valid_count, previous_odd),
+                    trailingRunOdd(bits, mask, valid_count, previous_odd),
+                );
+            }
+        }
+    }
+}
+
+test "trailingRunOdd agrees with scalar carry for all small masks" {
+    inline for (.{ u4, u5, u7 }) |T| {
+        try expectTrailingRunOddSmall(T);
+    }
+}
+
+test "trailingRunOdd agrees with scalar carry for wide masks" {
+    inline for (.{ u16, u32, u64 }) |T| {
+        try expectTrailingRunOddWide(T);
+    }
+}
+
+fn expectCheckedBitIndexExtraction(comptime T: type) !void {
+    const bits: usize = @typeInfo(T).int.bits;
+    const Shift = std.math.Log2Int(T);
+    const one: T = 1;
+    const bitmask = (one << @as(Shift, 0)) |
+        (one << @as(Shift, @intCast(bits / 2))) |
+        (one << @as(Shift, @intCast(bits - 1)));
+
+    var indexes: [3]u32 = undefined;
+    const count = try extractBitIndexesChecked(T, bitmask, 100, &indexes);
+    try testing.expectEqual(@as(usize, 3), count);
+    try testing.expectEqual(@as(u32, 100), indexes[0]);
+    try testing.expectEqual(@as(u32, @intCast(100 + bits / 2)), indexes[1]);
+    try testing.expectEqual(@as(u32, @intCast(100 + bits - 1)), indexes[2]);
+
+    var short_indexes = [_]u32{ 0xdead_beef, 0xcafe_babe };
+    try testing.expectError(
+        error.CapacityExceeded,
+        extractBitIndexesChecked(T, bitmask, 100, &short_indexes),
+    );
+    try testing.expectEqualSlices(
+        u32,
+        &.{ 0xdead_beef, 0xcafe_babe },
+        &short_indexes,
+    );
+
+    var overflow_indexes = [_]u32{ 0xdead_beef, 0xcafe_babe, 0xfeed_face };
+    try testing.expectError(
+        error.InputTooLarge,
+        extractBitIndexesChecked(
+            T,
+            bitmask,
+            @as(usize, std.math.maxInt(u32)),
+            &overflow_indexes,
+        ),
+    );
+    try testing.expectEqualSlices(
+        u32,
+        &.{ 0xdead_beef, 0xcafe_babe, 0xfeed_face },
+        &overflow_indexes,
+    );
+
+    var boundary_index: [1]u32 = undefined;
+    try testing.expectEqual(
+        @as(usize, 1),
+        try extractBitIndexesChecked(
+            T,
+            one,
+            @as(usize, std.math.maxInt(u32)),
+            &boundary_index,
+        ),
+    );
+    try testing.expectEqual(std.math.maxInt(u32), boundary_index[0]);
+
+    var empty: [0]u32 = .{};
+    try testing.expectEqual(
+        @as(usize, 0),
+        try extractBitIndexesChecked(
+            T,
+            0,
+            std.math.maxInt(usize),
+            &empty,
+        ),
+    );
+}
+
+test "extractBitIndexesChecked emits complete output at all supported widths" {
+    inline for (.{ u4, u5, u7, u16, u32, u64 }) |T| {
+        try expectCheckedBitIndexExtraction(T);
+    }
 }

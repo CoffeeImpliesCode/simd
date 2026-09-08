@@ -7,6 +7,7 @@ const Allocator = std.mem.Allocator;
 const CHECKSUM_STRIDE: usize = 64;
 const CHECKSUM_BYTES: usize = 128;
 const STREAM_CHUNK_LEN: usize = 4096;
+const RESIDENT_PREFIX_EVENT_COUNT: usize = 8;
 const DEFAULT_ITERATIONS: usize = 3;
 const workload_scale: usize = 64;
 
@@ -33,6 +34,8 @@ const Stage = enum {
     validate,
     tape,
     stream,
+    traverse_all,
+    traverse_prefix8,
 };
 
 const formats = [_]Format{
@@ -58,6 +61,8 @@ const stages = [_]Stage{
     .validate,
     .tape,
     .stream,
+    .traverse_all,
+    .traverse_prefix8,
 };
 
 const input_count = formats.len * workloads.len;
@@ -232,6 +237,8 @@ fn stageName(stage: Stage) []const u8 {
         .validate => "validate",
         .tape => "tape",
         .stream => "stream",
+        .traverse_all => "traverse_all",
+        .traverse_prefix8 => "traverse_prefix8",
     };
 }
 
@@ -260,6 +267,107 @@ fn mixBytes(checksum: *u64, bytes: []const u8) void {
 fn sampleToken(index: usize, total: usize) bool {
     if (total == 0) return false;
     return index < 4 or index == total - 1 or index % CHECKSUM_STRIDE == 0;
+}
+
+fn mixNativeValue(checksum: *u64, value: anytype) void {
+    const Value = @TypeOf(value);
+    switch (@typeInfo(Value)) {
+        .void => {},
+        .bool => mix(checksum, @intFromBool(value)),
+        .int => |info| {
+            if (info.bits > 64) {
+                @compileError("resident event integer payload exceeds 64 bits");
+            }
+            const Unsigned = @Int(.unsigned, info.bits);
+            const bits: Unsigned = @bitCast(value);
+            mix(checksum, @intCast(bits));
+        },
+        .float => |info| {
+            if (info.bits > 64) {
+                @compileError("resident event float payload exceeds 64 bits");
+            }
+            const Unsigned = @Int(.unsigned, info.bits);
+            const bits: Unsigned = @bitCast(value);
+            mix(checksum, @intCast(bits));
+        },
+        .@"enum" => mixNativeValue(checksum, @intFromEnum(value)),
+        .@"struct" => |info| {
+            mix(checksum, @intCast(info.fields.len));
+            inline for (info.fields, 0..) |field, field_index| {
+                mix(checksum, @intCast(field_index));
+                mixNativeValue(checksum, @field(value, field.name));
+            }
+        },
+        .@"union" => |info| {
+            if (info.tag_type == null) {
+                @compileError("resident event payload union must have a tag");
+            }
+            mixNativeValue(checksum, @intFromEnum(std.meta.activeTag(value)));
+            switch (value) {
+                inline else => |payload| mixNativeValue(checksum, payload),
+            }
+        },
+        .optional => {
+            if (value) |payload| {
+                mix(checksum, 1);
+                mixNativeValue(checksum, payload);
+            } else {
+                mix(checksum, 0);
+            }
+        },
+        .array => |info| {
+            if (info.child == u8) {
+                mixBytes(checksum, value[0..]);
+            } else {
+                mix(checksum, @intCast(info.len));
+                inline for (value) |element| mixNativeValue(checksum, element);
+            }
+        },
+        .pointer => |info| {
+            if (info.size != .slice or info.child != u8) {
+                @compileError(
+                    "resident event pointer payload must be a borrowed byte slice",
+                );
+            }
+            mixBytes(checksum, value);
+        },
+        else => @compileError(
+            "unsupported resident event payload type: " ++ @typeName(Value),
+        ),
+    }
+}
+
+fn consumeResidentEvents(
+    reader: anytype,
+    event_limit: ?usize,
+    checksum: *u64,
+) !void {
+    if (event_limit) |limit| std.debug.assert(limit > 0);
+
+    var event_count: usize = 0;
+    var next_event = try reader.next();
+    while (next_event) |event| {
+        const next_count = event_count + 1;
+        const limit_reached = if (event_limit) |limit|
+            next_count >= limit
+        else
+            false;
+
+        var following_event: @TypeOf(next_event) = null;
+        if (!limit_reached) following_event = try reader.next();
+
+        const sample = event_count < 4 or
+            event_count % CHECKSUM_STRIDE == 0 or
+            following_event == null;
+        if (sample) mixNativeValue(checksum, event);
+        std.mem.doNotOptimizeAway(&event);
+
+        event_count = next_count;
+        if (limit_reached) break;
+        next_event = following_event;
+    }
+    mix(checksum, @intCast(event_count));
+    std.mem.doNotOptimizeAway(reader);
 }
 
 fn stageSeed(input: Input, stage: Stage) u64 {
@@ -697,6 +805,147 @@ fn runStreamOnce(
     }
 }
 
+fn runResidentOnce(
+    parser: anytype,
+    input: []const u8,
+    event_limit: ?usize,
+    checksum: *u64,
+    comptime init_document: anytype,
+) !void {
+    var document = try init_document(parser, input);
+    defer document.deinit();
+
+    var reader = try document.eventReader();
+    try consumeResidentEvents(&reader, event_limit, checksum);
+    std.mem.doNotOptimizeAway(&document);
+}
+
+fn runResidentStageFor(
+    comptime Parser: type,
+    io: std.Io,
+    allocator: Allocator,
+    input: Input,
+    stage: Stage,
+    iterations: usize,
+    comptime init_document: anytype,
+) !Sample {
+    const event_limit: ?usize = switch (stage) {
+        .traverse_all => null,
+        .traverse_prefix8 => RESIDENT_PREFIX_EVENT_COUNT,
+        else => unreachable,
+    };
+
+    var counting = CountingAllocator{ .child = allocator };
+    const counted = counting.allocator();
+    var parser = try Parser.init(counted, input.bytes.len);
+    defer parser.deinit();
+
+    var warmup_checksum = input.hash;
+    try runResidentOnce(
+        &parser,
+        input.bytes,
+        event_limit,
+        &warmup_checksum,
+        init_document,
+    );
+    counting.reset();
+
+    var checksum = stageSeed(input, stage);
+    const start = std.Io.Clock.awake.now(io).nanoseconds;
+    for (0..iterations) |_| {
+        try runResidentOnce(
+            &parser,
+            input.bytes,
+            event_limit,
+            &checksum,
+            init_document,
+        );
+        std.mem.doNotOptimizeAway(&checksum);
+    }
+    const end = std.Io.Clock.awake.now(io).nanoseconds;
+    std.mem.doNotOptimizeAway(&checksum);
+    return .{
+        .elapsed_ns = try elapsedNanoseconds(start, end),
+        .checksum = checksum,
+        .allocation_count = counting.allocation_count,
+        .allocated_bytes = counting.allocated_bytes,
+    };
+}
+
+fn runResidentStage(
+    io: std.Io,
+    allocator: Allocator,
+    input: Input,
+    stage: Stage,
+    iterations: usize,
+) !Sample {
+    return switch (input.format) {
+        .json => runResidentStageFor(
+            lib.ondemand.Parser,
+            io,
+            allocator,
+            input,
+            stage,
+            iterations,
+            lib.formats.json.initOnDemandDocument,
+        ),
+        .jsonl => runResidentStageFor(
+            lib.formats.jsonl.Parser,
+            io,
+            allocator,
+            input,
+            stage,
+            iterations,
+            lib.formats.jsonl.initOnDemandDocument,
+        ),
+        .jsonc => runResidentStageFor(
+            lib.ondemand.Parser,
+            io,
+            allocator,
+            input,
+            stage,
+            iterations,
+            lib.formats.jsonc.initOnDemandDocument,
+        ),
+        .json5 => runResidentStageFor(
+            lib.ondemand.Parser,
+            io,
+            allocator,
+            input,
+            stage,
+            iterations,
+            lib.formats.json5.initOnDemandDocument,
+        ),
+        .markdown => runResidentStageFor(
+            lib.formats.markdown.Parser,
+            io,
+            allocator,
+            input,
+            stage,
+            iterations,
+            lib.formats.markdown.initOnDemandDocument,
+        ),
+        .xml => runResidentStageFor(
+            lib.formats.xml.Parser,
+            io,
+            allocator,
+            input,
+            stage,
+            iterations,
+            lib.formats.xml.initOnDemandDocument,
+        ),
+        .yaml => runResidentStageFor(
+            lib.formats.yaml.Parser,
+            io,
+            allocator,
+            input,
+            stage,
+            iterations,
+            lib.formats.yaml.initOnDemandDocument,
+        ),
+    };
+}
+
 fn elapsedNanoseconds(start: i96, end: i96) !u64 {
     if (end < start) return error.ClockWentBackwards;
     const delta: i96 = end - start;
@@ -711,6 +960,13 @@ fn runStage(
     stage: Stage,
     iterations: usize,
 ) !Sample {
+    switch (stage) {
+        .traverse_all, .traverse_prefix8 => {
+            return runResidentStage(io, allocator, input, stage, iterations);
+        },
+        .index, .validate, .tape, .stream => {},
+    }
+
     var counting = CountingAllocator{ .child = allocator };
     counting.reset();
     const counted = counting.allocator();
@@ -722,6 +978,7 @@ fn runStage(
             .validate => try runValidateOnce(input.format, counted, input.bytes, &checksum),
             .tape => try runTapeOnce(input.format, counted, input.bytes, &checksum),
             .stream => try runStreamOnce(input.format, counted, input.bytes, &checksum),
+            .traverse_all, .traverse_prefix8 => unreachable,
         }
         std.mem.doNotOptimizeAway(&checksum);
     }
@@ -1118,6 +1375,25 @@ pub fn main(init: std.process.Init) !void {
     try stdout.print("# synthetic_scale={d}\n", .{workload_scale});
     try stdout.print(
         "# consumption=checksum samples first4,last,every64 tokens; raw spans max128 bytes; included in elapsed_ns\n",
+        .{},
+    );
+    try stdout.print(
+        "# resident_setup=parser init and stage warmup excluded; counters reset after setup; " ++
+            "document init/indexing,traversal,release included in elapsed_ns\n",
+        .{},
+    );
+    try stdout.print(
+        "# resident_consumption=checksum samples first4,last,every64 native events; " ++
+            "raw byte spans max128 bytes; included in elapsed_ns\n",
+        .{},
+    );
+    try stdout.print(
+        "# traverse_prefix8=first 8 native events or EOF, then document release\n",
+        .{},
+    );
+    try stdout.print(
+        "# baseline=index,validate,tape,stream have pre-feature baselines; " ++
+            "traverse_all,traverse_prefix8 have no pre-feature baseline\n",
         .{},
     );
     try stdout.print(

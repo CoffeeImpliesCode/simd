@@ -1,6 +1,7 @@
 const std = @import("std");
 const stage1 = @import("stage1.zig");
 const simd = @import("simd.zig");
+const lexical = @import("json_lexical.zig");
 
 const assert = std.debug.assert;
 const testing = std.testing;
@@ -32,31 +33,8 @@ pub const Options = struct {
     mode: Mode = .document,
 };
 
-pub const CommentState = enum {
-    none,
-    line,
-    block,
-};
-
-pub const CarryState = struct {
-    in_string: bool = false,
-    in_atom: bool = false,
-    ends_in_backslash: bool = false,
-    quote_delimiter: u8 = 0,
-    comment: CommentState = .none,
-    backslash_run_odd: bool = false,
-    pending_slash: bool = false,
-    pending_escape: bool = false,
-    pending_escape_offset: u32 = 0,
-    pending_unicode_len: u2 = 0,
-    pending_unicode: [3]u8 = .{ 0, 0, 0 },
-    pending_unicode_offset: u32 = 0,
-    block_comment_ends_in_star: bool = false,
-    // JSON5 line comments carry at most the E2 80 prefix of a separator.
-    pending_line_comment_unicode_len: u2 = 0,
-    pending_line_comment_unicode: [2]u8 = .{ 0, 0 },
-};
-
+pub const CommentState = lexical.CommentState;
+pub const CarryState = lexical.State;
 /// Incrementally builds a JSON-family StructuralIndex. Input bytes are copied
 /// through two fixed, padded slots allocated by init; feed never allocates or
 /// replaces that input buffer.
@@ -70,19 +48,54 @@ pub const StreamIndexer = struct {
     fill: usize = 0,
     processed_len: usize = 0,
     input_len: usize = 0,
-    carry: CarryState = .{},
+    carry: lexical.State = .{},
     index: ?stage1.StructuralIndex,
     finished: bool = false,
 
     const Self = @This();
+    const ScanSink = struct {
+        owner: *Self,
+
+        pub fn appendOffset(self: *@This(), offset: usize) lexical.Error!void {
+            if (offset > std.math.maxInt(u32)) return error.InputTooLarge;
+            const index = self.owner.indexPtr();
+            if (index.count >= index.indexes.len - sentinel_count) {
+                return error.CapacityExceeded;
+            }
+            index.indexes[index.count] = @intCast(offset);
+            index.count += 1;
+        }
+
+        pub fn appendMask(
+            self: *@This(),
+            comptime T: type,
+            mask: T,
+            base_offset: usize,
+        ) lexical.Error!void {
+            const index = self.owner.indexPtr();
+            if (index.count > index.indexes.len - sentinel_count) {
+                return error.CapacityExceeded;
+            }
+            const output = index.indexes[index.count .. index.indexes.len - sentinel_count];
+            const written = try simd.extractBitIndexesChecked(
+                T,
+                mask,
+                base_offset,
+                output,
+            );
+            index.count += written;
+        }
+    };
 
     pub const InitError = stage1.StructuralIndex.InitError;
     pub const FeedError = std.mem.Allocator.Error || error{
         AlreadyFinished,
+        CapacityExceeded,
         CapacityOverflow,
         InputTooLarge,
     };
     pub const FinishError = std.mem.Allocator.Error || error{
+        CapacityExceeded,
         CapacityOverflow,
         InputTooLarge,
     };
@@ -171,7 +184,7 @@ pub const StreamIndexer = struct {
             remaining = remaining[copy_count..];
 
             if (self.fill == self.slot_len) {
-                self.processBytes(slot[0..self.slot_len]);
+                try self.processBytes(slot[0..self.slot_len]);
                 self.fill = 0;
                 self.active_slot ^= 1;
             }
@@ -208,11 +221,11 @@ pub const StreamIndexer = struct {
         try self.ensureIndexCapacity(self.input_len);
         if (self.fill > 0) {
             const slot = self.activeSlot();
-            self.processBytes(slot[0..self.fill]);
+            try self.processBytes(slot[0..self.fill]);
             self.fill = 0;
         }
 
-        self.flushDeferred();
+        try self.finishLexical();
         assert(self.processed_len == self.input_len);
         try self.indexPtr().finish(self.input_len);
         self.finished = true;
@@ -291,463 +304,49 @@ pub const StreamIndexer = struct {
         );
     }
 
-    fn processBytesSimd(self: *Self, data: []const u8) void {
-        const VLEN = simd.default_vector_len;
-        const Mask = simd.Mask(VLEN);
-        const Shift = std.math.Log2Int(Mask);
+    fn processBytes(self: *Self, data: []const u8) FinishError!void {
         assert(data.len <= self.slot_len);
         assert(self.index != null);
         assert(self.processed_len + data.len <= self.input_len);
 
-        var windows = simd.windows(u8, VLEN, data, 0);
-        var local_offset: usize = 0;
-        while (local_offset < data.len) : (local_offset += VLEN) {
-            const chunk = windows.next().?;
-            const valid_count = @min(data.len - local_offset, VLEN);
-            const valid_mask = validByteMask(VLEN, valid_count);
-            const top_bit: Mask = @as(Mask, 1) <<
-                @as(Shift, @intCast(VLEN - 1));
-
-            const backslashes = simd.matchByte(VLEN, chunk, '\\') & valid_mask;
-            const backslash_result = simd.computeBackslashRuns(
-                Mask,
-                backslashes,
-                self.carry.ends_in_backslash,
-            );
-            var odd_backslash_ends =
-                backslash_result.odd_length_ends & valid_mask;
-            if (self.carry.ends_in_backslash) {
-                if ((backslashes & @as(Mask, 1)) == 0) {
-                    if (self.carry.backslash_run_odd) {
-                        odd_backslash_ends |= 1;
-                    } else {
-                        odd_backslash_ends &= ~@as(Mask, 1);
-                    }
-                } else if (self.carry.backslash_run_odd) {
-                    odd_backslash_ends ^=
-                        leadingRunEndMask(VLEN, backslashes, valid_count);
-                }
-            }
-
-            const quotes = simd.matchByte(VLEN, chunk, '"') & valid_mask;
-            const unescaped_quotes = quotes & ~odd_backslash_ends;
-            const inside_without_closing =
-                simd.prefixXor(Mask, unescaped_quotes) ^
-                if (self.carry.in_string) ~@as(Mask, 0) else 0;
-            const opening_quotes = unescaped_quotes & inside_without_closing;
-            const string_mask = inside_without_closing | unescaped_quotes;
-            const outside_string = ~string_mask & valid_mask;
-
-            const structural =
-                simd.matchAny4(VLEN, chunk, '{', '}', '[', ']') |
-                simd.matchAny2(VLEN, chunk, ':', ',');
-            const whitespace =
-                simd.matchAny4(VLEN, chunk, ' ', '\t', '\n', '\r');
-            const atom_candidates =
-                simd.matchRange(VLEN, chunk, '0', '9') |
-                simd.matchAny4(VLEN, chunk, '-', 't', 'f', 'n');
-            const atom_active =
-                outside_string & ~(structural | whitespace | quotes);
-            const atom_starts = atom_candidates & atom_active &
-                ~((atom_active << @as(Shift, 1)) |
-                    if (self.carry.in_atom) @as(Mask, 1) else 0);
-            const record_boundaries: Mask = if (self.options.mode == .jsonl)
-                simd.matchByte(VLEN, chunk, '\n')
-            else
-                0;
-            const structural_indexes =
-                ((structural | atom_starts | record_boundaries) &
-                    outside_string) |
-                opening_quotes;
-
-            var candidates: [VLEN]u32 = undefined;
-            const candidate_count = simd.extractBitIndexes(
-                Mask,
-                structural_indexes,
-                self.processed_len + local_offset,
-                &candidates,
-            );
-            const index = self.indexPtr();
-            assert(index.count + candidate_count + sentinel_count <=
-                index.indexes.len);
-            @memcpy(
-                index.indexes[index.count..][0..candidate_count],
-                candidates[0..candidate_count],
-            );
-            index.count += candidate_count;
-
-            self.carry.in_string = (inside_without_closing & top_bit) != 0;
-            self.carry.ends_in_backslash = valid_count == VLEN and
-                (backslashes & top_bit) != 0;
-            self.carry.quote_delimiter =
-                if (self.carry.in_string) '"' else 0;
-            self.carry.backslash_run_odd = trailingBackslashRunOdd(
-                VLEN,
-                chunk,
-                valid_count,
-                self.carry.backslash_run_odd,
-            );
-            self.carry.in_atom = valid_count != 0 and
-                (atom_active & (@as(Mask, 1) <<
-                    @as(Shift, @intCast(valid_count - 1)))) != 0;
-        }
-
-        self.processed_len += data.len;
-    }
-
-    fn processBytes(self: *Self, data: []const u8) void {
-        if (self.options.dialect == .json) {
-            self.processBytesSimd(data);
-        } else {
-            self.processBytesScalar(data);
-        }
-    }
-
-    fn processBytesScalar(self: *Self, data: []const u8) void {
-        assert(data.len <= self.slot_len);
-        assert(self.index != null);
-        assert(self.processed_len + data.len <= self.input_len);
-
-        for (data, 0..) |byte, local_offset| {
-            self.processByte(
-                self.processed_len + local_offset,
-                byte,
-            );
+        var sink = ScanSink{ .owner = self };
+        switch (self.lexicalMode()) {
+            inline else => |mode| lexical.feed(
+                simd.default_vector_len,
+                mode,
+                &self.carry,
+                data,
+                self.processed_len,
+                &sink,
+            ) catch |err| switch (err) {
+                error.NonContiguousInput => unreachable,
+                error.CapacityExceeded => return error.CapacityExceeded,
+                error.InputTooLarge => return error.InputTooLarge,
+            },
         }
         self.processed_len += data.len;
     }
 
-    fn processByte(self: *Self, offset: usize, byte: u8) void {
-        defer self.updateBackslashParity(byte);
-
-        if (self.carry.pending_slash) {
-            self.carry.pending_slash = false;
-            if (self.commentsEnabled() and byte == '/') {
-                self.carry.comment = .line;
-                self.carry.in_atom = false;
-                return;
-            }
-            if (self.commentsEnabled() and byte == '*') {
-                self.carry.comment = .block;
-                self.carry.in_atom = false;
-                return;
-            }
-
-            // A slash that is not followed by a comment opener is ordinary
-            // input. JSON-family scanners do not index it, but JSON and JSONC
-            // retain it as atom context while JSON5 treats it as a separator.
-            self.carry.in_atom = self.options.dialect != .json5;
-        }
-
-        if (self.carry.pending_escape) {
-            self.carry.pending_escape = false;
-            if (byte == 'u') {
-                self.recordAtom(self.carry.pending_escape_offset);
-                self.carry.in_atom = true;
-                return;
-            }
-            self.carry.in_atom = false;
-        }
-
-        if (self.carry.pending_unicode_len != 0) {
-            if (self.appendPendingUnicode(byte)) return;
-            self.processByteNow(offset, byte);
-            return;
-        }
-
-        self.processByteNow(offset, byte);
-    }
-
-    fn processByteNow(self: *Self, offset: usize, byte: u8) void {
-        switch (self.carry.comment) {
-            .line => {
-                if (self.carry.pending_line_comment_unicode_len != 0) {
-                    if (self.appendPendingLineCommentUnicode(byte)) return;
-                }
-                if (byte == '\n' or byte == '\r') {
-                    self.carry.comment = .none;
-                    self.carry.in_atom = false;
-                    if (self.options.mode == .jsonl and byte == '\n') {
-                        self.record(offset);
-                    }
-                    return;
-                }
-                if (self.options.dialect == .json5 and byte == 0xe2) {
-                    self.carry.pending_line_comment_unicode[0] = byte;
-                    self.carry.pending_line_comment_unicode_len = 1;
-                }
-                return;
+    fn finishLexical(self: *Self) FinishError!void {
+        var sink = ScanSink{ .owner = self };
+        switch (self.lexicalMode()) {
+            inline else => |mode| lexical.finish(mode, &self.carry, &sink) catch |err| switch (err) {
+                error.NonContiguousInput => unreachable,
+                error.CapacityExceeded => return error.CapacityExceeded,
+                error.InputTooLarge => return error.InputTooLarge,
             },
-            .block => {
-                if (self.carry.block_comment_ends_in_star) {
-                    self.carry.block_comment_ends_in_star = false;
-                    if (byte == '/') {
-                        self.carry.comment = .none;
-                        self.carry.in_atom = false;
-                        return;
-                    }
-                }
-                if (byte == '*') {
-                    self.carry.block_comment_ends_in_star = true;
-                }
-                return;
-            },
-            .none => {},
         }
-        if (self.carry.quote_delimiter != 0) {
-            if (byte == self.carry.quote_delimiter and
-                !self.carry.backslash_run_odd)
-            {
-                self.carry.in_string = false;
-                self.carry.quote_delimiter = 0;
-                self.carry.in_atom = false;
-            }
-            return;
-        }
-        if (self.commentsEnabled() and byte == '/') {
-            self.carry.pending_slash = true;
-            return;
-        }
-
-        if (self.options.dialect == .json5 and byte == '\\') {
-            self.carry.pending_escape = true;
-            self.carry.pending_escape_offset = @intCast(offset);
-            return;
-        }
-
-        if (self.isQuote(byte)) {
-            if (!self.carry.backslash_run_odd) {
-                // JSONC and JSON5 discover opening quotes in their Stage2 source scan.
-                if (self.options.dialect == .json) {
-                    self.record(offset);
-                }
-                self.carry.in_string = true;
-                self.carry.quote_delimiter = byte;
-                self.carry.in_atom = false;
-            } else {
-                self.carry.in_atom = self.options.dialect == .jsonc;
-            }
-            return;
-        }
-
-        if (self.options.mode == .jsonl and byte == '\n') {
-            self.record(offset);
-            self.carry.in_atom = false;
-            return;
-        }
-
-        if (isStructuralByte(byte)) {
-            self.record(offset);
-            self.carry.in_atom = false;
-            return;
-        }
-
-        if (self.options.dialect == .json5 and startsUnicodeWhitespace(byte)) {
-            self.carry.pending_unicode[0] = byte;
-            self.carry.pending_unicode_len = 1;
-            self.carry.pending_unicode_offset = @intCast(offset);
-            return;
-        }
-
-        if (self.isAtomCandidate(byte)) {
-            self.recordAtom(offset);
-            self.carry.in_atom = true;
-            return;
-        }
-
-        self.carry.in_atom = switch (self.options.dialect) {
-            .json, .jsonc => !isWhitespaceByte(byte),
-            .json5 => false,
-        };
-    }
-    fn appendPendingUnicode(self: *Self, byte: u8) bool {
-        const len: usize = self.carry.pending_unicode_len;
-        const first = self.carry.pending_unicode[0];
-
-        if (len == 1) {
-            const expected = switch (first) {
-                0xc2 => byte == 0xa0,
-                0xe1 => byte == 0x9a,
-                0xe2 => byte == 0x80 or byte == 0x81,
-                0xe3 => byte == 0x80,
-                0xef => byte == 0xbb,
-                else => false,
-            };
-            const continuation = byte >= 0x80 and byte <= 0xbf;
-            if (!expected and !continuation) {
-                self.recordAtom(self.carry.pending_unicode_offset);
-                self.carry.in_atom = true;
-                self.carry.pending_unicode_len = 0;
-                return false;
-            }
-        } else if (len == 2 and (byte < 0x80 or byte > 0xbf)) {
-            self.recordAtom(self.carry.pending_unicode_offset);
-            self.carry.in_atom = true;
-            self.carry.pending_unicode_len = 0;
-            return false;
-        }
-
-        self.carry.pending_unicode[len] = byte;
-        self.carry.pending_unicode_len += 1;
-
-        const count: usize = self.carry.pending_unicode_len;
-        const complete = switch (first) {
-            0xc2 => count >= 2,
-            0xe1, 0xe2, 0xe3, 0xef => count >= 3,
-            else => true,
-        };
-        if (!complete) return true;
-
-        const bytes = self.carry.pending_unicode;
-        const whitespace = switch (first) {
-            0xc2 => bytes[1] == 0xa0,
-            0xe1 => bytes[1] == 0x9a and bytes[2] == 0x80,
-            0xe2 => (bytes[1] == 0x80 and
-                (bytes[2] >= 0x80 and bytes[2] <= 0x8a or
-                    bytes[2] == 0xa8 or bytes[2] == 0xa9 or
-                    bytes[2] == 0xaf)) or
-                (bytes[1] == 0x81 and bytes[2] == 0x9f),
-            0xe3 => bytes[1] == 0x80 and bytes[2] == 0x80,
-            0xef => bytes[1] == 0xbb and bytes[2] == 0xbf,
-            else => false,
-        };
-        if (whitespace) {
-            self.carry.in_atom = false;
-        } else {
-            self.recordAtom(self.carry.pending_unicode_offset);
-            self.carry.in_atom = true;
-        }
-        self.carry.pending_unicode_len = 0;
-        return true;
     }
 
-    fn appendPendingLineCommentUnicode(self: *Self, byte: u8) bool {
-        const len: usize = self.carry.pending_line_comment_unicode_len;
-        if (len == 1) {
-            if (byte != 0x80) {
-                self.carry.pending_line_comment_unicode_len = 0;
-                return false;
-            }
-            self.carry.pending_line_comment_unicode[1] = byte;
-            self.carry.pending_line_comment_unicode_len = 2;
-            return true;
-        }
-
-        assert(len == 2);
-        self.carry.pending_line_comment_unicode_len = 0;
-        if (byte == 0xa8 or byte == 0xa9) {
-            self.carry.comment = .none;
-            self.carry.in_atom = false;
-            return true;
-        }
-        return false;
-    }
-
-    fn flushDeferred(self: *Self) void {
-        if (self.carry.pending_slash) {
-            self.carry.pending_slash = false;
-            self.carry.in_atom = self.options.dialect != .json5;
-        }
-        if (self.carry.pending_escape) {
-            self.carry.pending_escape = false;
-            self.carry.in_atom = false;
-        }
-        if (self.carry.pending_unicode_len != 0) {
-            self.recordAtom(self.carry.pending_unicode_offset);
-            self.carry.in_atom = true;
-            self.carry.pending_unicode_len = 0;
-        }
-        self.carry.pending_line_comment_unicode_len = 0;
-    }
-
-    fn record(self: *Self, offset: usize) void {
-        const index = self.indexPtr();
-        assert(index.count + sentinel_count <= index.indexes.len);
-        index.indexes[index.count] = @intCast(offset);
-        index.count += 1;
-    }
-
-    fn recordAtom(self: *Self, offset: usize) void {
-        if (!self.carry.in_atom) self.record(offset);
-    }
-
-    fn commentsEnabled(self: *const Self) bool {
-        return self.options.dialect != .json;
-    }
-
-    fn isQuote(self: *const Self, byte: u8) bool {
-        return byte == '"' or
-            (self.options.dialect == .json5 and byte == '\'');
-    }
-    fn updateBackslashParity(self: *Self, byte: u8) void {
-        self.carry.ends_in_backslash = byte == '\\';
-        self.carry.backslash_run_odd =
-            if (byte == '\\') !self.carry.backslash_run_odd else false;
-    }
-
-    fn isAtomCandidate(self: *const Self, byte: u8) bool {
+    fn lexicalMode(self: *const Self) lexical.Mode {
+        if (self.options.mode == .jsonl) return .jsonl;
         return switch (self.options.dialect) {
-            .json, .jsonc => isAtomByte(byte),
-            .json5 => switch (byte) {
-                '-', '+', '.', '0'...'9', 'a'...'z', 'A'...'Z', '_', '$', 0xc0...0xff => true,
-                0x80...0xbf => self.carry.in_atom,
-                else => false,
-            },
+            .json => .json,
+            .jsonc => .jsonc,
+            .json5 => .json5,
         };
     }
 };
-
-fn startsUnicodeWhitespace(byte: u8) bool {
-    return switch (byte) {
-        0xc2, 0xe1, 0xe2, 0xe3, 0xef => true,
-        else => false,
-    };
-}
-
-fn validByteMask(
-    comptime VLEN: usize,
-    valid_count: usize,
-) simd.Mask(VLEN) {
-    const Mask = simd.Mask(VLEN);
-    const Shift = std.math.Log2Int(Mask);
-
-    if (valid_count == VLEN) return ~@as(Mask, 0);
-    if (valid_count == 0) return 0;
-    return (@as(Mask, 1) << @as(Shift, @intCast(valid_count))) - 1;
-}
-
-fn leadingRunEndMask(
-    comptime VLEN: usize,
-    backslashes: simd.Mask(VLEN),
-    valid_count: usize,
-) simd.Mask(VLEN) {
-    const Mask = simd.Mask(VLEN);
-    const Shift = std.math.Log2Int(Mask);
-
-    const non_backslashes = ~backslashes | ~validByteMask(VLEN, valid_count);
-    if (non_backslashes == 0) return 0;
-    const run_length: usize = @intCast(@ctz(non_backslashes));
-    if (run_length >= valid_count) return 0;
-    return @as(Mask, 1) << @as(Shift, @intCast(run_length));
-}
-
-fn trailingBackslashRunOdd(
-    comptime VLEN: usize,
-    chunk: simd.Vec(VLEN, u8),
-    valid_count: usize,
-    previous_run_odd: bool,
-) bool {
-    if (valid_count == 0) return false;
-
-    const bytes: [VLEN]u8 = chunk;
-    var run_length: usize = 0;
-    var index = valid_count;
-    while (index > 0 and bytes[index - 1] == '\\') : (index -= 1) {
-        run_length += 1;
-    }
-    if (index == 0) return (run_length % 2 == 0) == previous_run_odd;
-    return run_length % 2 != 0;
-}
 
 fn scalarIndexJson(
     allocator: std.mem.Allocator,

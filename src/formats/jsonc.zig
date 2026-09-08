@@ -3,8 +3,38 @@ const simd = @import("../core/simd.zig");
 const stage1 = @import("../core/stage1.zig");
 const stream = @import("../core/stream.zig");
 const stage2 = @import("../core/stage2.zig");
+const ondemand = @import("../core/ondemand.zig");
+const lexical = @import("../core/json_lexical.zig");
 const testing = std.testing;
 const sentinel_count: usize = 3;
+
+const IndexSink = struct {
+    indexes: []u32,
+    count: usize = 0,
+
+    pub fn appendOffset(self: *@This(), offset: usize) lexical.Error!void {
+        if (offset > std.math.maxInt(u32)) return error.InputTooLarge;
+        if (self.count >= self.indexes.len) return error.CapacityExceeded;
+        self.indexes[self.count] = @intCast(offset);
+        self.count += 1;
+    }
+
+    pub fn appendMask(
+        self: *@This(),
+        comptime T: type,
+        mask: T,
+        base_offset: usize,
+    ) lexical.Error!void {
+        const output = self.indexes[self.count..];
+        const written = try simd.extractBitIndexesChecked(
+            T,
+            mask,
+            base_offset,
+            output,
+        );
+        self.count += written;
+    }
+};
 
 /// Initializes a chunk-fed JSONC Stage 1 indexer in document mode.
 pub fn initStreamIndexer(
@@ -16,6 +46,15 @@ pub fn initStreamIndexer(
         chunk_len,
         stream.Options{ .dialect = .jsonc, .mode = .document },
     );
+}
+/// Initializes a lazy JSONC document over parser-owned indexes.
+pub fn initOnDemandDocument(
+    parser: *ondemand.Parser,
+    input: []const u8,
+) !ondemand.Document {
+    const indexes = try parser.prepareDocument(input);
+    const token_count = try indexJsoncInto(simd.default_vector_len, indexes, input);
+    return parser.completeDialectDocument(input, token_count, .jsonc);
 }
 
 pub fn indexJsonc(
@@ -51,203 +90,49 @@ pub fn validateJsonc(
     return stage2.validate(input, &structural_index, .jsonc);
 }
 
+pub fn indexJsoncInto(
+    comptime VLEN: usize,
+    indexes: []u32,
+    input: []const u8,
+) lexical.Error!usize {
+    if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
+
+    var sink = IndexSink{ .indexes = indexes };
+    var state: lexical.State = .{};
+    lexical.feed(VLEN, .jsonc, &state, input, 0, &sink) catch |err| switch (err) {
+        error.NonContiguousInput => unreachable,
+        error.CapacityExceeded => return error.CapacityExceeded,
+        error.InputTooLarge => return error.InputTooLarge,
+    };
+    lexical.finish(.jsonc, &state, &sink) catch |err| switch (err) {
+        error.NonContiguousInput => unreachable,
+        error.CapacityExceeded => return error.CapacityExceeded,
+        error.InputTooLarge => return error.InputTooLarge,
+    };
+    return sink.count;
+}
+
 pub fn indexJsoncImpl(
     comptime VLEN: usize,
     allocator: std.mem.Allocator,
     input: []const u8,
 ) !stage1.StructuralIndex {
-    const Mask = simd.Mask(VLEN);
-    const Shift = std.math.Log2Int(Mask);
-
     if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
 
     var result = try stage1.StructuralIndex.init(allocator, input.len);
     errdefer result.deinit(allocator);
 
-    var in_string = false;
-    var in_single_comment = false;
-    var in_multi_comment = false;
-    var previous_chunk_ends_in_backslash = false;
-    var previous_backslash_run_odd = false;
-    var skip_after_multi_comment = false;
-    var previous_in_atom = false;
-    var windows = simd.windows(u8, VLEN, input, ' ');
-    var chunk_offset: usize = 0;
-
-    while (chunk_offset < input.len) {
-        const chunk = windows.next().?;
-        const chunk_bytes: [VLEN]u8 = chunk;
-        const chunk_length = @min(input.len - chunk_offset, VLEN);
-        const valid_mask = validByteMask(VLEN, chunk_length);
-        const top_bit: Mask = @as(Mask, 1) << @as(Shift, @intCast(VLEN - 1));
-        const quote_mask = simd.matchByte(VLEN, chunk, '"') & valid_mask;
-        const backslash_mask = simd.matchByte(VLEN, chunk, '\\') & valid_mask;
-        const backslash_result = simd.computeBackslashRuns(
-            Mask,
-            backslash_mask,
-            previous_chunk_ends_in_backslash,
-        );
-        var odd_backslash_ends = backslash_result.odd_length_ends & valid_mask;
-        if (previous_chunk_ends_in_backslash) {
-            if ((backslash_mask & @as(Mask, 1)) == 0) {
-                if (previous_backslash_run_odd) {
-                    odd_backslash_ends |= 1;
-                } else {
-                    odd_backslash_ends &= ~@as(Mask, 1);
-                }
-            } else if (previous_backslash_run_odd) {
-                odd_backslash_ends ^= leadingRunEndMask(VLEN, backslash_mask, chunk_length);
-            }
-        }
-        const unescaped_quote_mask = quote_mask & ~odd_backslash_ends;
-        const structural_mask = simd.matchAny4(VLEN, chunk, '{', '}', '[', ']') |
-            simd.matchAny2(VLEN, chunk, ':', ',');
-        const atom_mask = simd.matchAny4(VLEN, chunk, '-', 't', 'f', 'n') |
-            simd.matchRange(VLEN, chunk, '0', '9');
-
-        var visible_mask: Mask = 0;
-        var byte_offset: usize = 0;
-        while (byte_offset < chunk_length) : (byte_offset += 1) {
-            const byte = chunk_bytes[byte_offset];
-            const bit = @as(Mask, 1) << @as(Shift, @intCast(byte_offset));
-            const absolute_offset = chunk_offset + byte_offset;
-            if (skip_after_multi_comment) {
-                skip_after_multi_comment = false;
-                continue;
-            }
-
-            if (in_string) {
-                if ((unescaped_quote_mask & bit) != 0) {
-                    in_string = false;
-                    previous_in_atom = false;
-                }
-                continue;
-            }
-
-            if (in_single_comment) {
-                if (byte == '\n' or byte == '\r') {
-                    in_single_comment = false;
-                    previous_in_atom = false;
-                }
-                continue;
-            }
-
-            if (in_multi_comment) {
-                if (byte == '*' and absolute_offset + 1 < input.len and
-                    input[absolute_offset + 1] == '/')
-                {
-                    in_multi_comment = false;
-                    previous_in_atom = false;
-                    skip_after_multi_comment = true;
-                }
-                continue;
-            }
-
-            if ((unescaped_quote_mask & bit) != 0) {
-                in_string = true;
-                previous_in_atom = false;
-                continue;
-            }
-
-            if (byte == '/' and absolute_offset + 1 < input.len) {
-                const next_byte = input[absolute_offset + 1];
-                if (next_byte == '/') {
-                    in_single_comment = true;
-                    previous_in_atom = false;
-                    continue;
-                }
-                if (next_byte == '*') {
-                    in_multi_comment = true;
-                    previous_in_atom = false;
-                    continue;
-                }
-            }
-
-            const is_structural = (structural_mask & bit) != 0;
-            if (is_structural) {
-                visible_mask |= bit;
-                previous_in_atom = false;
-                continue;
-            }
-
-            const is_atom_candidate = (atom_mask & bit) != 0;
-            if (is_atom_candidate) {
-                if (!previous_in_atom) {
-                    visible_mask |= bit;
-                }
-                previous_in_atom = true;
-                continue;
-            }
-
-            previous_in_atom = !isJsoncWhitespace(byte);
-        }
-
-        var indexes: [VLEN]u32 = undefined;
-        const index_count = simd.extractBitIndexes(
-            Mask,
-            visible_mask,
-            chunk_offset,
-            &indexes,
-        );
-        for (indexes[0..index_count]) |index| {
-            result.indexes[result.count] = index;
-            result.count += 1;
-        }
-
-        previous_chunk_ends_in_backslash = chunk_length == VLEN and
-            (backslash_mask & top_bit) != 0;
-        previous_backslash_run_odd = trailingBackslashRunOdd(
-            VLEN,
-            chunk,
-            chunk_length,
-            previous_backslash_run_odd,
-        );
-        chunk_offset += VLEN;
-    }
+    result.count = indexJsoncInto(
+        VLEN,
+        result.indexes[0 .. result.indexes.len - sentinel_count],
+        input,
+    ) catch |err| switch (err) {
+        error.CapacityExceeded => unreachable,
+        error.NonContiguousInput => unreachable,
+        error.InputTooLarge => return error.InputTooLarge,
+    };
     try result.finish(input.len);
-
     return result;
-}
-
-fn validByteMask(comptime VLEN: usize, valid_count: usize) simd.Mask(VLEN) {
-    const Mask = simd.Mask(VLEN);
-    const Shift = std.math.Log2Int(Mask);
-
-    if (valid_count == VLEN) return ~@as(Mask, 0);
-    if (valid_count == 0) return 0;
-    return (@as(Mask, 1) << @as(Shift, @intCast(valid_count))) - 1;
-}
-
-fn leadingRunEndMask(
-    comptime VLEN: usize,
-    backslashes: simd.Mask(VLEN),
-    valid_count: usize,
-) simd.Mask(VLEN) {
-    const Mask = simd.Mask(VLEN);
-    const Shift = std.math.Log2Int(Mask);
-
-    const non_backslashes = ~backslashes | ~validByteMask(VLEN, valid_count);
-    if (non_backslashes == 0) return 0;
-    const run_length: usize = @intCast(@ctz(non_backslashes));
-    if (run_length >= valid_count) return 0;
-    return @as(Mask, 1) << @as(Shift, @intCast(run_length));
-}
-
-fn trailingBackslashRunOdd(
-    comptime VLEN: usize,
-    chunk: simd.Vec(VLEN, u8),
-    valid_count: usize,
-    prev_run_odd: bool,
-) bool {
-    if (valid_count == 0) return false;
-    const bytes: [VLEN]u8 = chunk;
-    var run_length: usize = 0;
-    var index = valid_count;
-    while (index > 0 and bytes[index - 1] == '\\') : (index -= 1) {
-        run_length += 1;
-    }
-    if (index == 0) return (run_length % 2 == 0) == prev_run_odd;
-    return run_length % 2 != 0;
 }
 
 fn scalarIndexJsonc(
@@ -260,15 +145,15 @@ fn scalarIndexJsonc(
     var in_string = false;
     var in_single_comment = false;
     var in_multi_comment = false;
-    var skip_after_multi_comment = false;
+    var skip_comment_byte = false;
     var previous_in_atom = false;
     var backslash_run_length: usize = 0;
 
     for (input, 0..) |byte, byte_offset| {
         const unescaped_quote = byte == '"' and backslash_run_length % 2 == 0;
 
-        if (skip_after_multi_comment) {
-            skip_after_multi_comment = false;
+        if (skip_comment_byte) {
+            skip_comment_byte = false;
         } else if (in_string) {
             if (unescaped_quote) {
                 in_string = false;
@@ -285,7 +170,7 @@ fn scalarIndexJsonc(
             {
                 in_multi_comment = false;
                 previous_in_atom = false;
-                skip_after_multi_comment = true;
+                skip_comment_byte = true;
             }
         } else if (unescaped_quote) {
             in_string = true;
@@ -297,6 +182,7 @@ fn scalarIndexJsonc(
                 previous_in_atom = false;
             } else if (next_byte == '*') {
                 in_multi_comment = true;
+                skip_comment_byte = true;
                 previous_in_atom = false;
             } else {
                 previous_in_atom = !isJsoncWhitespace(byte);
@@ -372,7 +258,7 @@ test "indexJsonc width differential covers comment delimiters" {
         0, 1, 14, 15, 16, 17, 30, 31, 32, 33, 62, 63, 64, 65, 66,
     };
 
-    inline for ([_]usize{ 16, 32, 64 }) |vlen| {
+    inline for ([_]usize{ 4, 5, 7, 16, 32, 64 }) |vlen| {
         for (boundary_lengths) |length| {
             var boundary_input: [66]u8 = @splat(' ');
             if (length > 0) {
@@ -409,7 +295,7 @@ test "indexJsonc width differential covers escaped boundary quotes" {
         0, 1, 14, 15, 16, 17, 30, 31, 32, 33, 62, 63, 64, 65, 66,
     };
 
-    inline for ([_]usize{ 16, 32, 64 }) |vlen| {
+    inline for ([_]usize{ 4, 5, 7, 16, 32, 64 }) |vlen| {
         for (boundary_lengths) |length| {
             var boundary_input: [66]u8 = @splat(' ');
             if (length > 0) {
@@ -664,7 +550,7 @@ test "indexJsonc matches scalar for adversarial strings and comments" {
         "[\"even slash run: \\\\\"/* comment */1]",
     };
 
-    inline for ([_]usize{ 16, 32, 64 }) |vlen| {
+    inline for ([_]usize{ 4, 5, 7, 16, 32, 64 }) |vlen| {
         for (cases) |input| {
             try expectJsoncMatchesScalarAtWidth(vlen, input);
         }
@@ -749,7 +635,7 @@ test "indexJsonc matches scalar for every byte value" {
     for (0..input.len) |byte_offset| {
         input[byte_offset] = @as(u8, @truncate(byte_offset));
     }
-    inline for ([_]usize{ 16, 32, 64 }) |vlen| {
+    inline for ([_]usize{ 4, 5, 7, 16, 32, 64 }) |vlen| {
         try expectJsoncMatchesScalarAtWidth(vlen, &input);
     }
 }
@@ -831,4 +717,21 @@ test "JSONC stream wrapper reset and finish lifecycle preserve offsets" {
     defer expected_second.deinit(testing.allocator);
     try expectJsoncStreamIndexEqual(&expected_first, &first);
     try expectJsoncStreamIndexEqual(&expected_second, &second);
+}
+
+test "JSONC comment delimiters cannot overlap" {
+    const input = "/*/1";
+    var scalar = try scalarIndexJsonc(testing.allocator, input);
+    defer scalar.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), scalar.count);
+    inline for (.{ 4, 5, 7, 16, 32, 64 }) |width| {
+        try expectJsoncMatchesScalarAtWidth(width, input);
+    }
+    var indexer = try initStreamIndexer(testing.allocator, 1);
+    defer indexer.deinit();
+    for (0..input.len) |offset| try indexer.feed(input[offset..][0..1]);
+    try indexer.finish();
+    var streamed = indexer.take();
+    defer streamed.deinit(testing.allocator);
+    try expectJsoncStreamIndexEqual(&scalar, &streamed);
 }

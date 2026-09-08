@@ -1,8 +1,8 @@
 # simd — Stage 2, On-Demand, and Streaming Architecture
 
-Status: Stage 1 and Stage 2 are implemented for JSON, JSONL, JSONC, JSON5,
-Markdown, and XML. On-Demand traversal and the chunk-fed Stage 1
-`StreamIndexer` remain JSON-only.
+Status: Stage 1 indexing and Stage 2 validation are implemented for JSON,
+JSONL, JSONC, JSON5, Markdown, XML, and YAML. Each format also exposes a
+resident on-demand reader and a chunk-fed `StreamIndexer`.
 
 Scope: this document records current contracts and the remaining roadmap.
 Sections marked **Future roadmap** are designs, not current APIs. Sections
@@ -17,12 +17,13 @@ current repo (`src/core/stage1.zig`, `src/core/stage2.zig`,
 
 ---
 
-## Item 1 — On-Demand Event Interface (implemented for JSON)
+## Item 1 — On-Demand Event Interface (implemented for all formats)
 
-The current JSON entry point is `json.initOnDemandDocument(parser, input)`.
-An `ondemand.Document` exposes `tokenCursor()` and `eventReader()`. Both read a
-complete caller-owned input slice. `EventReader` emits a pull event sequence,
-but it is not a chunk-at-a-time input reader.
+Each format exposes `initOnDemandDocument(parser, input)`. The document owns
+no complete tape and borrows the caller-owned input slice. `tokenCursor()`
+and `eventReader()` read through parser-owned reusable state under a
+single-focus lease; `EventReader` emits a pull event sequence, but it is not
+a chunk-at-a-time input reader.
 
 ### Historical design record: pull-based cursor over `Stage1.StructuralIndex`
 
@@ -356,14 +357,16 @@ VLEN instantiation unchanged. Keep them; extend the sweep:
 
 ---
 
-## Item 4 — Stage 2 Structural Validation (implemented for six formats)
+## Item 4 — Stage 2 Structural Validation (implemented for seven formats)
 
 `src/core/stage2.zig` owns the JSON-family parser, `Dialect`, tape, cursor, and
 shared diagnostic. `Dialect` contains `.json`, `.jsonc`, and `.json5`.
 Each JSON-family adapter runs its Stage 1 indexer and selects the matching
 dialect. JSONL derives record spans from its Stage 1 index and uses `.json` for
-each record. Markdown and XML own format-local documents, tapes, validators,
-errors, and diagnostics. They do not use the JSON `Dialect` or JSON tape.
+each record. Markdown, XML, and YAML own format-local documents, tapes,
+validators, errors, and diagnostics. They do not use the JSON `Dialect` or
+JSON tape. YAML keeps a scalar oracle (`scalarIndexYaml`) that the SIMD
+newline-indexed path must match at every supported width.
 
 ### JSON-family tape layout — `TapeWord` (64-bit packed, shared with Item 1)
 
@@ -543,7 +546,7 @@ escaped raw views.
 The current validator fails at the first `Diagnostic`. Recovery by scanning to
 the next separator or matching close token remains future work.
 
-### Current six-format support matrix
+### Current seven-format support matrix
 
 | Format | Builder | Validator and diagnostic | Document and tape | Implemented grammar scope |
 |---|---|---|---|---|
@@ -551,8 +554,9 @@ the next separator or matching close token remains future work.
 | JSONC | `jsonc.buildJsoncTape(allocator, input) -> stage2.BuildError!stage2.Document` | `jsonc.validateJsonc(allocator, input) -> stage2.ValidationError!?stage2.Diagnostic` | `stage2.Document` with `stage2.TapeWord` and `.jsonc` | Strict JSON plus `//` and `/* ... */` comments. It accepts no other JSON5 syntax. |
 | JSON5 | `json5.buildJson5Tape(allocator, input) -> stage2.BuildError!stage2.Document` | `json5.validateJson5(allocator, input) -> stage2.ValidationError!?stage2.Diagnostic` | `stage2.Document` with `stage2.TapeWord` and `.json5` | JSON5 grammar, including comments, single quotes, identifier keys, trailing commas, JSON5 numbers, whitespace, and escapes |
 | JSONL | `jsonl.buildJsonlTape(allocator, input) -> stage2.BuildError!JsonlDocument` | `jsonl.validateJsonl(allocator, input) -> stage2.ValidationError!?JsonlDiagnostic` | `JsonlDocument` owns `JsonlRecord` metadata and one `stage2.Document` tape per record | Strict JSON for each nonblank record. A Stage 1-indexed LF outside strings ends a record. Blank and trailing records are skipped. |
-| Markdown | `markdown.buildMarkdownTape(allocator, input) -> MarkdownBuildError!MarkdownDocument` | `markdown.validateMarkdown(allocator, input) -> MarkdownValidationError!?MarkdownDiagnostic` | Format-local `MarkdownDocument` with `MarkdownTapeWord` | Stage 1 token integrity for the Markdown marker stream. It is not CommonMark validation or a CommonMark AST. |
+| Markdown | `markdown.buildMarkdownTape(allocator, input) -> MarkdownBuildError!MarkdownDocument` | `markdown.validateMarkdown(allocator, input) -> MarkdownValidationError!?MarkdownDiagnostic` | Format-local `MarkdownDocument` with `MarkdownTapeWord` | Stage 1 token integrity for the Markdown marker stream. It is not CommonMark validation or a CommonMark AST. Marker spans are bounded by `u24`; source offsets remain `u32`. |
 | XML | `xml.buildXmlTape(allocator, input) -> XmlBuildError!XmlDocument` | `xml.validateXml(input) -> XmlValidationError!?XmlDiagnostic` | Format-local `XmlDocument` with `XmlTapeWord` | The supported XML well-formedness subset covers one root, UTF-8 XML characters, names, attributes, built-in and numeric entities, comments, CDATA, processing instructions, and an XML 1.0 declaration. DTD and DOCTYPE declarations are unsupported. |
+| YAML | `yaml.buildYamlTape(allocator, input) -> YamlBuildError!YamlDocument` | `yaml.validateYaml(allocator, input) -> YamlValidationError!?Failure` | Format-local `YamlDocument` with `YamlTapeWord` | The `yaml-basic-1.2.2` profile: block and flow collections, quoted and plain scalars, document markers, and comments. Anchors, tags, directives, and multiline block scalars are `Unsupported`. |
 
 Markdown preserves these Stage 1 token kinds in its local tape: headings,
 code fences, list items, blockquotes, inline code, link open and close
@@ -576,12 +580,14 @@ not JSON documents, JSON tape cursors, or JSON DOMs.
 
 ## Item 5 — Streaming / Chunk-at-a-Time Input
 
-### Implemented JSON baseline
+### Implemented per-format baseline
 
-`src/core/stream.zig` implements a chunk-fed JSON Stage 1 `StreamIndexer`.
-Its public lifecycle is `init`, `feed`, `feedFrom`, `finish`, `take`, `reset`,
-and `deinit`. It copies chunks through two fixed padded slots and produces a
-`StructuralIndex`.
+Every format exposes a chunk-fed `StreamIndexer` with the public lifecycle
+`init`, `feed`, `feedFrom`, `finish`, `take`, `reset`, and `deinit`. The JSON
+indexer in `src/core/stream.zig` copies chunks through two fixed padded slots
+and produces a `StructuralIndex`. The remaining formats retain only unfinished
+lexical state plus output offsets; `take` transfers index storage to the
+caller, and stream output matches the one-shot indexer under every partition.
 
 `feedFrom` is an optional convenience adapter over `feed`:
 
@@ -605,8 +611,8 @@ returns because the indexer copies it into its resident padded slots. After
 remain. `feedFrom` produces Stage 1 output only; Stage 2 and On-Demand still
 require separate caller-owned complete input that outlives those consumers.
 
-The stream module does not run Stage 2 or On-Demand traversal, and it does not
-yet provide chunk-fed Stage 1 support for the other five formats.
+Stage 2 and On-Demand traversal still require separate caller-owned complete
+input that outlives those consumers.
 
 ### General streaming reader boundary
 
@@ -765,23 +771,26 @@ therefore still require independent complete input owned by the caller.
 1. Strict JSON and JSONL Stage 1 index unescaped double-quote string openings.
    JSONC and JSON5 suppress quote positions, so Stage 2 scans their strings
    from the source. All Stage 1 indexers write `(len, len, 0)` sentinel padding.
-2. `simd.default_vector_len` is the current vector-width source for the six
-   Stage 1 indexers.
+2. `simd.default_vector_len` is the current vector-width source for the seven
+   Stage 1 indexers. Scalar oracles stay width-free and validate every
+   instantiation; YAML additionally sweeps widths 4 through 64.
 3. JSON, JSONC, and JSON5 use `stage2.Document` with a core-owned `Dialect`.
 4. JSONL uses Stage 1-indexed LF boundaries outside strings. Each nonblank
    record owns an independent strict JSON tape.
-5. Markdown and XML use format-local documents and tapes, not JSON DOMs.
-6. JSON On-Demand consumes complete resident input through parser-owned
-   structural storage.
-7. JSON streaming ends at Stage 1 `StructuralIndex` production; `feedFrom` is
-   only an input adapter and does not make Stage 2 or On-Demand source-safe.
+5. Markdown, XML, and YAML use format-local documents and tapes, not JSON DOMs.
+6. Every on-demand reader consumes complete resident input through parser-owned
+   reusable state under a single-focus lease. Failed peeks are sticky; copied
+   documents cannot claim a second focus on shared state.
+7. Streaming ends at index production; `feedFrom` is only an input adapter and
+   does not make Stage 2 or on-demand cursors source-safe.
 8. The `feedFrom` reader and its backing storage are caller-owned for the
    duration of the call only; the indexer retains parser state and indexes, not
    source bytes.
 
 ## Future roadmap
 
-1. Add chunk-fed Stage 1 support for JSONL, JSONC, JSON5, Markdown, and XML.
+1. Error recovery: validators fail at the first diagnostic; recovery by
+   scanning to the next separator or matching close token remains future work.
 2. Keep `std.Io.Reader` integration as an optional adapter without presenting
    pull events as an input streaming API.
 3. Define how chunked source storage outlives Stage 2 or On-Demand cursors

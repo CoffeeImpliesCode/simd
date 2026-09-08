@@ -4,9 +4,37 @@ const stage1 = @import("../core/stage1.zig");
 const stream = @import("../core/stream.zig");
 const ondemand = @import("../core/ondemand.zig");
 const stage2 = @import("../core/stage2.zig");
+const lexical = @import("../core/json_lexical.zig");
 
 const testing = std.testing;
 const sentinel_count: usize = 3;
+const IndexSink = struct {
+    indexes: []u32,
+    count: usize = 0,
+
+    pub fn appendOffset(self: *@This(), offset: usize) lexical.Error!void {
+        if (offset > std.math.maxInt(u32)) return error.InputTooLarge;
+        if (self.count >= self.indexes.len) return error.CapacityExceeded;
+        self.indexes[self.count] = @intCast(offset);
+        self.count += 1;
+    }
+
+    pub fn appendMask(
+        self: *@This(),
+        comptime T: type,
+        mask: T,
+        base_offset: usize,
+    ) lexical.Error!void {
+        const output = self.indexes[self.count..];
+        const written = try simd.extractBitIndexesChecked(
+            T,
+            mask,
+            base_offset,
+            output,
+        );
+        self.count += written;
+    }
+};
 
 /// Initializes a chunk-fed RFC JSON Stage 1 indexer in document mode.
 pub fn initStreamIndexer(
@@ -154,169 +182,33 @@ pub fn indexJsonImpl(
         input,
     ) catch |err| switch (err) {
         error.CapacityExceeded => unreachable,
+        error.NonContiguousInput => unreachable,
         error.InputTooLarge => return error.InputTooLarge,
     };
     try indexes.finish(input.len);
     return indexes;
 }
 
-fn indexJsonInto(
+pub fn indexJsonInto(
     comptime VLEN: usize,
     indexes: []u32,
     input: []const u8,
-) !usize {
-    const Mask = simd.Mask(VLEN);
-    const Shift = std.math.Log2Int(Mask);
-
+) lexical.Error!usize {
     if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
 
-    var windows = simd.windows(u8, VLEN, input, 0);
-    var base_offset: usize = 0;
-    var index_count: usize = 0;
-    var prev_in_string = false;
-    var prev_ends_in_backslash = false;
-    var prev_backslash_run_odd = false;
-    var prev_in_atom = false;
-    var candidate_indexes: [VLEN]u32 = undefined;
-    var pending_structural_indexes: Mask = 0;
-    var pending_base_offset: usize = 0;
-    var has_pending_structural_indexes = false;
-
-    while (base_offset < input.len) {
-        const chunk = windows.next().?;
-        const valid_count = @min(input.len - base_offset, VLEN);
-        const valid_mask = validByteMask(VLEN, valid_count);
-        const top_bit: Mask = @as(Mask, 1) << @as(Shift, @intCast(VLEN - 1));
-
-        const backslashes: Mask = simd.matchByte(VLEN, chunk, '\\') & valid_mask;
-        const backslash_result = simd.computeBackslashRuns(
-            Mask,
-            backslashes,
-            prev_ends_in_backslash,
-        );
-        var odd_backslash_ends = backslash_result.odd_length_ends & valid_mask;
-        if (prev_ends_in_backslash) {
-            if ((backslashes & @as(Mask, 1)) == 0) {
-                if (prev_backslash_run_odd) {
-                    odd_backslash_ends |= 1;
-                } else {
-                    odd_backslash_ends &= ~@as(Mask, 1);
-                }
-            } else if (prev_backslash_run_odd) {
-                odd_backslash_ends ^= leadingRunEndMask(VLEN, backslashes, valid_count);
-            }
-        }
-
-        const quotes: Mask = simd.matchByte(VLEN, chunk, '"') & valid_mask;
-        const unescaped_quotes = quotes & ~odd_backslash_ends;
-        const inside_without_closing = simd.prefixXor(Mask, unescaped_quotes) ^
-            if (prev_in_string) ~@as(Mask, 0) else 0;
-        const opening_quotes = unescaped_quotes & inside_without_closing;
-        const string_mask = inside_without_closing | unescaped_quotes;
-        const outside_string = ~string_mask & valid_mask;
-
-        const structural: Mask = simd.matchAny4(VLEN, chunk, '{', '}', '[', ']') |
-            simd.matchAny2(VLEN, chunk, ':', ',');
-        const whitespace: Mask = simd.matchAny4(VLEN, chunk, ' ', '\t', '\n', '\r');
-        const atom_candidates: Mask = simd.matchRange(VLEN, chunk, '0', '9') |
-            simd.matchAny4(VLEN, chunk, '-', 't', 'f', 'n');
-        const atom_active = outside_string & ~(structural | whitespace | quotes);
-        const atom_starts = atom_candidates & atom_active &
-            ~((atom_active << @as(Shift, 1)) |
-                if (prev_in_atom) @as(Mask, 1) else 0);
-        const structural_indexes = ((structural | atom_starts) & outside_string) |
-            opening_quotes;
-
-        if (has_pending_structural_indexes) {
-            const candidate_count = simd.extractBitIndexes(
-                Mask,
-                pending_structural_indexes,
-                pending_base_offset,
-                &candidate_indexes,
-            );
-            if (candidate_count > indexes.len - index_count) return error.CapacityExceeded;
-            @memcpy(
-                indexes[index_count..][0..candidate_count],
-                candidate_indexes[0..candidate_count],
-            );
-            index_count += candidate_count;
-        }
-        pending_structural_indexes = structural_indexes;
-        pending_base_offset = base_offset;
-        has_pending_structural_indexes = true;
-
-        prev_in_string = (inside_without_closing & top_bit) != 0;
-        prev_ends_in_backslash = valid_count == VLEN and
-            (backslashes & top_bit) != 0;
-        prev_backslash_run_odd = trailingBackslashRunOdd(
-            VLEN,
-            chunk,
-            valid_count,
-            prev_backslash_run_odd,
-        );
-        prev_in_atom = valid_count != 0 and
-            (atom_active & (@as(Mask, 1) <<
-                @as(Shift, @intCast(valid_count - 1)))) != 0;
-        base_offset += VLEN;
-    }
-
-    if (has_pending_structural_indexes) {
-        const candidate_count = simd.extractBitIndexes(
-            Mask,
-            pending_structural_indexes,
-            pending_base_offset,
-            &candidate_indexes,
-        );
-        if (candidate_count > indexes.len - index_count) return error.CapacityExceeded;
-        @memcpy(
-            indexes[index_count..][0..candidate_count],
-            candidate_indexes[0..candidate_count],
-        );
-        index_count += candidate_count;
-    }
-
-    return index_count;
-}
-
-fn validByteMask(comptime VLEN: usize, valid_count: usize) simd.Mask(VLEN) {
-    const Mask = simd.Mask(VLEN);
-    const Shift = std.math.Log2Int(Mask);
-
-    if (valid_count == VLEN) return ~@as(Mask, 0);
-    if (valid_count == 0) return 0;
-    return (@as(Mask, 1) << @as(Shift, @intCast(valid_count))) - 1;
-}
-
-fn leadingRunEndMask(
-    comptime VLEN: usize,
-    backslashes: simd.Mask(VLEN),
-    valid_count: usize,
-) simd.Mask(VLEN) {
-    const Mask = simd.Mask(VLEN);
-    const Shift = std.math.Log2Int(Mask);
-
-    const non_backslashes = ~backslashes | ~validByteMask(VLEN, valid_count);
-    if (non_backslashes == 0) return 0;
-    const run_length: usize = @intCast(@ctz(non_backslashes));
-    if (run_length >= valid_count) return 0;
-    return @as(Mask, 1) << @as(Shift, @intCast(run_length));
-}
-
-fn trailingBackslashRunOdd(
-    comptime VLEN: usize,
-    chunk: simd.Vec(VLEN, u8),
-    valid_count: usize,
-    prev_run_odd: bool,
-) bool {
-    if (valid_count == 0) return false;
-    const bytes: [VLEN]u8 = chunk;
-    var run_length: usize = 0;
-    var index = valid_count;
-    while (index > 0 and bytes[index - 1] == '\\') : (index -= 1) {
-        run_length += 1;
-    }
-    if (index == 0) return (run_length % 2 == 0) == prev_run_odd;
-    return run_length % 2 != 0;
+    var sink = IndexSink{ .indexes = indexes };
+    var state: lexical.State = .{};
+    lexical.feed(VLEN, .json, &state, input, 0, &sink) catch |err| switch (err) {
+        error.NonContiguousInput => unreachable,
+        error.CapacityExceeded => return error.CapacityExceeded,
+        error.InputTooLarge => return error.InputTooLarge,
+    };
+    lexical.finish(.json, &state, &sink) catch |err| switch (err) {
+        error.NonContiguousInput => unreachable,
+        error.CapacityExceeded => return error.CapacityExceeded,
+        error.InputTooLarge => return error.InputTooLarge,
+    };
+    return sink.count;
 }
 
 fn scalarIndexJson(
@@ -565,7 +457,7 @@ test "indexJson matches scalar at all SIMD widths" {
         "-123.45e+6 0 -0 1E10",
     };
 
-    inline for ([_]usize{ 16, 32, 64 }) |vlen| {
+    inline for ([_]usize{ 4, 5, 7, 16, 32, 64 }) |vlen| {
         for (cases) |input| {
             try expectMatchesScalarAtWidth(vlen, input);
         }
@@ -577,7 +469,7 @@ test "indexJson width differential covers vector boundaries" {
         0, 1, 14, 15, 16, 17, 30, 31, 32, 33, 62, 63, 64, 65, 66,
     };
 
-    inline for ([_]usize{ 16, 32, 64 }) |vlen| {
+    inline for ([_]usize{ 4, 5, 7, 16, 32, 64 }) |vlen| {
         for (boundary_lengths) |length| {
             var input: [66]u8 = @splat(' ');
             if (length > 0) {
@@ -936,7 +828,7 @@ test "indexJson differential adversarial byte matrix" {
         0, 1, 14, 15, 16, 17, 30, 31, 32, 33, 62, 63, 64, 65, 66,
     };
 
-    inline for ([_]usize{ 16, 32, 64 }) |vlen| {
+    inline for ([_]usize{ 4, 5, 7, 16, 32, 64 }) |vlen| {
         var state: u64 = 0x6a09e667f3bcc909;
         var input: [257]u8 = undefined;
 

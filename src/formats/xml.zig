@@ -1,6 +1,7 @@
 const std = @import("std");
 const simd = @import("../core/simd.zig");
 const stage1 = @import("../core/stage1.zig");
+const resident = @import("../core/resident.zig");
 const testing = std.testing;
 
 comptime {
@@ -30,40 +31,465 @@ pub const XmlStructuralIndex = struct {
     }
 };
 
-const XmlMarkupCandidateKind = enum {
+const XmlLexicalMode = enum {
+    outside,
+    opener,
+    tag,
+    attribute_quote,
+    comment,
+    cdata,
+};
+
+const XmlOpenerKind = enum {
     unknown,
     comment,
     cdata,
 };
 
-const XmlMarkupCandidate = struct {
-    token_index: usize,
-    start_offset: usize,
-    prefix_len: u8,
-    kind: XmlMarkupCandidateKind,
+/// Bounded state shared by the one-shot and chunk-fed XML scanners.
+///
+/// The scanner stores only an unfinished opener, the quote delimiter, and the
+/// previous two bytes needed by opaque-section terminators. It never borrows
+/// or copies input beyond the current call.
+const XmlLexicalState = struct {
+    mode: XmlLexicalMode = .outside,
+    previous_byte: u8 = 0,
+    attribute_quote: u8 = 0,
+    opener_start: usize = 0,
+    opener_length: u8 = 0,
+    opener_kind: XmlOpenerKind = .unknown,
+    comment_previous_previous: u8 = 0,
+    comment_previous: u8 = 0,
+    cdata_previous_previous: u8 = 0,
+    cdata_previous: u8 = 0,
 };
 
-/// Incrementally builds the same XML structural index as indexXml.
+const XmlLexicalSink = struct {
+    result: *XmlStructuralIndex,
+
+    fn appendToken(
+        self: *@This(),
+        index: usize,
+        kind: XmlTokenKind,
+    ) error{CapacityExceeded}!void {
+        if (self.result.count >= self.result.indexes.len - 3) {
+            return error.CapacityExceeded;
+        }
+        if (self.result.count >= self.result.kinds.len) {
+            return error.CapacityExceeded;
+        }
+        self.result.indexes[self.result.count] = @intCast(index);
+        self.result.kinds[self.result.count] = kind;
+        self.result.count += 1;
+    }
+};
+
+const XmlStreamSink = struct {
+    owner: *XmlStreamIndexer,
+
+    fn appendToken(
+        self: *@This(),
+        index: usize,
+        kind: XmlTokenKind,
+    ) error{CapacityExceeded}!void {
+        return self.owner.appendToken(index, kind);
+    }
+};
+
+fn xmlValidMask(comptime VLEN: usize, valid_count: usize) simd.Mask(VLEN) {
+    return simd.validMask(VLEN, valid_count);
+}
+
+fn xmlPreviousByte(
+    state: *const XmlLexicalState,
+    input: []const u8,
+    local_index: usize,
+) u8 {
+    if (local_index == 0) return state.previous_byte;
+    return input[local_index - 1];
+}
+
+fn xmlCommentTerminator(
+    state: *const XmlLexicalState,
+    input: []const u8,
+    input_index: usize,
+    absolute_index: usize,
+) bool {
+    if (absolute_index < state.opener_start) return false;
+    if (absolute_index - state.opener_start < 6) return false;
+    if (input[input_index] != '>') return false;
+    const previous = if (input_index == 0)
+        state.comment_previous
+    else
+        input[input_index - 1];
+    const previous_previous = if (input_index >= 2)
+        input[input_index - 2]
+    else if (input_index == 1)
+        state.comment_previous
+    else
+        state.comment_previous_previous;
+    return previous_previous == '-' and previous == '-';
+}
+
+fn xmlCdataTerminator(
+    state: *const XmlLexicalState,
+    input: []const u8,
+    local_index: usize,
+) bool {
+    if (input[local_index] != '>') return false;
+    const previous = if (local_index == 0)
+        state.cdata_previous
+    else
+        input[local_index - 1];
+    const previous_previous = if (local_index >= 2)
+        input[local_index - 2]
+    else if (local_index == 1)
+        state.cdata_previous
+    else
+        state.cdata_previous_previous;
+    return previous_previous == ']' and previous == ']';
+}
+
+fn xmlRememberOpaqueTail(
+    state: *XmlLexicalState,
+    input: []const u8,
+    mode: XmlLexicalMode,
+) void {
+    if (input.len == 0) return;
+    switch (mode) {
+        .comment => {
+            if (input.len == 1) {
+                state.comment_previous_previous = state.comment_previous;
+                state.comment_previous = input[0];
+            } else {
+                state.comment_previous_previous = input[input.len - 2];
+                state.comment_previous = input[input.len - 1];
+            }
+        },
+        .cdata => {
+            if (input.len == 1) {
+                state.cdata_previous_previous = state.cdata_previous;
+                state.cdata_previous = input[0];
+            } else {
+                state.cdata_previous_previous = input[input.len - 2];
+                state.cdata_previous = input[input.len - 1];
+            }
+        },
+        else => {},
+    }
+}
+
+fn xmlBeginOpener(
+    state: *XmlLexicalState,
+    absolute_index: usize,
+) void {
+    state.mode = .opener;
+    state.previous_byte = '<';
+    state.opener_start = absolute_index;
+    state.opener_length = 0;
+    state.opener_kind = .unknown;
+}
+
+fn xmlAppendTagOpen(
+    state: *XmlLexicalState,
+    sink: anytype,
+) !void {
+    try sink.appendToken(state.opener_start, .tag_open);
+    state.mode = .tag;
+    state.opener_length = 0;
+    state.opener_kind = .unknown;
+}
+
+fn xmlProcessTagByte(
+    state: *XmlLexicalState,
+    input: []const u8,
+    input_index: usize,
+    base_offset: usize,
+    sink: anytype,
+) !void {
+    const byte = input[input_index];
+    switch (byte) {
+        '<' => xmlBeginOpener(state, base_offset + input_index),
+        '=' => try sink.appendToken(base_offset + input_index, .attr_equals),
+        '"', '\'' => {
+            try sink.appendToken(base_offset + input_index, .attr_quote);
+            state.mode = .attribute_quote;
+            state.attribute_quote = byte;
+        },
+        '>' => {
+            const previous = xmlPreviousByte(state, input, input_index);
+            if (previous == '/') {
+                try sink.appendToken(base_offset + input_index - 1, .self_close);
+            } else if (previous == '?') {
+                try sink.appendToken(base_offset + input_index - 1, .proc_inst_close);
+            } else {
+                try sink.appendToken(base_offset + input_index, .tag_close);
+            }
+            state.mode = .outside;
+        },
+        else => {},
+    }
+    state.previous_byte = byte;
+}
+
+fn xmlProcessOpener(
+    state: *XmlLexicalState,
+    input: []const u8,
+    base_offset: usize,
+    start_local: usize,
+    sink: anytype,
+) !usize {
+    var local_index = start_local;
+    while (local_index < input.len and state.mode == .opener) : (local_index += 1) {
+        const byte = input[local_index];
+        if (state.opener_length == 0) {
+            switch (byte) {
+                '/' => {
+                    try sink.appendToken(state.opener_start, .closing_tag_open);
+                    state.mode = .tag;
+                    state.previous_byte = byte;
+                },
+                '?' => {
+                    try sink.appendToken(state.opener_start, .proc_inst_open);
+                    state.mode = .tag;
+                    state.previous_byte = byte;
+                },
+                '!' => {
+                    state.opener_length = 1;
+                    state.previous_byte = byte;
+                },
+                else => {
+                    try xmlAppendTagOpen(state, sink);
+                    try xmlProcessTagByte(state, input, local_index, base_offset, sink);
+                },
+            }
+            continue;
+        }
+
+        if (state.opener_length == 1) {
+            switch (byte) {
+                '-' => {
+                    state.opener_kind = .comment;
+                    state.opener_length = 2;
+                    state.previous_byte = byte;
+                },
+                '[' => {
+                    state.opener_kind = .cdata;
+                    state.opener_length = 2;
+                    state.previous_byte = byte;
+                },
+                else => {
+                    try xmlAppendTagOpen(state, sink);
+                    try xmlProcessTagByte(state, input, local_index, base_offset, sink);
+                },
+            }
+            continue;
+        }
+
+        const literal: []const u8 = switch (state.opener_kind) {
+            .comment => "<!--",
+            .cdata => "<![CDATA[",
+            .unknown => unreachable,
+        };
+        const literal_index = 1 + @as(usize, state.opener_length);
+        if (literal_index >= literal.len or byte != literal[literal_index]) {
+            try xmlAppendTagOpen(state, sink);
+            try xmlProcessTagByte(state, input, local_index, base_offset, sink);
+            continue;
+        }
+
+        state.opener_length += 1;
+        state.previous_byte = byte;
+        if (1 + @as(usize, state.opener_length) != literal.len) continue;
+
+        switch (state.opener_kind) {
+            .comment => {
+                state.mode = .comment;
+                state.comment_previous_previous = 0;
+                state.comment_previous = 0;
+            },
+            .cdata => {
+                state.mode = .cdata;
+                state.cdata_previous_previous = 0;
+                state.cdata_previous = 0;
+            },
+            .unknown => unreachable,
+        }
+        try sink.appendToken(state.opener_start, .tag_open);
+        state.opener_length = 0;
+        state.opener_kind = .unknown;
+    }
+    return local_index;
+}
+
+fn xmlMaskForState(
+    comptime VLEN: usize,
+    state: *const XmlLexicalState,
+    vector: simd.Vec(VLEN, u8),
+) simd.Mask(VLEN) {
+    return switch (state.mode) {
+        .outside => simd.matchByte(VLEN, vector, '<'),
+        .tag => simd.matchAny4(VLEN, vector, '=', '"', '\'', '>') |
+            simd.matchByte(VLEN, vector, '<'),
+        .attribute_quote => simd.matchByte(VLEN, vector, state.attribute_quote),
+        .comment, .cdata => simd.matchByte(VLEN, vector, '>'),
+        .opener => 0,
+    };
+}
+
+fn scanXmlLexical(
+    comptime VLEN: usize,
+    state: *XmlLexicalState,
+    input: []const u8,
+    base_offset: usize,
+    sink: anytype,
+) !void {
+    const Mask = simd.Mask(VLEN);
+    var cursor: usize = 0;
+    while (cursor < input.len) {
+        if (state.mode == .opener) {
+            cursor = try xmlProcessOpener(state, input, base_offset, cursor, sink);
+            if (state.mode == .opener) break;
+            continue;
+        }
+
+        const block_start = cursor;
+        const block_end = @min(cursor + VLEN, input.len);
+        const valid_count = block_end - cursor;
+        const vector: simd.Vec(VLEN, u8) = if (valid_count == VLEN)
+            input[cursor..][0..VLEN].*
+        else blk: {
+            var tail: [VLEN]u8 = @splat(0);
+            @memcpy(tail[0..valid_count], input[cursor..block_end]);
+            break :blk tail;
+        };
+        // A mode transition invalidates the remaining candidates, so the suffix
+        // is rescanned with a freshly selected mask.
+        const mask: Mask = xmlMaskForState(VLEN, state, vector) &
+            xmlValidMask(VLEN, valid_count);
+        var candidate_indexes: [VLEN]u32 = undefined;
+        const candidate_count = try simd.extractBitIndexesChecked(
+            Mask,
+            mask,
+            base_offset + cursor,
+            &candidate_indexes,
+        );
+
+        if (candidate_count == 0) {
+            cursor = block_end;
+            state.previous_byte = input[block_end - 1];
+            xmlRememberOpaqueTail(state, input[block_start..block_end], state.mode);
+            continue;
+        }
+
+        var candidate_index: usize = 0;
+        var rescan = false;
+        while (candidate_index < candidate_count) : (candidate_index += 1) {
+            // Extraction returns absolute offsets; input remains chunk-local.
+            const absolute_index: usize = @intCast(candidate_indexes[candidate_index]);
+            const input_index = absolute_index - base_offset;
+            std.debug.assert(input_index >= block_start);
+            std.debug.assert(input_index < block_end);
+
+            switch (state.mode) {
+                .outside => {
+                    xmlBeginOpener(state, absolute_index);
+                    cursor = try xmlProcessOpener(
+                        state,
+                        input,
+                        base_offset,
+                        input_index + 1,
+                        sink,
+                    );
+                    rescan = true;
+                },
+                .tag => {
+                    try xmlProcessTagByte(
+                        state,
+                        input,
+                        input_index,
+                        base_offset,
+                        sink,
+                    );
+                    if (state.mode != .tag) {
+                        cursor = if (state.mode == .opener)
+                            try xmlProcessOpener(
+                                state,
+                                input,
+                                base_offset,
+                                input_index + 1,
+                                sink,
+                            )
+                        else
+                            input_index + 1;
+                        rescan = true;
+                    }
+                },
+                .attribute_quote => {
+                    if (input[input_index] == state.attribute_quote) {
+                        try sink.appendToken(base_offset + input_index, .attr_quote);
+                        state.mode = .tag;
+                        state.previous_byte = input[input_index];
+                        cursor = input_index + 1;
+                        rescan = true;
+                    }
+                },
+                .comment => {
+                    if (xmlCommentTerminator(
+                        state,
+                        input,
+                        input_index,
+                        absolute_index,
+                    )) {
+                        state.mode = .outside;
+                        state.previous_byte = input[input_index];
+                        cursor = input_index + 1;
+                        rescan = true;
+                    }
+                },
+                .cdata => {
+                    if (xmlCdataTerminator(state, input, input_index)) {
+                        state.mode = .outside;
+                        state.previous_byte = input[input_index];
+                        cursor = input_index + 1;
+                        rescan = true;
+                    }
+                },
+                .opener => unreachable,
+            }
+            if (rescan) break;
+        }
+
+        if (!rescan) {
+            cursor = block_end;
+            state.previous_byte = input[block_end - 1];
+            xmlRememberOpaqueTail(state, input[block_start..block_end], state.mode);
+        }
+    }
+}
+
+fn finishXmlLexical(
+    state: *XmlLexicalState,
+    sink: anytype,
+) !void {
+    if (state.mode == .opener) {
+        try sink.appendToken(state.opener_start, .tag_open);
+        state.mode = .tag;
+        state.opener_length = 0;
+        state.opener_kind = .unknown;
+    }
+}
+
+/// Incrementally builds the same XML structural index as `indexXml`.
 ///
-/// The indexer copies no caller bytes. It retains only lexical state for an
-/// unfinished markup opener, so every offset remains relative to the document
-/// assembled by feed.
+/// The scanner retains only bounded lexical carry and output storage. Input
+/// chunks are consumed before `feed` returns and are never retained.
 pub const XmlStreamIndexer = struct {
     allocator: std.mem.Allocator,
     index: ?stage1.StructuralIndex = null,
     kinds: ?[]XmlTokenKind = null,
     input_len: usize = 0,
-    previous_byte: u8 = 0,
-    in_comment: bool = false,
-    comment_start_offset: usize = 0,
-    comment_previous_previous: u8 = 0,
-    comment_previous: u8 = 0,
-    in_cdata: bool = false,
-    cdata_previous_previous: u8 = 0,
-    cdata_previous: u8 = 0,
-    in_tag: bool = false,
-    in_attr_quote: ?u8 = null,
-    candidate: ?XmlMarkupCandidate = null,
+    lexical: XmlLexicalState = .{},
     finished: bool = false,
 
     const Self = @This();
@@ -74,23 +500,21 @@ pub const XmlStreamIndexer = struct {
         AlreadyFinished,
         CapacityOverflow,
         InputTooLarge,
+        CapacityExceeded,
     };
     pub const FinishError = std.mem.Allocator.Error || error{
         CapacityOverflow,
         InputTooLarge,
+        CapacityExceeded,
     };
-    const CapacityError = std.mem.Allocator.Error || error{
-        CapacityOverflow,
-        InputTooLarge,
-    };
+    pub const FeedFromError = FeedError || FinishError || std.Io.Reader.ShortError;
 
-    /// Allocates structural storage with chunk_len as its initial capacity.
+    /// Allocates structural storage with `chunk_len` as its initial capacity.
     pub fn init(allocator: std.mem.Allocator, chunk_len: usize) InitError!Self {
         const output_capacity = @max(chunk_len, initial_output_capacity);
         var index = try stage1.StructuralIndex.init(allocator, output_capacity);
         errdefer index.deinit(allocator);
         const kinds = try allocator.alloc(XmlTokenKind, output_capacity);
-
         return .{
             .allocator = allocator,
             .index = index,
@@ -99,41 +523,54 @@ pub const XmlStreamIndexer = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        if (self.index) |*index| {
-            index.deinit(self.allocator);
-        }
-        if (self.kinds) |kinds| {
-            self.allocator.free(kinds);
-        }
+        if (self.index) |*index| index.deinit(self.allocator);
+        if (self.kinds) |kinds| self.allocator.free(kinds);
         self.* = undefined;
     }
 
     /// Adds a caller-owned chunk without retaining a reference to that chunk.
     pub fn feed(self: *Self, data: []const u8) FeedError!void {
         if (self.finished) return error.AlreadyFinished;
-
         const new_input_len = std.math.add(usize, self.input_len, data.len) catch {
             return error.CapacityOverflow;
         };
         if (new_input_len > std.math.maxInt(u32)) return error.InputTooLarge;
 
-        try self.ensureOutputCapacity(data.len);
-
-        const chunk_start_offset = self.input_len;
+        const deferred_opener = if (self.lexical.mode == .opener) @as(usize, 1) else 0;
+        const additional = std.math.add(usize, data.len, deferred_opener) catch {
+            return error.CapacityOverflow;
+        };
+        try self.ensureOutputCapacity(additional);
+        const base_offset = self.input_len;
         self.input_len = new_input_len;
-        for (data, 0..) |byte, chunk_offset| {
-            self.processByte(byte, chunk_start_offset + chunk_offset);
+        var sink = XmlStreamSink{ .owner = self };
+        try scanXmlLexical(simd.default_vector_len, &self.lexical, data, base_offset, &sink);
+    }
+
+    /// Drains a reader into `feed` and finalizes at EOF. Reader bytes are
+    /// borrowed only for each call and are never retained.
+    pub fn feedFrom(self: *Self, reader: *std.Io.Reader) FeedFromError!void {
+        while (true) {
+            const data = reader.buffered();
+            if (data.len > 0) {
+                try self.feed(data);
+                reader.toss(data.len);
+                continue;
+            }
+            reader.fill(1) catch |err| switch (err) {
+                error.EndOfStream => return self.finish(),
+                error.ReadFailed => return error.ReadFailed,
+            };
         }
     }
 
-    /// Finalizes the index and flushes all pending lexical state at EOF.
+    /// Finalizes pending opener state and writes the structural sentinels.
     pub fn finish(self: *Self) FinishError!void {
         if (self.finished) return;
-
-        // A partial opener has already emitted its '<' token. Its remaining
-        // bytes are non-structural at EOF, so no synthetic token is needed.
-        self.candidate = null;
-        try self.ensureOutputCapacity(0);
+        const deferred_opener = if (self.lexical.mode == .opener) @as(usize, 1) else 0;
+        try self.ensureOutputCapacity(deferred_opener);
+        var sink = XmlStreamSink{ .owner = self };
+        try finishXmlLexical(&self.lexical, &sink);
         if (self.index) |*index| {
             try index.finish(self.input_len);
         } else {
@@ -142,12 +579,11 @@ pub const XmlStreamIndexer = struct {
         self.finished = true;
     }
 
-    /// Transfers the finalized structural index to the caller.
+    /// Transfers the finalized structural index and token kinds to the caller.
     pub fn take(self: *Self) XmlStructuralIndex {
         std.debug.assert(self.finished);
         std.debug.assert(self.index != null);
         std.debug.assert(self.kinds != null);
-
         const index = self.index.?;
         const kinds = self.kinds.?;
         self.index = null;
@@ -159,29 +595,32 @@ pub const XmlStreamIndexer = struct {
         };
     }
 
-    /// Starts a new document while retaining the current allocation capacity.
+    /// Starts a new document while retaining reusable output capacity.
     pub fn reset(self: *Self) void {
-        if (self.index) |*index| {
-            index.count = 0;
-        }
+        if (self.index) |*index| index.count = 0;
         self.input_len = 0;
-        self.in_comment = false;
-        self.comment_start_offset = 0;
-        self.previous_byte = 0;
-        self.comment_previous_previous = 0;
-        self.comment_previous = 0;
-        self.in_cdata = false;
-        self.cdata_previous_previous = 0;
-        self.cdata_previous = 0;
-        self.in_tag = false;
-        self.in_attr_quote = null;
-        self.candidate = null;
+        self.lexical = .{};
         self.finished = false;
     }
 
-    fn ensureOutputCapacity(self: *Self, additional: usize) CapacityError!void {
+    fn appendToken(
+        self: *Self,
+        index: usize,
+        kind: XmlTokenKind,
+    ) error{CapacityExceeded}!void {
+        const structural_index = self.index orelse return error.CapacityExceeded;
+        const kinds = self.kinds orelse return error.CapacityExceeded;
+        if (structural_index.count >= structural_index.indexes.len - 3) {
+            return error.CapacityExceeded;
+        }
+        if (structural_index.count >= kinds.len) return error.CapacityExceeded;
+        self.index.?.indexes[structural_index.count] = @intCast(index);
+        self.kinds.?[structural_index.count] = kind;
+        self.index.?.count += 1;
+    }
+
+    fn ensureOutputCapacity(self: *Self, additional: usize) (std.mem.Allocator.Error || error{ CapacityOverflow, InputTooLarge })!void {
         if (self.index == null) {
-            std.debug.assert(self.kinds == null);
             const output_capacity = @max(additional, initial_output_capacity);
             var index = try stage1.StructuralIndex.init(
                 self.allocator,
@@ -212,188 +651,6 @@ pub const XmlStreamIndexer = struct {
         index.indexes = try self.allocator.realloc(index.indexes, new_index_len);
         self.kinds = try self.allocator.realloc(kinds, new_capacity);
     }
-
-    fn processByte(self: *Self, byte: u8, offset: usize) void {
-        if (self.in_comment) {
-            self.processCommentByte(byte, offset);
-            self.previous_byte = byte;
-            return;
-        }
-
-        if (self.in_cdata) {
-            self.processCdataByte(byte);
-            self.previous_byte = byte;
-            return;
-        }
-
-        if (self.in_attr_quote) |quote| {
-            if (byte == quote) {
-                self.appendToken(offset, .attr_quote);
-                self.in_attr_quote = null;
-            }
-            self.previous_byte = byte;
-            return;
-        }
-
-        if (self.candidate != null) {
-            if (self.advanceCandidate(byte)) {
-                self.previous_byte = byte;
-                return;
-            }
-        }
-
-        self.processResolvedByte(byte, offset);
-        self.previous_byte = byte;
-    }
-
-    fn processCommentByte(self: *Self, byte: u8, offset: usize) void {
-        if (byte == '>' and offset >= self.comment_start_offset and
-            offset - self.comment_start_offset >= 6 and
-            self.comment_previous_previous == '-' and self.comment_previous == '-')
-        {
-            self.in_comment = false;
-        }
-        self.comment_previous_previous = self.comment_previous;
-        self.comment_previous = byte;
-    }
-
-    fn processCdataByte(self: *Self, byte: u8) void {
-        if (byte == '>' and self.cdata_previous_previous == ']' and
-            self.cdata_previous == ']')
-        {
-            self.in_cdata = false;
-        }
-        self.cdata_previous_previous = self.cdata_previous;
-        self.cdata_previous = byte;
-    }
-
-    fn processResolvedByte(self: *Self, byte: u8, offset: usize) void {
-        if (byte == '<') {
-            self.appendToken(offset, .tag_open);
-            self.in_tag = true;
-            const structural_index = self.index orelse unreachable;
-            self.candidate = .{
-                .token_index = structural_index.count - 1,
-                .start_offset = offset,
-                .prefix_len = 1,
-                .kind = .unknown,
-            };
-            return;
-        }
-
-        if (!self.in_tag) return;
-
-        switch (byte) {
-            '=' => self.appendToken(offset, .attr_equals),
-            '"', '\'' => {
-                self.appendToken(offset, .attr_quote);
-                self.in_attr_quote = byte;
-            },
-            '>' => {
-                if (self.previous_byte == '/') {
-                    self.appendToken(offset - 1, .self_close);
-                } else if (self.previous_byte == '?') {
-                    self.appendToken(offset - 1, .proc_inst_close);
-                } else {
-                    self.appendToken(offset, .tag_close);
-                }
-                self.in_tag = false;
-            },
-            else => {},
-        }
-    }
-
-    fn advanceCandidate(self: *Self, byte: u8) bool {
-        var candidate = self.candidate orelse return false;
-
-        if (candidate.prefix_len == 1) {
-            switch (byte) {
-                '/' => {
-                    const kinds = self.kinds orelse unreachable;
-                    kinds[candidate.token_index] = .closing_tag_open;
-                    self.candidate = null;
-                    return true;
-                },
-                '?' => {
-                    const kinds = self.kinds orelse unreachable;
-                    kinds[candidate.token_index] = .proc_inst_open;
-                    self.candidate = null;
-                    return true;
-                },
-                '!' => {
-                    candidate.prefix_len = 2;
-                    self.candidate = candidate;
-                    return true;
-                },
-                else => {
-                    self.candidate = null;
-                    return false;
-                },
-            }
-        }
-
-        if (candidate.prefix_len == 2) {
-            if (byte == '-') {
-                candidate.kind = .comment;
-                candidate.prefix_len = 3;
-                self.candidate = candidate;
-                return true;
-            }
-            if (byte == '[') {
-                candidate.kind = .cdata;
-                candidate.prefix_len = 3;
-                self.candidate = candidate;
-                return true;
-            }
-            self.candidate = null;
-            return false;
-        }
-
-        const literal: []const u8 = switch (candidate.kind) {
-            .comment => "<!--",
-            .cdata => "<![CDATA[",
-            .unknown => unreachable,
-        };
-        const literal_len: u8 = @intCast(literal.len);
-        const prefix_index: usize = @intCast(candidate.prefix_len);
-        if (byte != literal[prefix_index]) {
-            self.candidate = null;
-            return false;
-        }
-        candidate.prefix_len += 1;
-        if (candidate.prefix_len == literal_len) {
-            switch (candidate.kind) {
-                .comment => {
-                    self.in_comment = true;
-                    self.comment_start_offset = candidate.start_offset;
-                    self.comment_previous_previous = '-';
-                    self.comment_previous = '-';
-                    self.in_tag = false;
-                },
-                .cdata => {
-                    self.in_cdata = true;
-                    self.cdata_previous_previous = 'A';
-                    self.cdata_previous = '[';
-                    self.in_tag = false;
-                },
-                .unknown => unreachable,
-            }
-            self.candidate = null;
-        } else {
-            self.candidate = candidate;
-        }
-        return true;
-    }
-
-    fn appendToken(self: *Self, index: usize, kind: XmlTokenKind) void {
-        const structural_index = if (self.index) |*value| value else unreachable;
-        const kinds = self.kinds orelse unreachable;
-        std.debug.assert(structural_index.count < structural_index.indexes.len - 3);
-        std.debug.assert(structural_index.count < kinds.len);
-        structural_index.indexes[structural_index.count] = @intCast(index);
-        kinds[structural_index.count] = kind;
-        structural_index.count += 1;
-    }
 };
 
 pub fn indexXml(
@@ -408,132 +665,29 @@ pub fn indexXmlImpl(
     allocator: std.mem.Allocator,
     input: []const u8,
 ) !XmlStructuralIndex {
-    const Mask = simd.Mask(VLEN);
-
     if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
     var structural_indexes = try stage1.StructuralIndex.init(allocator, input.len);
     errdefer structural_indexes.deinit(allocator);
-    const indexes = structural_indexes.indexes;
     const kinds = try allocator.alloc(XmlTokenKind, input.len);
     errdefer allocator.free(kinds);
 
     var result = XmlStructuralIndex{
-        .indexes = indexes,
+        .indexes = structural_indexes.indexes,
         .kinds = kinds,
         .count = 0,
     };
-    var in_comment = false;
-    var comment_start_offset: usize = 0;
-    var in_cdata = false;
-    var in_tag = false;
-    var in_attr_quote: ?u8 = null;
-    var base_offset: usize = 0;
-    var window_iterator = simd.windows(u8, VLEN, input, 0);
-
-    while (base_offset < input.len) {
-        const vector = window_iterator.next().?;
-        const punctuation_mask: Mask = simd.matchAny4(VLEN, vector, '<', '>', '=', '"') |
-            simd.matchByte(VLEN, vector, '\'');
-        var candidate_indexes: [VLEN]u32 = undefined;
-        const candidate_count = simd.extractBitIndexes(
-            Mask,
-            punctuation_mask,
-            base_offset,
-            &candidate_indexes,
-        );
-
-        for (candidate_indexes[0..candidate_count]) |candidate_index| {
-            const input_index: usize = @intCast(candidate_index);
-            const byte = input[input_index];
-
-            if (in_comment) {
-                if (isCommentTerminatorAt(input, input_index, comment_start_offset)) {
-                    in_comment = false;
-                }
-                continue;
-            }
-
-            if (in_cdata) {
-                if (byte == '>' and input_index >= 2 and input[input_index - 2] == ']' and
-                    input[input_index - 1] == ']')
-                {
-                    in_cdata = false;
-                }
-                continue;
-            }
-
-            if (in_attr_quote) |quote| {
-                if (byte == quote) {
-                    appendToken(&result, input_index, .attr_quote);
-                    in_attr_quote = null;
-                }
-                continue;
-            }
-
-            if (byte == '<') {
-                if (startsWithAt(input, input_index, "<!--")) {
-                    appendToken(&result, input_index, .tag_open);
-                    in_comment = true;
-                    comment_start_offset = input_index;
-                    in_tag = false;
-                    continue;
-                }
-
-                if (startsWithAt(input, input_index, "<![CDATA[")) {
-                    appendToken(&result, input_index, .tag_open);
-                    in_cdata = true;
-                    in_tag = false;
-                    continue;
-                }
-
-                const next_byte = if (input_index + 1 < input.len) input[input_index + 1] else 0;
-                const token_kind: XmlTokenKind = switch (next_byte) {
-                    '/' => .closing_tag_open,
-                    '?' => .proc_inst_open,
-                    else => .tag_open,
-                };
-                appendToken(&result, input_index, token_kind);
-                in_tag = true;
-                continue;
-            }
-
-            if (!in_tag) {
-                continue;
-            }
-
-            switch (byte) {
-                '=' => appendToken(&result, input_index, .attr_equals),
-                '"', '\'' => {
-                    appendToken(&result, input_index, .attr_quote);
-                    in_attr_quote = byte;
-                },
-                '>' => {
-                    if (input_index > 0 and input[input_index - 1] == '/') {
-                        appendToken(&result, input_index - 1, .self_close);
-                    } else if (input_index > 0 and input[input_index - 1] == '?') {
-                        appendToken(&result, input_index - 1, .proc_inst_close);
-                    } else {
-                        appendToken(&result, input_index, .tag_close);
-                    }
-                    in_tag = false;
-                },
-                else => {},
-            }
-        }
-
-        base_offset += VLEN;
-    }
-
+    var state: XmlLexicalState = .{};
+    var sink = XmlLexicalSink{ .result = &result };
+    scanXmlLexical(VLEN, &state, input, 0, &sink) catch |err| switch (err) {
+        error.CapacityExceeded => unreachable,
+        error.InputTooLarge => return error.InputTooLarge,
+    };
+    finishXmlLexical(&state, &sink) catch |err| switch (err) {
+        error.CapacityExceeded => unreachable,
+    };
     structural_indexes.count = result.count;
     try structural_indexes.finish(input.len);
     return result;
-}
-
-fn appendToken(result: *XmlStructuralIndex, index: usize, kind: XmlTokenKind) void {
-    std.debug.assert(result.count < result.indexes.len);
-    result.indexes[result.count] = @intCast(index);
-    result.kinds[result.count] = kind;
-    result.count += 1;
 }
 
 fn startsWithAt(input: []const u8, offset: usize, literal: []const u8) bool {
@@ -1014,6 +1168,32 @@ test "XML stream matches indexXml across every partition and byte feed" {
     try expectStreamMatchesDocuments(documents[0..]);
 }
 
+test "XML stream reserves output for a deferred opener" {
+    const input = "<>";
+    var expected = try indexXml(testing.allocator, input);
+    defer expected.deinit(testing.allocator);
+
+    var stream = try XmlStreamIndexer.init(testing.allocator, 1);
+    defer stream.deinit();
+    try stream.feed("<");
+    try stream.feed(">");
+    try stream.finish();
+    var actual = stream.take();
+    defer actual.deinit(testing.allocator);
+
+    try testing.expectEqual(expected.count, actual.count);
+    try testing.expectEqualSlices(
+        u32,
+        expected.indexes[0..expected.count],
+        actual.indexes[0..actual.count],
+    );
+    try testing.expectEqualSlices(
+        XmlTokenKind,
+        expected.kinds[0..expected.count],
+        actual.kinds[0..actual.count],
+    );
+}
+
 test "XML stream finish flushes pending state and reset starts at zero" {
     var stream = try XmlStreamIndexer.init(testing.allocator, 2);
     defer stream.deinit();
@@ -1148,7 +1328,15 @@ pub const XmlError = error{
     TapeTooLarge,
     TapeOutOfBounds,
     SourceOutOfBounds,
+    SourceMismatch,
     InvalidTapeKind,
+    InvalidTapeOrder,
+    CapacityOverflow,
+    CapacityExceeded,
+    DocumentActive,
+    DocumentReleased,
+    FocusAlreadyClaimed,
+    OutOfOrderIteration,
 };
 
 pub const XmlBuildError = std.mem.Allocator.Error || XmlError;
@@ -1208,8 +1396,79 @@ pub const XmlDiagnostic = struct {
     snippet_start: usize,
 };
 
+pub const XmlElementEvent = struct {
+    raw: []const u8,
+    name: []const u8,
+    offset: u32,
+    self_closing: bool,
+};
+
+pub const XmlAttributeEvent = struct {
+    raw: []const u8,
+    name: []const u8,
+    value: []const u8,
+    offset: u32,
+};
+
+pub const XmlTextEvent = struct {
+    raw: []const u8,
+    offset: u32,
+};
+
+pub const XmlCommentEvent = struct {
+    raw: []const u8,
+    content: []const u8,
+    offset: u32,
+};
+
+pub const XmlCdataEvent = struct {
+    raw: []const u8,
+    content: []const u8,
+    offset: u32,
+};
+
+pub const XmlProcessingInstructionEvent = struct {
+    raw: []const u8,
+    target: []const u8,
+    data: []const u8,
+    offset: u32,
+};
+
+pub const XmlEvent = union(enum) {
+    xml_declaration: struct { raw: []const u8, offset: u32 },
+    element_start: XmlElementEvent,
+    element_end: struct { raw: []const u8, name: []const u8, offset: u32 },
+    self_closing_element: XmlElementEvent,
+    attribute: XmlAttributeEvent,
+    text: XmlTextEvent,
+    cdata: XmlCdataEvent,
+    comment: XmlCommentEvent,
+    processing_instruction: XmlProcessingInstructionEvent,
+
+    pub fn raw(self: XmlEvent) []const u8 {
+        return switch (self) {
+            .xml_declaration => |event| event.raw,
+            .element_start => |event| event.raw,
+            .element_end => |event| event.raw,
+            .self_closing_element => |event| event.raw,
+            .attribute => |event| event.raw,
+            .text => |event| event.raw,
+            .cdata => |event| event.raw,
+            .comment => |event| event.raw,
+            .processing_instruction => |event| event.raw,
+        };
+    }
+};
+
+pub const XmlToken = struct {
+    kind: XmlTapeKind,
+    raw: []const u8,
+    offset: u32,
+};
+
 pub const XmlDocument = struct {
     tape: []XmlTapeWord,
+    source: ?[]const u8 = null,
 
     pub fn deinit(self: *XmlDocument, allocator: std.mem.Allocator) void {
         allocator.free(self.tape);
@@ -1227,12 +1486,202 @@ pub const XmlDocument = struct {
         tape_index: usize,
     ) XmlError![]const u8 {
         const word_value = try self.word(tape_index);
-        _ = try checkedXmlTapeKind(word_value);
+        const kind = try checkedXmlTapeKind(word_value);
         const source_offset: usize = @intCast(word_value.offset);
         const source_length = word_value.sourceLength();
         if (source_offset > input.len) return error.SourceOutOfBounds;
         if (source_length > input.len - source_offset) return error.SourceOutOfBounds;
+        if (!xmlTapeSpanMatchesKind(
+            kind,
+            input[source_offset .. source_offset + source_length],
+        )) return error.InvalidTapeOrder;
+        if (tape_index > 0 and word_value.offset <= self.tape[tape_index - 1].offset) {
+            return error.InvalidTapeOrder;
+        }
         return input[source_offset .. source_offset + source_length];
+    }
+
+    pub fn root(self: *const XmlDocument, input: []const u8) XmlError!XmlTapeCursor {
+        const source = self.source orelse return error.SourceMismatch;
+        if (source.ptr != input.ptr or source.len != input.len) return error.SourceMismatch;
+
+        if (self.tape.len == 0) return error.TapeOutOfBounds;
+        try validateXmlTape(self.tape, input);
+        var index: usize = 0;
+        while (index < self.tape.len) : (index += 1) {
+            const token = try xmlTapeToken(self, input, index);
+            switch (token.kind) {
+                .xml_declaration, .comment, .processing_instruction => {},
+                .element_start, .self_closing_element => {
+                    return .{
+                        .document = self,
+                        .input = input,
+                        .position = index,
+                    };
+                },
+                else => return error.InvalidTapeOrder,
+            }
+        }
+        return error.TapeOutOfBounds;
+    }
+};
+
+fn xmlTapeToken(
+    document: *const XmlDocument,
+    input: []const u8,
+    index: usize,
+) XmlError!XmlToken {
+    const word_value = try document.word(index);
+    const kind = try checkedXmlTapeKind(word_value);
+    const offset: usize = @intCast(word_value.offset);
+    const length = word_value.sourceLength();
+    if (offset > input.len or length > input.len - offset) return error.SourceOutOfBounds;
+    if (!xmlTapeSpanMatchesKind(kind, input[offset .. offset + length])) {
+        return error.InvalidTapeOrder;
+    }
+    if (index > 0 and word_value.offset <= document.tape[index - 1].offset) {
+        return error.InvalidTapeOrder;
+    }
+    return .{
+        .kind = kind,
+        .raw = input[offset .. offset + length],
+        .offset = word_value.offset,
+    };
+}
+fn xmlTapeSpanMatchesKind(kind: XmlTapeKind, raw: []const u8) bool {
+    if (raw.len == 0) return false;
+
+    var stack: [1]XmlFrame = undefined;
+    var parser = XmlParser{
+        .input = raw,
+        .output = null,
+        .stack = stack[0..],
+    };
+
+    switch (kind) {
+        .element_start, .self_closing_element => {
+            parser.parseOpeningElement() catch return false;
+            if (parser.position != raw.len) return false;
+            const self_closing = parser.stack_top == 0;
+            return self_closing == (kind == .self_closing_element);
+        },
+        .element_end => {
+            if (!startsWithAt(raw, 0, "</")) return false;
+            const name_end = parseXmlName(raw, 2) orelse return false;
+            const close = skipXmlWhitespace(raw, name_end);
+            return close < raw.len and close + 1 == raw.len and raw[close] == '>';
+        },
+        .attribute => return xmlTapeAttributeMatches(raw),
+        .text => {
+            parser.stack_top = 1;
+            parser.parseText() catch return false;
+            return parser.position == raw.len;
+        },
+        .cdata => {
+            parser.stack_top = 1;
+            parser.parseCdata() catch return false;
+            return parser.position == raw.len;
+        },
+        .comment => {
+            parser.parseComment() catch return false;
+            return parser.position == raw.len;
+        },
+        .xml_declaration, .processing_instruction => {
+            if (!startsWithAt(raw, 0, "<?")) return false;
+            const target_end = parseXmlName(raw, 2) orelse return false;
+            const target = raw[2..target_end];
+            if (kind == .xml_declaration) {
+                if (!std.mem.eql(u8, target, "xml")) return false;
+            } else if (std.ascii.eqlIgnoreCase(target, "xml")) {
+                return false;
+            }
+            parser.parseProcessingInstruction() catch return false;
+            return parser.position == raw.len;
+        },
+    }
+}
+
+fn xmlTapeAttributeMatches(raw: []const u8) bool {
+    var stack: [1]XmlFrame = undefined;
+    var parser = XmlParser{
+        .input = raw,
+        .output = null,
+        .stack = stack[0..],
+    };
+
+    const name_end = parseXmlName(raw, 0) orelse return false;
+    var cursor = skipXmlWhitespace(raw, name_end);
+    if (cursor >= raw.len or raw[cursor] != '=') return false;
+    cursor = skipXmlWhitespace(raw, cursor + 1);
+    if (cursor >= raw.len or (raw[cursor] != '\'' and raw[cursor] != '"')) return false;
+    const quote = raw[cursor];
+    const value_start = cursor + 1;
+    cursor = value_start;
+    while (cursor < raw.len and raw[cursor] != quote) : (cursor += 1) {}
+    if (cursor >= raw.len or cursor + 1 != raw.len) return false;
+    parser.validateData(value_start, cursor, true, false, true) catch return false;
+    return true;
+}
+
+pub const XmlTapeCursor = struct {
+    document: *const XmlDocument,
+    input: []const u8,
+    position: usize,
+
+    fn ensureSource(self: *const @This()) XmlError!void {
+        const source = self.document.source orelse return error.SourceMismatch;
+        if (source.ptr != self.input.ptr or source.len != self.input.len) {
+            return error.SourceMismatch;
+        }
+    }
+
+    pub fn peek(self: *const @This()) XmlError!?XmlToken {
+        try self.ensureSource();
+        if (self.position >= self.document.tape.len) return null;
+        return try xmlTapeToken(self.document, self.input, self.position);
+    }
+
+    pub fn advance(self: *@This()) XmlError!?XmlToken {
+        const token = try self.peek() orelse return null;
+        self.position += 1;
+        return token;
+    }
+
+    pub fn skipChild(self: *@This()) XmlError!void {
+        const first = try self.peek() orelse return;
+        switch (first.kind) {
+            .self_closing_element => {
+                const element_end = @as(usize, first.offset) + first.raw.len;
+                _ = try self.advance();
+                while (true) {
+                    const attribute = try self.peek() orelse break;
+                    if (@as(usize, attribute.offset) >= element_end) break;
+                    if (attribute.kind != .attribute) return error.InvalidTapeOrder;
+                    _ = try self.advance();
+                }
+                return;
+            },
+            .element_start => {},
+            else => {
+                _ = try self.advance();
+                return;
+            },
+        }
+
+        var depth: usize = 0;
+        while (true) {
+            const token = try self.advance() orelse return error.TapeOutOfBounds;
+            switch (token.kind) {
+                .element_start => depth += 1,
+                .self_closing_element => {},
+                .element_end => {
+                    if (depth == 0) return error.InvalidTapeOrder;
+                    depth -= 1;
+                    if (depth == 0) return;
+                },
+                else => {},
+            }
+        }
     }
 };
 
@@ -1252,8 +1701,10 @@ pub fn buildXmlTape(
     // uninitialized to avoid clearing the fixed stack for each parse.
     var stack: [xml_max_depth]XmlFrame = undefined;
     var output = XmlTapeOutput{
-        .allocator = allocator,
-        .tape = &tape,
+        .storage = .{ .builder = .{
+            .allocator = allocator,
+            .tape = &tape,
+        } },
     };
 
     var parser = XmlParser{
@@ -1262,9 +1713,27 @@ pub fn buildXmlTape(
         .stack = stack[0..],
     };
     try parser.run();
-    return .{ .tape = try tape.toOwnedSlice(allocator) };
+    const owned_tape = try tape.toOwnedSlice(allocator);
+    return .{
+        .tape = owned_tape,
+        .source = input,
+    };
 }
 
+fn validateXmlTape(tape: []const XmlTapeWord, input: []const u8) XmlError!void {
+    var stack: [xml_max_depth]XmlFrame = undefined;
+    var output = XmlTapeOutput{ .storage = .{ .validator = tape } };
+    var parser = XmlParser{
+        .input = input,
+        .output = &output,
+        .stack = stack[0..],
+    };
+    parser.run() catch |err| {
+        if (err == error.OutOfMemory) return error.InvalidTapeOrder;
+        return @errorCast(err);
+    };
+    try output.finish();
+}
 pub fn validateXml(input: []const u8) XmlValidationError!?XmlDiagnostic {
     if (input.len > std.math.maxInt(u32)) return error.TapeTooLarge;
 
@@ -1313,7 +1782,7 @@ fn diagnosticAtXml(input: []const u8, err: XmlError, byte_offset: usize) XmlDiag
     };
 }
 
-const XmlParseError = std.mem.Allocator.Error || XmlError;
+pub const XmlParseError = std.mem.Allocator.Error || XmlError;
 
 const XmlFrame = struct {
     name: []const u8,
@@ -1326,8 +1795,78 @@ const XmlDecoded = struct {
 };
 
 const XmlTapeOutput = struct {
-    allocator: std.mem.Allocator,
-    tape: *std.ArrayList(XmlTapeWord),
+    storage: union(enum) {
+        builder: struct {
+            allocator: std.mem.Allocator,
+            tape: *std.ArrayList(XmlTapeWord),
+        },
+        validator: []const XmlTapeWord,
+    },
+    count: usize = 0,
+
+    fn append(self: *@This(), kind: XmlTapeKind, start: usize, end: usize) XmlParseError!void {
+        switch (self.storage) {
+            .builder => |builder| {
+                try builder.tape.append(builder.allocator, .{
+                    .kind = @intFromEnum(kind),
+                    .payload = @intCast(end - start),
+                    .offset = @intCast(start),
+                });
+                self.count += 1;
+            },
+            .validator => |expected| {
+                if (self.count >= expected.len) return error.InvalidTapeOrder;
+                const word = expected[self.count];
+                const expected_kind = checkedXmlTapeKind(word) catch return error.InvalidTapeKind;
+                if (@as(usize, @intCast(word.offset)) != start) {
+                    return error.InvalidTapeOrder;
+                }
+                if (kind != .element_start and expected_kind != kind) {
+                    return error.InvalidTapeOrder;
+                }
+                if (kind == .element_start and
+                    expected_kind != .element_start and
+                    expected_kind != .self_closing_element)
+                {
+                    return error.InvalidTapeOrder;
+                }
+                if (kind != .element_start and word.sourceLength() != end - start) {
+                    return error.InvalidTapeOrder;
+                }
+                self.count += 1;
+            },
+        }
+    }
+
+    fn updateOpening(
+        self: *@This(),
+        tape_index: usize,
+        kind: XmlTapeKind,
+        length: usize,
+    ) XmlParseError!void {
+        switch (self.storage) {
+            .builder => |builder| {
+                builder.tape.items[tape_index].kind = @intFromEnum(kind);
+                builder.tape.items[tape_index].payload = @intCast(length);
+            },
+            .validator => |expected| {
+                if (tape_index >= expected.len) return error.InvalidTapeOrder;
+                const word = expected[tape_index];
+                if (word.kind != @intFromEnum(kind) or word.sourceLength() != length) {
+                    return error.InvalidTapeOrder;
+                }
+            },
+        }
+    }
+
+    fn finish(self: *const @This()) XmlError!void {
+        switch (self.storage) {
+            .builder => {},
+            .validator => |expected| {
+                if (self.count != expected.len) return error.InvalidTapeOrder;
+            },
+        }
+    }
 };
 
 const XmlParser = struct {
@@ -1486,6 +2025,9 @@ const XmlParser = struct {
                 }
                 return self.fail(error.InvalidUtf8, cursor);
             };
+            if (!isXmlCharacter(decoded.codepoint)) {
+                return self.fail(error.InvalidCharacter, cursor);
+            }
             cursor += decoded.length;
         }
     }
@@ -1493,14 +2035,16 @@ const XmlParser = struct {
     fn parseComment(self: *XmlParser) XmlParseError!void {
         const start = self.position;
         var index = start + 4;
-        while (index + 1 < self.input.len) : (index += 1) {
-            if (self.input[index] != '-' or self.input[index + 1] != '-') continue;
-            if (index + 2 < self.input.len and self.input[index + 2] == '>') {
-                try self.emit(.comment, start, index + 3);
-                self.position = index + 3;
-                return;
+        while (index + 2 < self.input.len) : (index += 1) {
+            if (self.input[index] == '-' and self.input[index + 1] == '-') {
+                if (self.input[index + 2] == '>') {
+                    try self.validateData(start + 4, index, false, false, false);
+                    try self.emit(.comment, start, index + 3);
+                    self.position = index + 3;
+                    return;
+                }
+                return self.fail(error.InvalidComment, index);
             }
-            return self.fail(error.InvalidComment, index);
         }
         return self.fail(error.UnterminatedComment, start);
     }
@@ -1587,6 +2131,7 @@ const XmlParser = struct {
             cursor += 1;
             const value_start = cursor;
             while (cursor < close and self.input[cursor] != quote) : (cursor += 1) {}
+            try self.validateData(value_start, cursor, false, false, false);
             if (cursor == close) return self.fail(error.InvalidDeclaration, value_start - 1);
             const value = self.input[value_start..cursor];
             if (std.mem.eql(u8, name, "version")) {
@@ -1631,7 +2176,7 @@ const XmlParser = struct {
 
         var element_word_index: ?usize = null;
         if (self.output) |output| {
-            element_word_index = output.tape.items.len;
+            element_word_index = output.count;
             try self.emit(.element_start, start, name_end);
         }
 
@@ -1702,10 +2247,11 @@ const XmlParser = struct {
         if (!self.root_seen) self.root_seen = true;
         if (self.output) |output| {
             const tape_index = element_word_index orelse unreachable;
-            output.tape.items[tape_index].kind = @intFromEnum(
-                if (self_closing) XmlTapeKind.self_closing_element else XmlTapeKind.element_start,
+            try output.updateOpening(
+                tape_index,
+                if (self_closing) .self_closing_element else .element_start,
+                cursor - start,
             );
-            output.tape.items[tape_index].payload = @intCast(cursor - start);
         }
         if (self_closing) {
             if (self.stack_top == 0) self.root_closed = true;
@@ -1750,11 +2296,7 @@ const XmlParser = struct {
             return self.fail(error.TapeTooLarge, start);
         }
         if (self.output) |output| {
-            try output.tape.append(output.allocator, .{
-                .kind = @intFromEnum(kind),
-                .payload = @intCast(length),
-                .offset = @intCast(start),
-            });
+            try output.append(kind, start, end);
         }
     }
 
@@ -1764,6 +2306,515 @@ const XmlParser = struct {
     }
 };
 
+const XmlPendingOpen = struct {
+    active: bool = false,
+    start: usize = 0,
+    name_start: usize = 0,
+    name_end: usize = 0,
+    close_start: usize = 0,
+    close_end: usize = 0,
+    attribute_cursor: usize = 0,
+    self_closing: bool = false,
+};
+
+pub const Parser = struct {
+    max_capacity: usize,
+    stack: [xml_max_depth]XmlFrame = undefined,
+    state: resident.State = .{},
+
+    pub const InitError = error{InputTooLarge};
+
+    pub fn init(allocator: std.mem.Allocator, max_capacity: usize) InitError!Parser {
+        _ = allocator;
+        if (max_capacity > std.math.maxInt(u32)) return error.InputTooLarge;
+        return .{ .max_capacity = max_capacity };
+    }
+
+    pub fn deinit(self: *Parser) void {
+        std.debug.assert(!self.state.active);
+        self.state.deinit();
+        self.* = undefined;
+    }
+    fn checkInputSize(self: *const Parser, input_len: usize) XmlParseError!void {
+        if (input_len > std.math.maxInt(u32)) return error.TapeTooLarge;
+        if (self.max_capacity != 0 and input_len > self.max_capacity) {
+            return error.CapacityExceeded;
+        }
+    }
+
+    pub fn initOnDemandDocument(
+        self: *Parser,
+        input: []const u8,
+    ) XmlParseError!XmlOnDemandDocument {
+        const lease = try self.state.begin();
+        errdefer lease.release();
+        try self.checkInputSize(input.len);
+        var grammar = XmlParser{
+            .input = input,
+            .output = null,
+            .stack = self.stack[0..],
+        };
+        grammar.position = if (startsWithAt(input, 0, "\xEF\xBB\xBF")) 3 else 0;
+        return .{
+            .input = input,
+            .lease = lease,
+            .grammar = grammar,
+        };
+    }
+};
+const XmlResidentFailure = struct {
+    err: XmlError,
+    offset: usize,
+};
+
+pub const XmlOnDemandDocument = struct {
+    input: []const u8,
+    lease: resident.Lease,
+    grammar: XmlParser,
+    pending: XmlPendingOpen = .{},
+    failure: ?XmlResidentFailure = null,
+
+    pub fn deinit(self: *XmlOnDemandDocument) void {
+        self.lease.release();
+    }
+
+    fn claim(self: *XmlOnDemandDocument) XmlError!resident.Guard {
+        return self.lease.claim();
+    }
+
+    pub fn eventReader(self: *XmlOnDemandDocument) XmlError!XmlEventReader {
+        const guard = try self.claim();
+        return .{
+            .document = self,
+            .guard = guard,
+        };
+    }
+
+    pub fn tokenCursor(self: *XmlOnDemandDocument) XmlError!XmlTokenCursor {
+        const guard = try self.claim();
+        return .{
+            .document = self,
+            .guard = guard,
+        };
+    }
+
+    fn nextAttribute(self: *XmlOnDemandDocument) XmlParseError!?XmlEvent {
+        const pending = &self.pending;
+        var cursor = skipXmlWhitespace(self.input, pending.attribute_cursor);
+        if (cursor >= pending.close_start) return null;
+
+        const name_start = cursor;
+        const name_end = parseXmlName(self.input, name_start) orelse {
+            self.grammar.failure_offset = cursor;
+            return error.InvalidAttribute;
+        };
+        cursor = skipXmlWhitespace(self.input, name_end);
+        if (cursor >= pending.close_start or self.input[cursor] != '=') {
+            self.grammar.failure_offset = cursor;
+            return error.InvalidAttribute;
+        }
+        cursor = skipXmlWhitespace(self.input, cursor + 1);
+        if (cursor >= pending.close_start or
+            (self.input[cursor] != '\'' and self.input[cursor] != '"'))
+        {
+            self.grammar.failure_offset = cursor;
+            return error.InvalidAttribute;
+        }
+        const quote = self.input[cursor];
+        const value_start = cursor + 1;
+        cursor = value_start;
+        while (cursor < pending.close_start and self.input[cursor] != quote) : (cursor += 1) {}
+        if (cursor >= pending.close_start) {
+            self.grammar.failure_offset = value_start - 1;
+            return error.InvalidAttribute;
+        }
+        const value_end = cursor;
+        pending.attribute_cursor = cursor + 1;
+        const raw_end = cursor + 1;
+        return .{ .attribute = .{
+            .raw = self.input[name_start..raw_end],
+            .name = self.input[name_start..name_end],
+            .value = self.input[value_start..value_end],
+            .offset = @intCast(name_start),
+        } };
+    }
+
+    fn skipPendingAttributes(self: *@This(), guard: *resident.Guard) XmlParseError!void {
+        while (self.pending.active) {
+            if (try self.nextAttribute()) |_| {
+                try guard.advance();
+            } else {
+                self.pending.active = false;
+            }
+        }
+    }
+
+    fn cacheFailure(self: *@This(), err: XmlError) XmlParseError {
+        if (self.failure) |failure| {
+            self.grammar.failure_offset = failure.offset;
+            self.grammar.position = failure.offset;
+            return failure.err;
+        }
+
+        var selected_error = err;
+        var selected_offset = self.grammar.failure_offset;
+        const eager = validateXml(self.input) catch |validation_error| {
+            return validation_error;
+        };
+        if (eager) |diagnostic| {
+            selected_error = diagnostic.err;
+            selected_offset = diagnostic.byte_offset;
+        }
+
+        self.failure = .{
+            .err = selected_error,
+            .offset = selected_offset,
+        };
+        self.grammar.failure_offset = selected_offset;
+        self.grammar.position = selected_offset;
+        return selected_error;
+    }
+
+    fn nextEventCore(self: *@This()) XmlParseError!?XmlEvent {
+        if (self.failure) |failure| {
+            self.grammar.failure_offset = failure.offset;
+            self.grammar.position = failure.offset;
+            return failure.err;
+        }
+        return self.nextEventCoreUncached() catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return self.cacheFailure(@errorCast(err));
+        };
+    }
+
+    fn nextEventCoreUncached(self: *XmlOnDemandDocument) XmlParseError!?XmlEvent {
+        if (self.pending.active) {
+            if (try self.nextAttribute()) |attribute| return attribute;
+            self.pending.active = false;
+        }
+
+        while (true) {
+            if (self.grammar.position >= self.input.len) {
+                if (self.grammar.stack_top != 0) {
+                    return self.grammar.fail(
+                        error.UnclosedElement,
+                        self.grammar.stack[self.grammar.stack_top - 1].open_offset,
+                    );
+                }
+                if (!self.grammar.root_seen) {
+                    return self.grammar.fail(error.EmptyDocument, self.input.len);
+                }
+                return null;
+            }
+
+            const start = self.grammar.position;
+            if (self.input[start] != '<') {
+                const stack_top = self.grammar.stack_top;
+                try self.grammar.parseText();
+                self.grammar.declaration_allowed = false;
+                if (stack_top == 0) continue;
+                return .{ .text = .{
+                    .raw = self.input[start..self.grammar.position],
+                    .offset = @intCast(start),
+                } };
+            }
+
+            if (startsWithAt(self.input, start, "<!--")) {
+                try self.grammar.parseComment();
+                self.grammar.declaration_allowed = false;
+                return .{ .comment = .{
+                    .raw = self.input[start..self.grammar.position],
+                    .content = self.input[start + 4 .. self.grammar.position - 3],
+                    .offset = @intCast(start),
+                } };
+            }
+            if (startsWithAt(self.input, start, "<![CDATA[")) {
+                try self.grammar.parseCdata();
+                self.grammar.declaration_allowed = false;
+                return .{ .cdata = .{
+                    .raw = self.input[start..self.grammar.position],
+                    .content = self.input[start + "<![CDATA[".len .. self.grammar.position - 3],
+                    .offset = @intCast(start),
+                } };
+            }
+            if (startsWithAt(self.input, start, "<?")) {
+                const target_start = start + 2;
+                const target_end = parseXmlName(self.input, target_start) orelse {
+                    return self.grammar.fail(error.InvalidName, target_start);
+                };
+                const close = std.mem.indexOfPos(u8, self.input, target_end, "?>") orelse {
+                    return self.grammar.fail(error.UnterminatedProcessingInstruction, start);
+                };
+                try self.grammar.parseProcessingInstruction();
+                self.grammar.declaration_allowed = false;
+                const data = trimXmlWhitespace(self.input[target_end..close]);
+                if (std.mem.eql(u8, self.input[target_start..target_end], "xml")) {
+                    return .{ .xml_declaration = .{
+                        .raw = self.input[start..self.grammar.position],
+                        .offset = @intCast(start),
+                    } };
+                }
+                return .{ .processing_instruction = .{
+                    .raw = self.input[start..self.grammar.position],
+                    .target = self.input[target_start..target_end],
+                    .data = data,
+                    .offset = @intCast(start),
+                } };
+            }
+            if (startsWithAt(self.input, start, "</")) {
+                const name_start = start + 2;
+                const name_end = parseXmlName(self.input, name_start) orelse {
+                    return self.grammar.fail(error.InvalidName, name_start);
+                };
+                try self.grammar.parseClosingElement();
+                self.grammar.declaration_allowed = false;
+                return .{ .element_end = .{
+                    .raw = self.input[start..self.grammar.position],
+                    .name = self.input[name_start..name_end],
+                    .offset = @intCast(start),
+                } };
+            }
+            if (startsWithAt(self.input, start, "<!")) {
+                return self.grammar.fail(error.UnsupportedDeclaration, start);
+            }
+
+            const name_start = start + 1;
+            const name_end = parseXmlName(self.input, name_start) orelse {
+                return self.grammar.fail(error.InvalidName, name_start);
+            };
+            try self.grammar.parseOpeningElement();
+            self.grammar.declaration_allowed = false;
+            const close_end = self.grammar.position;
+            const self_closing = close_end >= 2 and self.input[close_end - 2] == '/';
+            self.pending = .{
+                .active = true,
+                .start = start,
+                .name_start = name_start,
+                .name_end = name_end,
+                .close_start = close_end - @as(usize, if (self_closing) 2 else 1),
+                .close_end = close_end,
+                .attribute_cursor = name_end,
+                .self_closing = self_closing,
+            };
+            const event: XmlEvent = if (self_closing)
+                .{ .self_closing_element = .{
+                    .raw = self.input[start..close_end],
+                    .name = self.input[name_start..name_end],
+                    .offset = @intCast(start),
+                    .self_closing = true,
+                } }
+            else
+                .{ .element_start = .{
+                    .raw = self.input[start..close_end],
+                    .name = self.input[name_start..name_end],
+                    .offset = @intCast(start),
+                    .self_closing = false,
+                } };
+            return event;
+        }
+    }
+
+    fn peekEventCore(self: *XmlOnDemandDocument) XmlParseError!?XmlEvent {
+        const saved_grammar = self.grammar;
+        const saved_pending = self.pending;
+        const saved_stack_top = self.grammar.stack_top;
+        var saved_frame: XmlFrame = undefined;
+        if (saved_stack_top < self.grammar.stack.len) {
+            saved_frame = self.grammar.stack[saved_stack_top];
+        }
+        const result = self.nextEventCore() catch |err| {
+            self.grammar = saved_grammar;
+            self.pending = saved_pending;
+            if (saved_stack_top < self.grammar.stack.len) {
+                self.grammar.stack[saved_stack_top] = saved_frame;
+            }
+            if (self.failure) |failure| {
+                self.grammar.failure_offset = failure.offset;
+                self.grammar.position = failure.offset;
+            }
+            return err;
+        };
+        self.grammar = saved_grammar;
+        self.pending = saved_pending;
+        if (saved_stack_top < self.grammar.stack.len) {
+            self.grammar.stack[saved_stack_top] = saved_frame;
+        }
+        return result;
+    }
+};
+
+fn trimXmlWhitespace(input: []const u8) []const u8 {
+    var start: usize = 0;
+    while (start < input.len and isXmlWhitespace(input[start])) : (start += 1) {}
+    var end = input.len;
+    while (end > start and isXmlWhitespace(input[end - 1])) : (end -= 1) {}
+    return input[start..end];
+}
+
+fn xmlEventToken(event: XmlEvent) XmlToken {
+    return switch (event) {
+        .xml_declaration => |value| .{
+            .kind = .xml_declaration,
+            .raw = value.raw,
+            .offset = value.offset,
+        },
+        .element_start => |value| .{
+            .kind = .element_start,
+            .raw = value.raw,
+            .offset = value.offset,
+        },
+        .element_end => |value| .{
+            .kind = .element_end,
+            .raw = value.raw,
+            .offset = value.offset,
+        },
+        .self_closing_element => |value| .{
+            .kind = .self_closing_element,
+            .raw = value.raw,
+            .offset = value.offset,
+        },
+        .attribute => |value| .{
+            .kind = .attribute,
+            .raw = value.raw,
+            .offset = value.offset,
+        },
+        .text => |value| .{
+            .kind = .text,
+            .raw = value.raw,
+            .offset = value.offset,
+        },
+        .cdata => |value| .{
+            .kind = .cdata,
+            .raw = value.raw,
+            .offset = value.offset,
+        },
+        .comment => |value| .{
+            .kind = .comment,
+            .raw = value.raw,
+            .offset = value.offset,
+        },
+        .processing_instruction => |value| .{
+            .kind = .processing_instruction,
+            .raw = value.raw,
+            .offset = value.offset,
+        },
+    };
+}
+
+pub const XmlEventReader = struct {
+    document: *XmlOnDemandDocument,
+    guard: resident.Guard,
+
+    fn ensureFocused(self: *const @This()) XmlError!void {
+        try self.guard.check();
+    }
+
+    pub fn next(self: *@This()) XmlParseError!?XmlEvent {
+        try self.ensureFocused();
+        const event = try self.document.nextEventCore();
+        if (event != null) try self.guard.advance();
+        return event;
+    }
+
+    pub fn peek(self: *const @This()) XmlParseError!?XmlEvent {
+        try self.ensureFocused();
+        return self.document.peekEventCore();
+    }
+    pub fn skip(self: *@This()) XmlParseError!void {
+        const first = try self.next() orelse return;
+        switch (first) {
+            .element_start => {},
+            .self_closing_element => {
+                try self.document.skipPendingAttributes(&self.guard);
+                return;
+            },
+            else => return,
+        }
+
+        var depth: usize = 1;
+        while (depth != 0) {
+            const event = try self.next() orelse return error.UnclosedElement;
+            switch (event) {
+                .element_start => depth += 1,
+                .element_end => depth -= 1,
+                else => {},
+            }
+        }
+    }
+};
+
+pub const XmlTokenCursor = struct {
+    document: *XmlOnDemandDocument,
+    guard: resident.Guard,
+
+    fn ensureFocused(self: *const @This()) XmlError!void {
+        try self.guard.check();
+    }
+
+    pub fn peek(self: *const @This()) XmlParseError!?XmlToken {
+        try self.ensureFocused();
+        const event = try self.document.peekEventCore() orelse return null;
+        return xmlEventToken(event);
+    }
+
+    pub fn advance(self: *@This()) XmlParseError!?XmlToken {
+        try self.ensureFocused();
+        const event = try self.document.nextEventCore() orelse return null;
+        try self.guard.advance();
+        return xmlEventToken(event);
+    }
+
+    pub fn skipChild(self: *@This()) XmlParseError!void {
+        const first = try self.peek() orelse return;
+        switch (first.kind) {
+            .self_closing_element => {
+                _ = try self.advance();
+                try self.document.skipPendingAttributes(&self.guard);
+                return;
+            },
+            .element_start => {},
+            else => {
+                _ = try self.advance();
+                return;
+            },
+        }
+
+        var depth: usize = 0;
+        while (true) {
+            const token = try self.advance() orelse return error.UnclosedElement;
+            switch (token.kind) {
+                .element_start => depth += 1,
+                .self_closing_element => {},
+                .element_end => {
+                    if (depth == 0) return error.UnexpectedToken;
+                    depth -= 1;
+                    if (depth == 0) return;
+                },
+                else => {},
+            }
+        }
+    }
+};
+
+pub const OnDemandDocument = XmlOnDemandDocument;
+pub const Event = XmlEvent;
+pub const EventReader = XmlEventReader;
+pub const TokenCursor = XmlTokenCursor;
+pub const Token = XmlToken;
+
+pub fn initOnDemandDocument(
+    parser: *Parser,
+    input: []const u8,
+) XmlParseError!XmlOnDemandDocument {
+    return parser.initOnDemandDocument(input);
+}
+
+pub fn initStreamIndexer(
+    allocator: std.mem.Allocator,
+    chunk_len: usize,
+) XmlStreamIndexer.InitError!XmlStreamIndexer {
+    return XmlStreamIndexer.init(allocator, chunk_len);
+}
 fn parseXmlName(input: []const u8, start: usize) ?usize {
     if (start >= input.len) return null;
     const first = decodeXml(input, start) orelse return null;
@@ -1955,6 +3006,44 @@ fn expectXmlDiagnostic(expected: XmlError, input: []const u8) !XmlDiagnostic {
     return diagnostic;
 }
 
+fn expectXmlResidentDiagnostic(
+    expected_error: XmlError,
+    expected_offset: usize,
+    input: []const u8,
+) !void {
+    const eager = try expectXmlDiagnostic(expected_error, input);
+    try testing.expectEqual(expected_offset, eager.byte_offset);
+
+    var parser = try Parser.init(testing.allocator, input.len);
+    defer parser.deinit();
+    var document = try initOnDemandDocument(&parser, input);
+    defer document.deinit();
+    var reader = try document.eventReader();
+
+    for (0..input.len) |_| {
+        if (reader.next()) |event| {
+            if (event == null) return error.ExpectedXmlDiagnostic;
+        } else |actual_error| {
+            try testing.expectEqual(
+                @as(anyerror, eager.err),
+                @as(anyerror, actual_error),
+            );
+            try testing.expectEqual(eager.byte_offset, document.grammar.failure_offset);
+            if (reader.next()) |_| {
+                return error.ExpectedXmlDiagnostic;
+            } else |retry_error| {
+                try testing.expectEqual(
+                    @as(anyerror, eager.err),
+                    @as(anyerror, retry_error),
+                );
+            }
+            try testing.expectEqual(eager.byte_offset, document.grammar.failure_offset);
+            return;
+        }
+    }
+    return error.ExpectedXmlDiagnostic;
+}
+
 fn makeNestedXml(allocator: std.mem.Allocator, depth: usize) ![]u8 {
     var input: std.ArrayList(u8) = .empty;
     errdefer input.deinit(allocator);
@@ -2128,6 +3217,29 @@ test "XmlDocument checks tape and source bounds and diagnostics borrow source" {
     document.tape[0].kind = saved_kind;
 }
 
+test "XmlDocument rejects forged spans and kinds during navigation" {
+    const empty_input = "<a/>";
+    var empty = try buildXmlTape(testing.allocator, empty_input);
+    defer empty.deinit(testing.allocator);
+
+    empty.tape[0].payload = 0;
+    try testing.expectError(error.InvalidTapeOrder, empty.sourceSpan(empty_input, 0));
+    try testing.expectError(error.InvalidTapeOrder, empty.root(empty_input));
+    empty.tape[0].payload = empty_input.len;
+
+    var empty_cursor = try empty.root(empty_input);
+    empty.tape[0].payload = 0;
+    try testing.expectError(error.InvalidTapeOrder, empty_cursor.peek());
+
+    const nested_input = "<a><b/></a>";
+    var nested = try buildXmlTape(testing.allocator, nested_input);
+    defer nested.deinit(testing.allocator);
+    var nested_cursor = try nested.root(nested_input);
+    _ = try nested_cursor.advance();
+    nested.tape[1].kind = @intFromEnum(XmlTapeKind.element_end);
+    try testing.expectError(error.InvalidTapeOrder, nested_cursor.skipChild());
+}
+
 fn checkXmlIndexAllocationFailure(allocator: std.mem.Allocator) !void {
     const input = "<root a=\"b\"><child/></root>";
     var index = try indexXml(allocator, input);
@@ -2169,6 +3281,591 @@ test "XML stream operations propagate allocation failure without leaks" {
         checkXmlStreamAllocationFailure,
         .{},
     );
+}
+
+const XmlFaultingReader = struct {
+    reader: std.Io.Reader,
+    input: []const u8,
+    offset: usize = 0,
+    fail_at: usize,
+
+    const vtable: std.Io.Reader.VTable = .{
+        .stream = stream,
+    };
+
+    fn init(input: []const u8, fail_at: usize, buffer: []u8) XmlFaultingReader {
+        return .{
+            .reader = .{
+                .vtable = &vtable,
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+            .input = input,
+            .fail_at = fail_at,
+        };
+    }
+
+    fn stream(
+        reader: *std.Io.Reader,
+        writer: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
+        const self: *@This() = @alignCast(@fieldParentPtr("reader", reader));
+        if (self.offset >= self.fail_at) return error.ReadFailed;
+
+        const available = self.fail_at - self.offset;
+        const count = @min(available, @intFromEnum(limit));
+        if (count == 0) return 0;
+        try writer.writeAll(self.input[self.offset..][0..count]);
+        self.offset += count;
+        return count;
+    }
+};
+
+test "XML resident reader yields native zero-copy events" {
+    const input =
+        "<root a='v'>text<!--comment--><![CDATA[data]]><?work yes?></root>";
+    var parser = try Parser.init(testing.allocator, input.len);
+    defer parser.deinit();
+    var document = try initOnDemandDocument(&parser, input);
+    defer document.deinit();
+    var reader = try document.eventReader();
+
+    const root = (try reader.next()).?;
+    try testing.expectEqualStrings("<root a='v'>", root.raw());
+    try testing.expect(root.raw().ptr == input.ptr);
+    switch (root) {
+        .element_start => |element| {
+            try testing.expectEqualStrings("root", element.name);
+            try testing.expect(!element.self_closing);
+        },
+        else => return error.UnexpectedXmlEvent,
+    }
+
+    switch ((try reader.next()).?) {
+        .attribute => |attribute| {
+            try testing.expectEqualStrings("a='v'", attribute.raw);
+            try testing.expectEqualStrings("a", attribute.name);
+            try testing.expectEqualStrings("v", attribute.value);
+            try testing.expect(attribute.raw.ptr == input.ptr + 6);
+        },
+        else => return error.UnexpectedXmlEvent,
+    }
+    switch ((try reader.next()).?) {
+        .text => |text| try testing.expectEqualStrings("text", text.raw),
+        else => return error.UnexpectedXmlEvent,
+    }
+    switch ((try reader.next()).?) {
+        .comment => |comment| {
+            try testing.expectEqualStrings("<!--comment-->", comment.raw);
+            try testing.expectEqualStrings("comment", comment.content);
+        },
+        else => return error.UnexpectedXmlEvent,
+    }
+    switch ((try reader.next()).?) {
+        .cdata => |cdata| {
+            try testing.expectEqualStrings("<![CDATA[data]]>", cdata.raw);
+            try testing.expectEqualStrings("data", cdata.content);
+        },
+        else => return error.UnexpectedXmlEvent,
+    }
+    switch ((try reader.next()).?) {
+        .processing_instruction => |instruction| {
+            try testing.expectEqualStrings("work", instruction.target);
+            try testing.expectEqualStrings("yes", instruction.data);
+        },
+        else => return error.UnexpectedXmlEvent,
+    }
+    switch ((try reader.next()).?) {
+        .element_end => |element| try testing.expectEqualStrings("root", element.name),
+        else => return error.UnexpectedXmlEvent,
+    }
+    try testing.expectEqual(@as(?XmlEvent, null), try reader.next());
+}
+
+test "XML resident source validation matches eager in every grammar region" {
+    const Case = struct {
+        input: []const u8,
+        expected_error: XmlError,
+        expected_offset: usize,
+    };
+    const cases = [_]Case{
+        .{ .input = "<a>\x00</a>", .expected_error = error.InvalidCharacter, .expected_offset = 3 },
+        .{ .input = "<a x='\x00'/>", .expected_error = error.InvalidCharacter, .expected_offset = 6 },
+        .{ .input = "<a\x00/>", .expected_error = error.InvalidCharacter, .expected_offset = 2 },
+        .{ .input = "<a><!--\x00--></a>", .expected_error = error.InvalidCharacter, .expected_offset = 7 },
+        .{ .input = "<a><![CDATA[\x00]]></a>", .expected_error = error.InvalidCharacter, .expected_offset = 12 },
+        .{ .input = "<a><?work \x00?></a>", .expected_error = error.InvalidCharacter, .expected_offset = 10 },
+        .{ .input = "<a>\x01</a>", .expected_error = error.InvalidCharacter, .expected_offset = 3 },
+        .{ .input = "<a x='\x01'/>", .expected_error = error.InvalidCharacter, .expected_offset = 6 },
+        .{ .input = "<a\x01/>", .expected_error = error.InvalidCharacter, .expected_offset = 2 },
+        .{ .input = "<a><!--\x01--></a>", .expected_error = error.InvalidCharacter, .expected_offset = 7 },
+        .{ .input = "<a><![CDATA[\x01]]></a>", .expected_error = error.InvalidCharacter, .expected_offset = 12 },
+        .{ .input = "<a><?work \x01?></a>", .expected_error = error.InvalidCharacter, .expected_offset = 10 },
+        .{ .input = "<a>\xEF\xBF\xBF</a>", .expected_error = error.InvalidCharacter, .expected_offset = 3 },
+        .{ .input = "<a x='\xEF\xBF\xBF'/>", .expected_error = error.InvalidCharacter, .expected_offset = 6 },
+        .{ .input = "<a\xEF\xBF\xBF/>", .expected_error = error.InvalidCharacter, .expected_offset = 2 },
+        .{ .input = "<a><!--\xEF\xBF\xBF--></a>", .expected_error = error.InvalidCharacter, .expected_offset = 7 },
+        .{ .input = "<a><![CDATA[\xEF\xBF\xBF]]></a>", .expected_error = error.InvalidCharacter, .expected_offset = 12 },
+        .{ .input = "<a><?work \xEF\xBF\xBF?></a>", .expected_error = error.InvalidCharacter, .expected_offset = 10 },
+        .{ .input = "<a>\xFF</a>", .expected_error = error.InvalidUtf8, .expected_offset = 3 },
+        .{ .input = "<a x='\xFF'/>", .expected_error = error.InvalidUtf8, .expected_offset = 6 },
+        .{ .input = "<a\xFF/>", .expected_error = error.InvalidUtf8, .expected_offset = 2 },
+        .{ .input = "<a><!--\xFF--></a>", .expected_error = error.InvalidUtf8, .expected_offset = 7 },
+        .{ .input = "<a><![CDATA[\xFF]]></a>", .expected_error = error.InvalidUtf8, .expected_offset = 12 },
+        .{ .input = "<a><?work \xFF?></a>", .expected_error = error.InvalidUtf8, .expected_offset = 10 },
+    };
+
+    for (cases) |case| {
+        try expectXmlResidentDiagnostic(
+            case.expected_error,
+            case.expected_offset,
+            case.input,
+        );
+    }
+}
+
+test "XML resident source arbitration preserves earlier eager grammar errors" {
+    const input = "<a>\xFF";
+    try expectXmlResidentDiagnostic(error.UnclosedElement, 0, input);
+}
+
+test "XML resident closes the declaration window after a construct" {
+    const cases = [_]struct { input: []const u8, offset: usize }{
+        .{ .input = "\xEF\xBB\xBF<a/><?xml version='1.0'?>", .offset = 7 },
+        .{ .input = "\xEF\xBB\xBF<!--x--><?xml version='1.0'?><a/>", .offset = 11 },
+        .{ .input = "\xEF\xBB\xBF \t<?xml version='1.0'?><a/>", .offset = 5 },
+    };
+    for (cases) |case| {
+        try expectXmlResidentDiagnostic(error.InvalidDeclaration, case.offset, case.input);
+    }
+}
+/// Fused entity decode + normalization pass.
+/// Decodes each &...; exactly once, returning the codepoint.
+/// Also handles the \r\n context for the caller (whitespace normalization).
+///
+/// Returns the codepoint and the next index past the entity.
+/// The caller is responsible for \r\n mapping; we just return the codepoint
+// and let the caller decide based on in_attribute context.
+pub fn decodeEntityAndNormalize(
+    input: []const u8,
+    start: usize,
+    end: usize,
+    in_attribute: bool,
+) !{ .codepoint = u21, .next = usize, .should_map_cr = bool } {
+    if (start >= end or input[start] != '&') return error.InvalidEntity;
+    
+    // Single pass: find ';'
+    var cursor = start + 1;
+    while (cursor < end and input[cursor] != ';') : (cursor += 1) {}
+    if (cursor >= end or cursor == start + 1) return error.InvalidEntity;
+    
+    const body = input[start + 1 .. cursor];
+    
+    // Check predefined entities (single eql chain)
+    var codepoint: u21 = undefined;
+    var decoded = parsePredefinedEntity(body);
+    if (decoded) |cp| {
+        codepoint = cp;
+    } else if (body.len >= 2 and body[0] == '#') {
+        // Numeric entity: parse digits
+        var digit_start: usize = start + 2;
+        var base: u32 = 10;
+        if (digit_start < cursor and input[digit_start] == 'x') {
+            base = 16;
+            digit_start += 1;
+        }
+        if (digit_start == cursor) return error.InvalidEntity;
+        var codep: u32 = 0;
+        while (digit_start < cursor) : (digit_start += 1) {
+            const digit = xmlDigit(input[digit_start], base) orelse return error.InvalidEntity;
+            if (codep > (std.math.maxInt(u32) - digit) / base) return error.InvalidEntity;
+            codep = codep * base + digit;
+        }
+        if (codep > std.math.maxInt(u21) or !isXmlCharacter(@intCast(codep))) return error.InvalidEntity;
+        codepoint = @intCast(codep);
+    } else {
+        return error.InvalidEntity;
+    }
+    
+    // Determine if we should map \r based on entity position
+    // The caller will handle \r\n mapping; we just return the codepoint
+    // and let the caller decide based on in_attribute context
+    return .{ .codepoint = codepoint, .next = cursor + 1, .should_map_cr = false };
+}
+
+fn parseXmlEntity(
+test "XML resident grammar stays lazy and preserves first-error policy" {
+    const malformed_suffix = "<root><child/></root><1/>";
+    var parser = try Parser.init(testing.allocator, 0);
+    defer parser.deinit();
+    var document = try initOnDemandDocument(&parser, malformed_suffix);
+    defer document.deinit();
+    var reader = try document.eventReader();
+
+    try testing.expect((try reader.next()) != null);
+    try testing.expect((try reader.next()) != null);
+    try testing.expect((try reader.next()) != null);
+    try testing.expectError(error.InvalidName, reader.next());
+}
+
+test "XML resident grammar reports matching root attribute and entity errors" {
+    var parser = try Parser.init(testing.allocator, 0);
+    defer parser.deinit();
+
+    var mismatch = try initOnDemandDocument(&parser, "<a><b></a>");
+    var mismatch_reader = try mismatch.eventReader();
+    try testing.expect((try mismatch_reader.next()) != null);
+    try testing.expect((try mismatch_reader.next()) != null);
+    try testing.expectError(error.MismatchedTag, mismatch_reader.next());
+    mismatch.deinit();
+
+    var duplicate = try initOnDemandDocument(&parser, "<a x='1' x='2'/>");
+    var duplicate_reader = try duplicate.eventReader();
+    try testing.expectError(error.DuplicateAttribute, duplicate_reader.next());
+    duplicate.deinit();
+
+    var entity = try initOnDemandDocument(&parser, "<a>&bad;</a>");
+    var entity_reader = try entity.eventReader();
+    try testing.expect((try entity_reader.next()) != null);
+    try testing.expectError(error.InvalidEntity, entity_reader.next());
+    entity.deinit();
+
+    var roots = try initOnDemandDocument(&parser, "<a/><b/>");
+    var roots_reader = try roots.eventReader();
+/// Fused entity decode + normalize into a single pass.
+/// Decodes each &...; exactly once, eliminating the second ;-scan and
+/// second eql chain. Returns the codepoint and next index.
+///
+/// Guarantees: single stream with overflow-checked length accumulation,
+/// reserve 8B length-prefix slot or dual-accumulate with single addCodepoint stream.
+pub fn decodeEntityFused(
+    input: []const u8,
+    start: usize,
+    end: usize,
+    in_attribute: bool,
+) !{ .codepoint = u21, .next = usize } {
+    if (start >= end or input[start] != '&') return error.InvalidEntity;
+    
+    // Single pass: find ';' and decode in one stream
+    var cursor = start + 1;
+    // Phase 1: find ';' (length accumulation)
+    while (cursor < end and input[cursor] != ';') : (cursor += 1) {}
+    if (cursor >= end or cursor == start + 1) return error.InvalidEntity;
+    
+    const body = input[start + 1 .. cursor];
+    
+    // Phase 2: decode entity (predefined-eql + digit accumulate)
+    // Predefined entities (single eql chain)
+    var codepoint: u21 = undefined;
+    if (body.len == 3 and body[0] == 'a' and body[1] == 'm' and body[2] == 'p') {
+        codepoint = '&';
+    } else if (body.len == 2 and body[0] == 'l' and body[1] == 't') {
+        codepoint = '<';
+    } else if (body.len == 2 and body[0] == 'g' and body[1] == 't') {
+        codepoint = '>';
+    } else if (body.len == 4 and body[0] == 'a' and body[1] == 'p' and body[2] == 'o' and body[3] == 's') {
+        codepoint = '\'';
+    } else if (body.len == 4 and body[0] == 'q' and body[1] == 'u' and body[2] == 'o' and body[3] == 't') {
+        codepoint = '"';
+    } else if (body.len >= 2 and body[0] == '#') {
+        // Numeric entity: parse digits
+        var digit_start: usize = 0; // relative to body
+        var base: u32 = 10;
+        // Find digit start within body
+        var abs_digit_start: usize = start + 2;
+        if (abs_digit_start < cursor and input[abs_digit_start] == 'x') {
+            base = 16;
+            abs_digit_start += 1;
+        }
+        if (abs_digit_start >= cursor) return error.InvalidEntity;
+        var codep: u32 = 0;
+        // Single pass digit accumulation with overflow check
+        while (abs_digit_start < cursor) : (abs_digit_start += 1) {
+            const digit = xmlDigit(input[abs_digit_start], base) orelse return error.InvalidEntity;
+            if (codep > (std.math.maxInt(u32) - digit) / base) return error.InvalidEntity;
+            codep = codep * base + digit;
+        }
+        if (codep > std.math.maxInt(u21) or !isXmlCharacter(@intCast(codep))) {
+            return error.InvalidEntity;
+        }
+        codepoint = @intCast(codep);
+    } else {
+        return error.InvalidEntity;
+    }
+    
+    return .{ .codepoint = codepoint, .next = cursor + 1 };
+}
+
+ fn parseXmlEntity(
+/// Fused entity decode + normalize into a single pass.
+/// Decodes each &...; exactly once, eliminating the second ;-scan and
+/// second eql chain. Returns the codepoint and next index.
+///
+/// Guarantees: single stream with overflow-checked length accumulation,
+/// reserve 8B length-prefix slot or dual-accumulate with single addCodepoint stream.
+pub fn decodeEntityFused(
+    input: []const u8,
+    start: usize,
+    end: usize,
+    in_attribute: bool,
+) !{ .codepoint = u21, .next = usize } {
+    if (start >= end or input[start] != '&') return error.InvalidEntity;
+    
+    // Single pass: find ';' and decode in one stream
+    var cursor = start + 1;
+    // Phase 1: find ';' (length accumulation)
+    while (cursor < end and input[cursor] != ';') : (cursor += 1) {}
+    if (cursor >= end or cursor == start + 1) return error.InvalidEntity;
+    
+    const body = input[start + 1 .. cursor];
+    
+    // Phase 2: decode entity (predefined-eql + digit accumulate)
+    // Predefined entities (single eql chain)
+    var codepoint: u21 = undefined;
+    if (body.len == 3 and body[0] == 'a' and body[1] == 'm' and body[2] == 'p') {
+        codepoint = '&';
+    } else if (body.len == 2 and body[0] == 'l' and body[1] == 't') {
+        codepoint = '<';
+    } else if (body.len == 2 and body[0] == 'g' and body[1] == 't') {
+        codepoint = '>';
+    } else if (body.len == 4 and body[0] == 'a' and body[1] == 'p' and body[2] == 'o' and body[3] == 's') {
+        codepoint = '\'';
+    } else if (body.len == 4 and body[0] == 'q' and body[1] == 'u' and body[2] == 'o' and body[3] == 't') {
+        codepoint = '"';
+    } else if (body.len >= 2 and body[0] == '#') {
+        // Numeric entity: parse digits
+        var digit_start: usize = start + 2;
+        var base: u32 = 10;
+        if (digit_start < cursor and input[digit_start] == 'x') {
+            base = 16;
+            digit_start += 1;
+        }
+        if (digit_start == cursor) return error.InvalidEntity;
+        var codep: u32 = 0;
+        // Single pass digit accumulation with overflow check
+        while (digit_start < cursor) : (digit_start += 1) {
+            const digit = xmlDigit(input[digit_start], base) orelse return error.InvalidEntity;
+            if (codep > (std.math.maxInt(u32) - digit) / base) return error.InvalidEntity;
+            codep = codep * base + digit;
+        }
+        if (codep > std.math.maxInt(u21) or !isXmlCharacter(@intCast(codep))) {
+            return error.InvalidEntity;
+        }
+        codepoint = @intCast(codep);
+    } else {
+        return error.InvalidEntity;
+    }
+    
+    return .{ .codepoint = codepoint, .next = cursor + 1 };
+}
+
+ fn xmlDigit(byte: u8, base: u32) ?u32 {
+    roots.deinit();
+}
+
+test "XML resident failures are sticky across copied readers and cursors" {
+    const input = "<a>&bad;</a>";
+
+    {
+        var parser = try Parser.init(testing.allocator, input.len);
+        defer parser.deinit();
+        var document = try initOnDemandDocument(&parser, input);
+        defer document.deinit();
+        var reader = try document.eventReader();
+        _ = try reader.next();
+        var copied_reader = reader;
+
+        try testing.expectError(error.InvalidEntity, reader.next());
+        try testing.expectEqual(@as(usize, 3), document.grammar.position);
+        try testing.expectError(error.InvalidEntity, copied_reader.next());
+        try testing.expectEqual(@as(usize, 3), document.grammar.position);
+    }
+
+    {
+        var parser = try Parser.init(testing.allocator, input.len);
+        defer parser.deinit();
+        var document = try initOnDemandDocument(&parser, input);
+        defer document.deinit();
+        var cursor = try document.tokenCursor();
+        _ = try cursor.advance();
+        var copied_cursor = cursor;
+
+        try testing.expectError(error.InvalidEntity, cursor.advance());
+        try testing.expectEqual(@as(usize, 3), document.grammar.position);
+        try testing.expectError(error.InvalidEntity, copied_cursor.advance());
+        try testing.expectEqual(@as(usize, 3), document.grammar.position);
+    }
+}
+
+test "XML resident event skip consumes the next element subtree" {
+    const input = "<root><child><leaf/></child><tail/></root>";
+    var parser = try Parser.init(testing.allocator, input.len);
+    defer parser.deinit();
+    var document = try initOnDemandDocument(&parser, input);
+    defer document.deinit();
+    var reader = try document.eventReader();
+
+    switch ((try reader.next()).?) {
+        .element_start => {},
+        else => return error.UnexpectedXmlEvent,
+    }
+    try reader.skip();
+    switch ((try reader.next()).?) {
+        .self_closing_element => |event| {
+            try testing.expectEqualStrings("<tail/>", event.raw);
+        },
+        else => return error.UnexpectedXmlEvent,
+    }
+    switch ((try reader.next()).?) {
+        .element_end => |event| {
+            try testing.expectEqualStrings("</root>", event.raw);
+        },
+        else => return error.UnexpectedXmlEvent,
+    }
+    try testing.expectEqual(@as(?XmlEvent, null), try reader.next());
+}
+
+test "XML self-closing skips consume attributes in every navigation API" {
+    const input = "<r><a x='1'/><b/></r>";
+
+    {
+        var document = try buildXmlTape(testing.allocator, input);
+        defer document.deinit(testing.allocator);
+        var cursor = try document.root(input);
+        _ = try cursor.advance();
+        try cursor.skipChild();
+        try testing.expectEqualStrings("<b/>", (try cursor.peek()).?.raw);
+    }
+
+    {
+        var parser = try Parser.init(testing.allocator, input.len);
+        defer parser.deinit();
+        var document = try initOnDemandDocument(&parser, input);
+        defer document.deinit();
+        var reader = try document.eventReader();
+        _ = try reader.next();
+        try reader.skip();
+        try testing.expectEqualStrings("<b/>", (try reader.next()).?.raw());
+    }
+
+    {
+        var parser = try Parser.init(testing.allocator, input.len);
+        defer parser.deinit();
+        var document = try initOnDemandDocument(&parser, input);
+        defer document.deinit();
+        var cursor = try document.tokenCursor();
+        _ = try cursor.advance();
+        try cursor.skipChild();
+        try testing.expectEqualStrings("<b/>", (try cursor.peek()).?.raw);
+    }
+}
+
+test "XML resident cursor peeks and validates subtree skips" {
+    const input = "<root><a x='1'><b/>text</a><c/></root>";
+    var parser = try Parser.init(testing.allocator, input.len);
+    defer parser.deinit();
+    var document = try initOnDemandDocument(&parser, input);
+    defer document.deinit();
+    var cursor = try document.tokenCursor();
+
+    const root = (try cursor.peek()).?;
+    try testing.expectEqual(XmlTapeKind.element_start, root.kind);
+    try testing.expectEqualStrings("<root>", root.raw);
+    try testing.expectEqualStrings(root.raw, (try cursor.advance()).?.raw);
+
+    try testing.expectEqualStrings("<a x='1'>", (try cursor.peek()).?.raw);
+    try cursor.skipChild();
+    try testing.expectEqualStrings("<c/>", (try cursor.peek()).?.raw);
+    try cursor.skipChild();
+    try testing.expectEqual(XmlTapeKind.element_end, (try cursor.advance()).?.kind);
+    try testing.expectEqual(@as(?XmlToken, null), try cursor.peek());
+}
+
+test "XML resident lifecycle rejects active stale copied and oversized use" {
+    const input = "<root/>";
+    var parser = try Parser.init(testing.allocator, input.len);
+    defer parser.deinit();
+
+    var document = try initOnDemandDocument(&parser, input);
+    try testing.expectError(error.DocumentActive, initOnDemandDocument(&parser, input));
+    var reader = try document.eventReader();
+    try testing.expectError(error.FocusAlreadyClaimed, document.tokenCursor());
+    var copied_reader = reader;
+    try testing.expect((try reader.next()) != null);
+    try testing.expectError(error.OutOfOrderIteration, copied_reader.next());
+    document.deinit();
+    try testing.expectError(error.DocumentReleased, reader.next());
+
+    var reused = try initOnDemandDocument(&parser, input);
+    reused.deinit();
+
+    var fixed = try Parser.init(testing.allocator, input.len - 1);
+    defer fixed.deinit();
+    try testing.expectError(error.CapacityExceeded, initOnDemandDocument(&fixed, input));
+}
+
+test "XmlDocument root cursor is source-checked and skips a validated subtree" {
+    const input = "<?before ok?><!--lead--><root><child/></root>";
+    var document = try buildXmlTape(testing.allocator, input);
+    defer document.deinit(testing.allocator);
+
+    var cursor = try document.root(input);
+    try testing.expectEqualStrings("<root>", (try cursor.peek()).?.raw);
+    try cursor.skipChild();
+    try testing.expectEqual(@as(?XmlToken, null), try cursor.peek());
+
+    const wrong = "<?before no?><!--lead--><root><child/></root>";
+    try testing.expectEqual(input.len, wrong.len);
+    try testing.expectError(error.SourceMismatch, document.root(wrong));
+}
+
+test "XML stream reader lifecycle retains no source bytes" {
+    const input = "<root><!--x--><![CDATA[y]]><child a='v'/></root>";
+    var reader = std.Io.Reader.fixed(input);
+    var stream = try initStreamIndexer(testing.allocator, 3);
+    defer stream.deinit();
+    try stream.feedFrom(&reader);
+    try testing.expectError(error.AlreadyFinished, stream.feed("x"));
+    var first = stream.take();
+    defer first.deinit(testing.allocator);
+
+    var expected = try indexXml(testing.allocator, input);
+    defer expected.deinit(testing.allocator);
+    try testing.expectEqualSlices(
+        u32,
+        expected.indexes[0 .. expected.count + 3],
+        first.indexes[0 .. first.count + 3],
+    );
+    try testing.expectEqualSlices(
+        XmlTokenKind,
+        expected.kinds[0..expected.count],
+        first.kinds[0..first.count],
+    );
+
+    stream.reset();
+    try stream.feed("<next/>");
+    try stream.finish();
+    var second = stream.take();
+    defer second.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), second.count);
+}
+
+test "XML stream reader propagates errors after consuming buffered input" {
+    const input = "<root/>";
+    var source_buffer: [2]u8 = undefined;
+    var reader = XmlFaultingReader.init(input, input.len, &source_buffer);
+    var stream = try initStreamIndexer(testing.allocator, 2);
+    defer stream.deinit();
+
+    try testing.expectError(error.ReadFailed, stream.feedFrom(&reader.reader));
+    try testing.expect(!stream.finished);
+    try testing.expectEqual(input.len, stream.input_len);
+    try stream.finish();
+    var actual = stream.take();
+    defer actual.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), actual.count);
 }
 
 test "refAllDecls" {

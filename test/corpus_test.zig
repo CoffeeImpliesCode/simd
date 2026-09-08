@@ -210,6 +210,9 @@ fn validateCatalog(allocator: std.mem.Allocator, spec: CatalogSpec) !usize {
         }
 
         for (profile.cases, 0..) |case, case_index| {
+            errdefer std.debug.print("corpus {s}/{s}/{s}: {s}\n", .{
+                spec.format, profile.id, case.id, case.fixture,
+            });
             try testing.expect(case.id.len > 0);
             for (profile.cases[0..case_index]) |prior_case| {
                 try testing.expect(!std.mem.eql(u8, case.id, prior_case.id));

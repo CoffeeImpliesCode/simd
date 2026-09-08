@@ -1,6 +1,7 @@
 const std = @import("std");
 const simd = @import("../core/simd.zig");
 const stage1 = @import("../core/stage1.zig");
+const resident = @import("../core/resident.zig");
 const assert = std.debug.assert;
 const testing = std.testing;
 
@@ -25,6 +26,25 @@ pub const MarkdownStructuralIndex = struct {
         allocator.free(self.kinds);
         self.* = undefined;
     }
+
+    pub fn sourceSpan(
+        self: *const MarkdownStructuralIndex,
+        token_index: usize,
+        input: []const u8,
+    ) ?[]const u8 {
+        if (token_index >= self.count or
+            token_index >= self.indexes.len or
+            token_index >= self.kinds.len)
+        {
+            return null;
+        }
+        const offset: usize = @intCast(self.indexes[token_index]);
+        if (offset >= input.len) return null;
+        if (!markdownSourceMatchesKind(input[offset], self.kinds[token_index])) return null;
+        const length = markdownMarkerLength(input, offset, self.kinds[token_index]);
+        if (length > input.len - offset) return null;
+        return input[offset .. offset + length];
+    }
 };
 
 const MarkdownIndexSink = struct {
@@ -33,6 +53,43 @@ const MarkdownIndexSink = struct {
 
     fn append(self: *@This(), offset: usize, kind: MarkdownTokenKind) void {
         appendToken(self.indexes, self.kinds, offset, kind);
+    }
+};
+
+const MarkdownTapeSink = struct {
+    tape: []MarkdownTapeWord,
+    count: *usize,
+    input: []const u8,
+    span_too_large: bool = false,
+
+    fn append(self: *@This(), offset: usize, kind: MarkdownTokenKind) void {
+        if (self.span_too_large) return;
+        assert(self.count.* < self.tape.len);
+        const length = markdownMarkerLength(self.input, offset, kind);
+        if (length > std.math.maxInt(u24)) {
+            self.span_too_large = true;
+            return;
+        }
+        self.tape[self.count.*] = .{
+            .kind = @intFromEnum(kind),
+            .payload = @intCast(length),
+            .offset = @intCast(offset),
+        };
+        self.count.* += 1;
+    }
+};
+
+const MarkdownResidentSink = struct {
+    indexes: []u32,
+    kinds: []MarkdownTokenKind,
+    count: *usize,
+
+    fn append(self: *@This(), offset: usize, kind: MarkdownTokenKind) void {
+        assert(self.count.* < self.indexes.len);
+        assert(self.count.* < self.kinds.len);
+        self.indexes[self.count.*] = @intCast(offset);
+        self.kinds[self.count.*] = kind;
+        self.count.* += 1;
     }
 };
 
@@ -67,6 +124,30 @@ const MarkdownValidationSink = struct {
         self.diagnostic = markdownDiagnosticAt(self.input, error.InvalidTokenKind, offset);
     }
 };
+const MarkdownTapeValidationSink = struct {
+    tape: []const MarkdownTapeWord,
+    count: usize = 0,
+    diagnostic: ?MarkdownNavigationError = null,
+
+    fn append(self: *@This(), offset: usize, kind: MarkdownTokenKind) void {
+        if (self.diagnostic != null) return;
+        if (self.count >= self.tape.len) {
+            self.diagnostic = error.InvalidTapeOrder;
+            return;
+        }
+        const word = self.tape[self.count];
+        if (word.offset != offset or word.tapeKind() != kind) {
+            self.diagnostic = error.InvalidTapeOrder;
+            return;
+        }
+        self.count += 1;
+    }
+
+    fn finish(self: *@This()) MarkdownNavigationError!void {
+        if (self.diagnostic) |diagnostic| return diagnostic;
+        if (self.count != self.tape.len) return error.InvalidTapeOrder;
+    }
+};
 
 pub fn indexMarkdown(
     allocator: std.mem.Allocator,
@@ -80,6 +161,7 @@ pub fn indexMarkdownImpl(
     allocator: std.mem.Allocator,
     input: []const u8,
 ) !MarkdownStructuralIndex {
+    if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
     var indexes = try stage1.StructuralIndex.init(allocator, input.len);
     errdefer indexes.deinit(allocator);
     const kinds = try allocator.alloc(MarkdownTokenKind, input.len);
@@ -121,10 +203,12 @@ pub const MarkdownStreamIndexer = struct {
 
     const Self = @This();
     const initial_output_capacity: usize = 1;
+    pub const max_retained_line_length: usize = std.math.maxInt(u32);
 
     const ProcessError = std.mem.Allocator.Error || error{
         CapacityOverflow,
         InputTooLarge,
+        LineTooLong,
     };
 
     pub const InitError = stage1.StructuralIndex.InitError;
@@ -132,11 +216,15 @@ pub const MarkdownStreamIndexer = struct {
         AlreadyFinished,
         CapacityOverflow,
         InputTooLarge,
+
+        LineTooLong,
     };
     pub const FinishError = std.mem.Allocator.Error || error{
         CapacityOverflow,
         InputTooLarge,
+        LineTooLong,
     };
+    pub const FeedFromError = FeedError || FinishError || std.Io.Reader.ShortError;
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -163,7 +251,6 @@ pub const MarkdownStreamIndexer = struct {
         self.line.deinit(self.allocator);
         self.* = undefined;
     }
-
     /// Adds bytes to the current document. Input bytes are never borrowed
     /// after this call returns.
     pub fn feed(self: *Self, data: []const u8) FeedError!void {
@@ -175,7 +262,7 @@ pub const MarkdownStreamIndexer = struct {
             data.len,
         ) catch return error.CapacityOverflow;
         if (new_input_len > std.math.maxInt(u32)) return error.InputTooLarge;
-        const line_capacity = self.maxLineLengthForFeed(data);
+        const line_capacity = try self.maxLineLengthForFeed(data);
         const pending_output_additional = std.math.add(
             usize,
             self.line.items.len,
@@ -207,6 +294,23 @@ pub const MarkdownStreamIndexer = struct {
                 self.line.appendAssumeCapacity(character);
             }
             data_offset += 1;
+        }
+    }
+
+    /// Drains a caller-owned reader and finishes at EOF.
+    pub fn feedFrom(self: *Self, reader: *std.Io.Reader) FeedFromError!void {
+        while (true) {
+            const data = reader.buffered();
+            if (data.len > 0) {
+                try self.feed(data);
+                reader.toss(data.len);
+                continue;
+            }
+
+            reader.fill(1) catch |err| switch (err) {
+                error.EndOfStream => return self.finish(),
+                error.ReadFailed => return error.ReadFailed,
+            };
         }
     }
 
@@ -267,7 +371,7 @@ pub const MarkdownStreamIndexer = struct {
         self.finished = false;
     }
 
-    fn maxLineLengthForFeed(self: *const Self, data: []const u8) usize {
+    fn maxLineLengthForFeed(self: *const Self, data: []const u8) ProcessError!usize {
         var current_length = self.line.items.len;
         var maximum_length = current_length;
         var pending_carriage_return = self.pending_carriage_return;
@@ -288,6 +392,7 @@ pub const MarkdownStreamIndexer = struct {
             } else if (character == '\n') {
                 current_length = 0;
             } else {
+                if (current_length >= max_retained_line_length) return error.LineTooLong;
                 current_length += 1;
                 maximum_length = @max(maximum_length, current_length);
             }
@@ -351,191 +456,359 @@ pub const MarkdownStreamIndexer = struct {
     }
 
     fn processLineContents(self: *Self, line: []const u8) void {
-        var content_start: usize = 0;
-        while (content_start < line.len and line[content_start] == ' ') {
-            content_start += 1;
-        }
-        const indentation = content_start;
-
-        if (self.in_code_fence) {
-            if (indentation <= 3 and content_start < line.len and
-                line[content_start] == self.fence_character)
-            {
-                const run_length = scalarRunLength(
-                    line,
-                    content_start,
-                    line.len,
-                    self.fence_character,
-                );
-                if (run_length >= self.fence_length and scalarOnlyWhitespace(
-                    line,
-                    content_start + run_length,
-                    line.len,
-                )) {
-                    self.appendStreamToken(
-                        self.line_start_offset + content_start,
-                        .code_fence,
-                    );
-                    self.in_code_fence = false;
-                    self.fence_character = 0;
-                    self.fence_length = 0;
-                }
-            }
-            return;
-        }
-
-        var is_fence_line = false;
-        if (!self.in_inline_code and indentation <= 3 and content_start < line.len) {
-            const character = line[content_start];
-            if (character == '`' or character == '~') {
-                const run_length = scalarRunLength(
-                    line,
-                    content_start,
-                    line.len,
-                    character,
-                );
-                if (run_length >= 3) {
-                    self.appendStreamToken(
-                        self.line_start_offset + content_start,
-                        .code_fence,
-                    );
-                    self.in_code_fence = true;
-                    self.in_inline_code = false;
-                    self.inline_code_length = 0;
-                    self.fence_character = character;
-                    self.fence_length = run_length;
-                    is_fence_line = true;
-                }
-            }
-        }
-
-        if (is_fence_line) return;
-        if (!self.in_inline_code and indentation <= 3 and content_start < line.len) {
-            self.processLineMarker(line, content_start);
-        }
-
-        var offset: usize = 0;
-        while (offset < line.len) {
-            const character = line[offset];
-            if (character == '`') {
-                const run_length = scalarRunLength(line, offset, line.len, '`');
-                const run_end = offset + run_length;
-                var run_offset = offset;
-                while (run_offset < run_end) : (run_offset += 1) {
-                    self.appendStreamToken(
-                        self.line_start_offset + run_offset,
-                        .inline_code,
-                    );
-                }
-                if (self.in_inline_code) {
-                    if (run_length == self.inline_code_length) {
-                        self.in_inline_code = false;
-                        self.inline_code_length = 0;
-                    }
-                } else {
-                    self.in_inline_code = true;
-                    self.inline_code_length = run_length;
-                }
-                offset = run_end;
-            } else {
-                if (!self.in_inline_code) {
-                    switch (character) {
-                        '[', '(' => self.appendStreamToken(
-                            self.line_start_offset + offset,
-                            .link_open,
-                        ),
-                        ']', ')' => self.appendStreamToken(
-                            self.line_start_offset + offset,
-                            .link_close,
-                        ),
-                        else => {},
-                    }
-                }
-                offset += 1;
-            }
-        }
-    }
-
-    fn processLineMarker(self: *Self, line: []const u8, content_start: usize) void {
-        const character = line[content_start];
-        if ((character == '-' or character == '*' or character == '_') and
-            scalarIsThematicBreak(line, content_start, line.len, character))
-        {
-            self.appendStreamToken(
-                self.line_start_offset + content_start,
-                .thematic_break,
-            );
-            return;
-        }
-
-        switch (character) {
-            '#' => self.appendStreamToken(
-                self.line_start_offset + content_start,
-                .heading,
-            ),
-            '>' => self.appendStreamToken(
-                self.line_start_offset + content_start,
-                .blockquote,
-            ),
-            '-', '*', '+' => self.appendStreamToken(
-                self.line_start_offset + content_start,
-                .list_item,
-            ),
-            '0'...'9' => {
-                var digit_end = content_start;
-                while (digit_end < line.len and std.ascii.isDigit(line[digit_end])) {
-                    digit_end += 1;
-                }
-                if (digit_end < line.len and line[digit_end] == '.') {
-                    self.appendStreamToken(
-                        self.line_start_offset + content_start,
-                        .list_item,
-                    );
-                }
-            },
-            else => {},
-        }
+        var state = MarkdownScanState{
+            .in_code_fence = self.in_code_fence,
+            .in_inline_code = self.in_inline_code,
+            .inline_code_length = self.inline_code_length,
+            .fence_character = self.fence_character,
+            .fence_length = self.fence_length,
+        };
+        var sink = MarkdownStreamSink{ .stream = self };
+        scanMarkdownLine(
+            simd.default_vector_len,
+            line,
+            0,
+            line.len,
+            &state,
+            &sink,
+        );
+        self.in_code_fence = state.in_code_fence;
+        self.in_inline_code = state.in_inline_code;
+        self.inline_code_length = state.inline_code_length;
+        self.fence_character = state.fence_character;
+        self.fence_length = state.fence_length;
     }
 };
+pub fn initStreamIndexer(
+    allocator: std.mem.Allocator,
+    chunk_len: usize,
+) MarkdownStreamIndexer.InitError!MarkdownStreamIndexer {
+    return MarkdownStreamIndexer.init(allocator, chunk_len);
+}
 
 fn scanMarkdown(comptime VLEN: usize, input: []const u8, sink: anytype) void {
-    const Mask = simd.Mask(VLEN);
     var state = MarkdownScanState{
         .in_code_fence = false,
         .in_inline_code = false,
         .inline_code_length = 0,
-        .inline_code_run_remaining = 0,
         .fence_character = 0,
         .fence_length = 0,
-        .line_marker_pending = true,
-        .indentation = 0,
-        .skip_line = false,
     };
-    var windows = simd.windows(u8, VLEN, input, 0);
-    var chunk_offset: usize = 0;
-    var scan_offset: usize = 0;
+    var line_start: usize = 0;
+    while (line_start < input.len) {
+        line_start = scanMarkdownLineFused(VLEN, input, line_start, &state, sink);
+    }
+}
 
-    while (windows.next()) |vector| : (chunk_offset += VLEN) {
-        const remaining = input.len - chunk_offset;
-        const valid_length = @min(remaining, VLEN);
-        const candidate_mask = markdownCandidateMask(VLEN, vector);
-        const valid_mask = markdownValidMask(VLEN, valid_length);
+fn scanMarkdownLineFused(
+    comptime VLEN: usize,
+    input: []const u8,
+    line_start: usize,
+    state: *MarkdownScanState,
+    sink: anytype,
+) usize {
+    const max_buffered_candidates = 64;
+    var candidate_offsets: [max_buffered_candidates]u32 = undefined;
+    var candidate_count: usize = 0;
+    var line_end = input.len;
+    var chunk_offset = line_start;
+
+    while (chunk_offset + VLEN <= input.len) : (chunk_offset += VLEN) {
+        const vector: simd.Vec(VLEN, u8) = input[chunk_offset..][0..VLEN].*;
+        const newline_mask = simd.matchAny2(VLEN, vector, '\r', '\n');
+        if (newline_mask != 0) {
+            const relative_line_end = @as(usize, @intCast(@ctz(newline_mask)));
+            line_end = chunk_offset + relative_line_end;
+            const valid_candidate_mask = markdownInlineCandidateMask(VLEN, vector) &
+                simd.validMask(VLEN, relative_line_end);
+            if (valid_candidate_mask != 0) {
+                if (candidate_count + VLEN <= max_buffered_candidates) {
+                    candidate_count += simd.extractBitIndexes(
+                        simd.Mask(VLEN),
+                        valid_candidate_mask,
+                        chunk_offset,
+                        candidate_offsets[candidate_count..],
+                    );
+                } else {
+                    candidate_count = max_buffered_candidates + 1;
+                }
+            }
+            break;
+        }
+        const candidate_mask = markdownInlineCandidateMask(VLEN, vector);
+        if (candidate_mask != 0) {
+            if (candidate_count + VLEN <= max_buffered_candidates) {
+                candidate_count += simd.extractBitIndexes(
+                    simd.Mask(VLEN),
+                    candidate_mask,
+                    chunk_offset,
+                    candidate_offsets[candidate_count..],
+                );
+            } else {
+                candidate_count = max_buffered_candidates + 1;
+            }
+        }
+    }
+
+    if (line_end == input.len and chunk_offset < input.len) {
+        var tail_offset = chunk_offset;
+        while (tail_offset < input.len) : (tail_offset += 1) {
+            const c = input[tail_offset];
+            if (c == '\r' or c == '\n') {
+                line_end = tail_offset;
+                break;
+            }
+            if (c == '`' or c == '[' or c == ']' or c == '(' or c == ')') {
+                if (candidate_count < max_buffered_candidates) {
+                    candidate_offsets[candidate_count] = @intCast(tail_offset);
+                    candidate_count += 1;
+                } else {
+                    candidate_count = max_buffered_candidates + 1;
+                }
+            }
+        }
+    }
+
+    scanMarkdownLineContent(
+        VLEN,
+        input,
+        line_start,
+        line_end,
+        candidate_offsets[0..@min(candidate_count, max_buffered_candidates)],
+        candidate_count <= max_buffered_candidates,
+        state,
+        sink,
+    );
+
+    if (line_end == input.len) return input.len;
+    if (input[line_end] == '\r' and line_end + 1 < input.len and input[line_end + 1] == '\n') {
+        return line_end + 2;
+    }
+    return line_end + 1;
+}
+
+fn findMarkdownLineEnd(
+    comptime VLEN: usize,
+    input: []const u8,
+    start: usize,
+) usize {
+    var chunk_offset = start;
+    while (chunk_offset + VLEN <= input.len) : (chunk_offset += VLEN) {
+        const vector: simd.Vec(VLEN, u8) = input[chunk_offset..][0..VLEN].*;
+        const newline_mask = simd.matchAny2(VLEN, vector, '\r', '\n');
+        if (newline_mask != 0) {
+            return chunk_offset + @as(usize, @intCast(@ctz(newline_mask)));
+        }
+    }
+    while (chunk_offset < input.len) : (chunk_offset += 1) {
+        const c = input[chunk_offset];
+        if (c == '\r' or c == '\n') return chunk_offset;
+    }
+    return input.len;
+}
+fn scanMarkdownLine(
+    comptime VLEN: usize,
+    input: []const u8,
+    line_start: usize,
+    line_end: usize,
+    state: *MarkdownScanState,
+    sink: anytype,
+) void {
+    scanMarkdownLineContent(VLEN, input, line_start, line_end, null, false, state, sink);
+}
+
+fn scanMarkdownLineContent(
+    comptime VLEN: usize,
+    input: []const u8,
+    line_start: usize,
+    line_end: usize,
+    buffered_candidates: ?[]const u32,
+    use_buffered: bool,
+    state: *MarkdownScanState,
+    sink: anytype,
+) void {
+    assert(line_start <= line_end);
+    assert(line_end <= input.len);
+
+    var content_start = line_start;
+    while (content_start < line_end and input[content_start] == ' ') {
+        content_start += 1;
+    }
+    const indentation = content_start - line_start;
+
+    if (state.in_code_fence) {
+        if (indentation <= 3 and content_start < line_end and
+            input[content_start] == state.fence_character)
+        {
+            const run_length = scalarRunLength(
+                input,
+                content_start,
+                line_end,
+                state.fence_character,
+            );
+            if (run_length >= state.fence_length and scalarOnlyWhitespace(
+                input,
+                content_start + run_length,
+                line_end,
+            )) {
+                sink.append(content_start, .code_fence);
+                state.in_code_fence = false;
+                state.fence_character = 0;
+                state.fence_length = 0;
+            }
+        }
+        return;
+    }
+
+    var is_fence_line = false;
+    if (!state.in_inline_code and indentation <= 3 and content_start < line_end) {
+        const character = input[content_start];
+        if (character == '`' or character == '~') {
+            const run_length = scalarRunLength(input, content_start, line_end, character);
+            if (run_length >= 3) {
+                is_fence_line = processMarkdownLineMarker(
+                    input,
+                    content_start,
+                    line_end,
+                    state,
+                    sink,
+                );
+            } else {
+                _ = processMarkdownLineMarker(
+                    input,
+                    content_start,
+                    line_end,
+                    state,
+                    sink,
+                );
+            }
+        } else {
+            _ = processMarkdownLineMarker(
+                input,
+                content_start,
+                line_end,
+                state,
+                sink,
+            );
+        }
+    }
+    if (is_fence_line) return;
+
+    if (use_buffered and buffered_candidates != null) {
+        var skipped_until = line_start;
+        for (buffered_candidates.?) |candidate_index| {
+            const offset: usize = @intCast(candidate_index);
+            if (offset < skipped_until) continue;
+            const character = input[offset];
+            if (character == '`') {
+                const run_length = scalarRunLength(input, offset, line_end, '`');
+                const run_end = offset + run_length;
+                var run_offset = offset;
+                while (run_offset < run_end) : (run_offset += 1) {
+                    sink.append(run_offset, .inline_code);
+                }
+                if (state.in_inline_code) {
+                    if (run_length == state.inline_code_length) {
+                        state.in_inline_code = false;
+                        state.inline_code_length = 0;
+                    }
+                } else {
+                    state.in_inline_code = true;
+                    state.inline_code_length = run_length;
+                }
+                skipped_until = run_end;
+                continue;
+            }
+            if (state.in_inline_code) continue;
+
+            switch (character) {
+                '[', '(' => sink.append(offset, .link_open),
+                ']', ')' => sink.append(offset, .link_close),
+                else => {},
+            }
+        }
+        return;
+    }
+
+    var chunk_offset = line_start;
+    var skipped_until = line_start;
+    while (chunk_offset + VLEN <= line_end) : (chunk_offset += VLEN) {
+        const vector: simd.Vec(VLEN, u8) = input[chunk_offset..][0..VLEN].*;
+        const candidate_mask = markdownInlineCandidateMask(VLEN, vector);
+        if (candidate_mask == 0) continue;
         var candidate_indexes: [VLEN]u32 = undefined;
         const candidate_count = simd.extractBitIndexes(
-            Mask,
-            candidate_mask & valid_mask,
+            simd.Mask(VLEN),
+            candidate_mask,
             chunk_offset,
             &candidate_indexes,
         );
 
         for (candidate_indexes[0..candidate_count]) |candidate_index| {
             const offset: usize = @intCast(candidate_index);
-            advanceLinePrefix(input, scan_offset, offset, &state);
-            processMarkdownCandidate(input, offset, &state, sink);
-            scan_offset = offset + 1;
+            if (offset < skipped_until) continue;
+            const character = input[offset];
+            if (character == '`') {
+                const run_length = scalarRunLength(input, offset, line_end, '`');
+                const run_end = offset + run_length;
+                var run_offset = offset;
+                while (run_offset < run_end) : (run_offset += 1) {
+                    sink.append(run_offset, .inline_code);
+                }
+                if (state.in_inline_code) {
+                    if (run_length == state.inline_code_length) {
+                        state.in_inline_code = false;
+                        state.inline_code_length = 0;
+                    }
+                } else {
+                    state.in_inline_code = true;
+                    state.inline_code_length = run_length;
+                }
+                skipped_until = run_end;
+                continue;
+            }
+            if (state.in_inline_code) continue;
+
+            switch (character) {
+                '[', '(' => sink.append(offset, .link_open),
+                ']', ')' => sink.append(offset, .link_close),
+                else => {},
+            }
+        }
+    }
+
+    while (chunk_offset < line_end) : (chunk_offset += 1) {
+        if (chunk_offset < skipped_until) continue;
+        const character = input[chunk_offset];
+        if (character == '`') {
+            const run_length = scalarRunLength(input, chunk_offset, line_end, '`');
+            const run_end = chunk_offset + run_length;
+            var run_offset = chunk_offset;
+            while (run_offset < run_end) : (run_offset += 1) {
+                sink.append(run_offset, .inline_code);
+            }
+            if (state.in_inline_code) {
+                if (run_length == state.inline_code_length) {
+                    state.in_inline_code = false;
+                    state.inline_code_length = 0;
+                }
+            } else {
+                state.in_inline_code = true;
+                state.inline_code_length = run_length;
+            }
+            skipped_until = run_end;
+            continue;
+        }
+        if (state.in_inline_code) continue;
+
+        switch (character) {
+            '[', '(' => sink.append(chunk_offset, .link_open),
+            ']', ')' => sink.append(chunk_offset, .link_close),
+            else => {},
         }
     }
 }
+
 
 pub const MarkdownError = error{
     InvalidIndexCount,
@@ -547,7 +820,7 @@ pub const MarkdownError = error{
 pub const MarkdownValidationError = std.mem.Allocator.Error || error{TapeTooLarge};
 pub const MarkdownBuildError = std.mem.Allocator.Error || MarkdownError || error{TapeTooLarge};
 
-/// A compact validated Markdown token. The offset points at the Stage1 marker.
+/// A compact validated Markdown marker. `payload` stores the marker span length.
 pub const MarkdownTapeWord = packed struct(u64) {
     kind: u8,
     payload: u24,
@@ -556,6 +829,10 @@ pub const MarkdownTapeWord = packed struct(u64) {
     pub fn tapeKind(self: MarkdownTapeWord) MarkdownTokenKind {
         return @enumFromInt(self.kind);
     }
+
+    pub fn sourceLength(self: MarkdownTapeWord) usize {
+        return @intCast(self.payload);
+    }
 };
 
 comptime {
@@ -563,15 +840,190 @@ comptime {
     assert(@sizeOf(MarkdownTapeWord) == 8);
 }
 
-/// An owned Markdown token tape. The source input remains borrowed.
+pub const MarkdownNavigationError = error{
+    PositionOutOfBounds,
+    InvalidTapeKind,
+    InvalidTapeOrder,
+    SourceOutOfBounds,
+    InvalidSource,
+    TapeOutOfBounds,
+};
+
+fn checkedMarkdownTapeKind(word: MarkdownTapeWord) MarkdownNavigationError!MarkdownTokenKind {
+    return switch (word.kind) {
+        @intFromEnum(MarkdownTokenKind.heading) => .heading,
+        @intFromEnum(MarkdownTokenKind.code_fence) => .code_fence,
+        @intFromEnum(MarkdownTokenKind.list_item) => .list_item,
+        @intFromEnum(MarkdownTokenKind.blockquote) => .blockquote,
+        @intFromEnum(MarkdownTokenKind.inline_code) => .inline_code,
+        @intFromEnum(MarkdownTokenKind.link_open) => .link_open,
+        @intFromEnum(MarkdownTokenKind.link_close) => .link_close,
+        @intFromEnum(MarkdownTokenKind.thematic_break) => .thematic_break,
+        else => error.InvalidTapeKind,
+    };
+}
+
+/// An owned Markdown marker tape. The source input remains borrowed.
 pub const MarkdownDocument = struct {
     tape: []MarkdownTapeWord,
+    source: []const u8,
 
     pub fn deinit(self: *MarkdownDocument, allocator: std.mem.Allocator) void {
         allocator.free(self.tape);
         self.* = undefined;
     }
+
+    pub fn root(self: *const MarkdownDocument, input: []const u8) MarkdownNavigationError!MarkdownCursor {
+        if (input.ptr != self.source.ptr or input.len != self.source.len) {
+            return error.InvalidSource;
+        }
+        try validateMarkdownTape(self.tape, input);
+        if (self.tape.len == 0) return error.TapeOutOfBounds;
+        return .{
+            .document = self,
+            .input = input,
+            .position_index = 0,
+        };
+    }
+
+    pub fn word(self: *const MarkdownDocument, tape_index: usize) MarkdownNavigationError!MarkdownTapeWord {
+        if (tape_index >= self.tape.len) return error.TapeOutOfBounds;
+        return self.tape[tape_index];
+    }
+
+    pub fn sourceSpan(
+        self: *const MarkdownDocument,
+        input: []const u8,
+        tape_index: usize,
+    ) MarkdownNavigationError![]const u8 {
+        const cursor = try self.root(input);
+        if (tape_index >= cursor.document.tape.len) return error.TapeOutOfBounds;
+        const word_value = self.tape[tape_index];
+        _ = try checkedMarkdownTapeKind(word_value);
+        const start: usize = @intCast(word_value.offset);
+        const length = word_value.sourceLength();
+        if (start > input.len or length > input.len - start) {
+            return error.SourceOutOfBounds;
+        }
+        return input[start .. start + length];
+    }
 };
+
+pub const MarkdownCursor = struct {
+    document: *const MarkdownDocument,
+    input: []const u8,
+    position_index: usize = 0,
+
+    pub fn peek(self: *const MarkdownCursor) MarkdownNavigationError!MarkdownTapeWord {
+        return self.currentWord();
+    }
+
+    pub fn advance(self: *MarkdownCursor) MarkdownNavigationError!void {
+        _ = try self.currentWord();
+        self.position_index += 1;
+    }
+
+    pub fn position(self: *const MarkdownCursor) usize {
+        return self.position_index;
+    }
+
+    pub fn raw(self: *const MarkdownCursor) MarkdownNavigationError![]const u8 {
+        return self.span();
+    }
+
+    pub fn span(self: *const MarkdownCursor) MarkdownNavigationError![]const u8 {
+        const word_value = try self.currentWord();
+        const start: usize = @intCast(word_value.offset);
+        const length = word_value.sourceLength();
+        if (start > self.input.len or length > self.input.len - start) {
+            return error.SourceOutOfBounds;
+        }
+        return self.input[start .. start + length];
+    }
+
+    pub fn sourceSpan(self: *const MarkdownCursor) MarkdownNavigationError![]const u8 {
+        return self.span();
+    }
+
+    fn currentWord(self: *const MarkdownCursor) MarkdownNavigationError!MarkdownTapeWord {
+        if (self.position_index >= self.document.tape.len) {
+            return error.PositionOutOfBounds;
+        }
+        const word_value = self.document.tape[self.position_index];
+        const kind = try checkedMarkdownTapeKind(word_value);
+        const start: usize = @intCast(word_value.offset);
+        const length = word_value.sourceLength();
+        if (start >= self.input.len or length > self.input.len - start) {
+            return error.SourceOutOfBounds;
+        }
+        if (!markdownSourceMatchesKind(self.input[start], kind)) {
+            return error.InvalidTapeKind;
+        }
+        if (markdownMarkerLength(self.input, start, kind) != length) {
+            return error.InvalidTapeOrder;
+        }
+        if (self.position_index > 0 and
+            word_value.offset <= self.document.tape[self.position_index - 1].offset)
+        {
+            return error.InvalidTapeOrder;
+        }
+        return word_value;
+    }
+};
+
+fn validateMarkdownTape(
+    tape: []const MarkdownTapeWord,
+    input: []const u8,
+) MarkdownNavigationError!void {
+    var previous_offset: usize = 0;
+    for (tape, 0..) |word_value, tape_index| {
+        const kind = try checkedMarkdownTapeKind(word_value);
+        const offset: usize = @intCast(word_value.offset);
+        const length = word_value.sourceLength();
+        if (offset >= input.len or length > input.len - offset) {
+            return error.SourceOutOfBounds;
+        }
+        if (tape_index > 0 and offset <= previous_offset) {
+            return error.InvalidTapeOrder;
+        }
+        if (!markdownSourceMatchesKind(input[offset], kind)) {
+            return error.InvalidTapeKind;
+        }
+        if (markdownMarkerLength(input, offset, kind) != length) {
+            return error.InvalidTapeOrder;
+        }
+        previous_offset = offset;
+    }
+
+    var sink = MarkdownTapeValidationSink{ .tape = tape };
+    scanMarkdown(simd.default_vector_len, input, &sink);
+    try sink.finish();
+}
+
+/// Builds a validated tape directly from the trusted marker scanner.
+pub fn buildMarkdownTape(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+) MarkdownBuildError!MarkdownDocument {
+    if (input.len > std.math.maxInt(u32)) {
+        return error.TapeTooLarge;
+    }
+    const tape = try allocator.alloc(MarkdownTapeWord, input.len);
+    errdefer allocator.free(tape);
+    var count: usize = 0;
+    var sink = MarkdownTapeSink{
+        .tape = tape,
+        .count = &count,
+        .input = input,
+    };
+    scanMarkdown(simd.default_vector_len, input, &sink);
+    if (sink.span_too_large) return error.TapeTooLarge;
+    const owned_tape = try allocator.realloc(tape, count);
+    return .{
+        .tape = owned_tape,
+        .source = input,
+    };
+}
 
 pub const MarkdownDiagnostic = struct {
     err: MarkdownError,
@@ -581,33 +1033,6 @@ pub const MarkdownDiagnostic = struct {
     snippet: []const u8,
     snippet_start: usize,
 };
-
-/// Builds an owned, validated tape while preserving the Stage1 token stream.
-pub fn buildMarkdownTape(
-    allocator: std.mem.Allocator,
-    input: []const u8,
-) MarkdownBuildError!MarkdownDocument {
-    var structural_index = indexMarkdown(allocator, input) catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        return error.TapeTooLarge;
-    };
-    defer structural_index.deinit(allocator);
-
-    if (try validateMarkdownIndex(input, &structural_index)) |diagnostic| {
-        return diagnostic.err;
-    }
-
-    const tape = try allocator.alloc(MarkdownTapeWord, structural_index.count);
-    errdefer allocator.free(tape);
-    for (tape, 0..) |*word, tape_index| {
-        word.* = .{
-            .kind = @intFromEnum(structural_index.kinds[tape_index]),
-            .payload = 0,
-            .offset = structural_index.indexes[tape_index],
-        };
-    }
-    return .{ .tape = tape };
-}
 
 /// Validates the Stage1 stream and returns only its first invariant failure.
 pub fn validateMarkdown(
@@ -719,17 +1144,50 @@ fn markdownSourceMatchesKind(character: u8, kind: MarkdownTokenKind) bool {
     };
 }
 
+fn markdownMarkerLength(
+    input: []const u8,
+    offset: usize,
+    kind: MarkdownTokenKind,
+) usize {
+    if (offset >= input.len) return 0;
+    return switch (kind) {
+        .code_fence => scalarRunLength(input, offset, scalarLineEnd(input, offset), input[offset]),
+        .list_item => if (std.ascii.isDigit(input[offset])) blk: {
+            var end = offset;
+            while (end < input.len and std.ascii.isDigit(input[end])) : (end += 1) {}
+            if (end < input.len and input[end] == '.') {
+                break :blk end - offset + 1;
+            }
+            break :blk 1;
+        } else 1,
+        else => 1,
+    };
+}
+
 const MarkdownScanState = struct {
     in_code_fence: bool,
     in_inline_code: bool,
     inline_code_length: usize,
-    inline_code_run_remaining: usize,
     fence_character: u8,
     fence_length: usize,
-    line_marker_pending: bool,
-    indentation: usize,
-    skip_line: bool,
 };
+
+const MarkdownStreamSink = struct {
+    stream: *MarkdownStreamIndexer,
+
+    fn append(self: *@This(), offset: usize, kind: MarkdownTokenKind) void {
+        self.stream.appendStreamToken(self.stream.line_start_offset + offset, kind);
+    }
+};
+
+fn markdownInlineCandidateMask(
+    comptime VLEN: usize,
+    vector: simd.Vec(VLEN, u8),
+) simd.Mask(VLEN) {
+    const inline_chars = simd.matchAny4(VLEN, vector, '`', '[', ']', '(');
+    const paren_close = simd.matchByte(VLEN, vector, ')');
+    return inline_chars | paren_close;
+}
 
 fn markdownCandidateMask(
     comptime VLEN: usize,
@@ -738,138 +1196,24 @@ fn markdownCandidateMask(
     const line_and_blocks = simd.matchAny4(VLEN, vector, '#', '>', '-', '*');
     const lists_and_inline = simd.matchAny4(VLEN, vector, '+', '`', '[', ']');
     const links_and_fences = simd.matchAny4(VLEN, vector, '(', ')', '~', '\n');
-    const carriage_returns = simd.matchByte(VLEN, vector, '\r');
     const thematic_underscores = simd.matchByte(VLEN, vector, '_');
     const digits = simd.matchRange(VLEN, vector, '0', '9');
-    return line_and_blocks | lists_and_inline | links_and_fences | carriage_returns |
-        thematic_underscores | digits;
+    return line_and_blocks | lists_and_inline | links_and_fences | thematic_underscores | digits;
 }
 
 fn markdownValidMask(comptime VLEN: usize, valid_length: usize) simd.Mask(VLEN) {
-    const Mask = simd.Mask(VLEN);
-    const Shift = std.math.Log2Int(Mask);
-
-    assert(valid_length > 0);
-    assert(valid_length <= VLEN);
-    if (valid_length == VLEN) return ~@as(Mask, 0);
-    return (@as(Mask, 1) << @as(Shift, @intCast(valid_length))) - 1;
+    return simd.validMask(VLEN, valid_length);
 }
 
-fn advanceLinePrefix(
-    input: []const u8,
-    start: usize,
-    end: usize,
-    state: *MarkdownScanState,
-) void {
-    assert(start <= end);
-    assert(end <= input.len);
-    var offset = start;
-    while (offset < end) : (offset += 1) {
-        if (state.line_marker_pending) {
-            if (input[offset] == ' ') {
-                state.indentation += 1;
-                if (state.indentation > 3) state.line_marker_pending = false;
-            } else {
-                state.line_marker_pending = false;
-            }
-        }
-    }
-}
 
-fn processMarkdownCandidate(
+fn processMarkdownLineMarker(
     input: []const u8,
     offset: usize,
-    state: *MarkdownScanState,
-    sink: anytype,
-) void {
-    const character = input[offset];
-    if (character == '\r' or character == '\n') {
-        state.line_marker_pending = true;
-        state.indentation = 0;
-        state.skip_line = false;
-        return;
-    }
-
-    if (state.skip_line) return;
-
-    if (state.in_code_fence) {
-        processFenceCandidate(input, offset, state, sink);
-        return;
-    }
-
-    if (state.inline_code_run_remaining > 0) {
-        sink.append(offset, .inline_code);
-        state.inline_code_run_remaining -= 1;
-        return;
-    }
-    if (state.line_marker_pending and !state.in_inline_code) {
-        if (processLineMarker(input, offset, state, sink)) return;
-    }
-
-    state.line_marker_pending = false;
-    if (character == '`') {
-        const run_length = scalarRunLength(input, offset, input.len, '`');
-        sink.append(offset, .inline_code);
-        state.inline_code_run_remaining = run_length - 1;
-        if (state.in_inline_code) {
-            if (run_length == state.inline_code_length) {
-                state.in_inline_code = false;
-                state.inline_code_length = 0;
-            }
-        } else {
-            state.in_inline_code = true;
-            state.inline_code_length = run_length;
-        }
-        return;
-    }
-    if (state.in_inline_code) return;
-
-    switch (character) {
-        '[', '(' => sink.append(offset, .link_open),
-        ']', ')' => sink.append(offset, .link_close),
-        else => {},
-    }
-}
-
-fn processFenceCandidate(
-    input: []const u8,
-    offset: usize,
-    state: *MarkdownScanState,
-    sink: anytype,
-) void {
-    if (!state.line_marker_pending) return;
-    if (input[offset] != state.fence_character) {
-        state.line_marker_pending = false;
-        return;
-    }
-
-    const line_end = scalarLineEnd(input, offset);
-    const run_length = scalarRunLength(input, offset, line_end, state.fence_character);
-    if (run_length < state.fence_length) {
-        state.line_marker_pending = false;
-        return;
-    }
-    if (!scalarOnlyWhitespace(input, offset + run_length, line_end)) {
-        state.line_marker_pending = false;
-        return;
-    }
-
-    sink.append(offset, .code_fence);
-    state.in_code_fence = false;
-    state.fence_character = 0;
-    state.fence_length = 0;
-    state.line_marker_pending = false;
-    state.skip_line = true;
-}
-
-fn processLineMarker(
-    input: []const u8,
-    offset: usize,
+    line_end: usize,
     state: *MarkdownScanState,
     sink: anytype,
 ) bool {
     const character = input[offset];
-    const line_end = scalarLineEnd(input, offset);
     if (character == '`' or character == '~') {
         const run_length = scalarRunLength(input, offset, line_end, character);
         if (run_length >= 3) {
@@ -877,11 +1221,8 @@ fn processLineMarker(
             state.in_code_fence = true;
             state.in_inline_code = false;
             state.inline_code_length = 0;
-            state.inline_code_run_remaining = 0;
             state.fence_character = character;
             state.fence_length = run_length;
-            state.line_marker_pending = false;
-            state.skip_line = true;
             return true;
         }
     }
@@ -890,8 +1231,7 @@ fn processLineMarker(
         scalarIsThematicBreak(input, offset, line_end, character))
     {
         sink.append(offset, .thematic_break);
-        state.line_marker_pending = false;
-        return true;
+        return false;
     }
 
     switch (character) {
@@ -905,16 +1245,221 @@ fn processLineMarker(
             }
             if (digit_end < line_end and input[digit_end] == '.') {
                 sink.append(offset, .list_item);
-            } else {
-                state.line_marker_pending = false;
-                return false;
             }
         },
         else => return false,
     }
-    state.line_marker_pending = false;
-    return true;
+    return false;
 }
+
+pub const MarkdownOnDemandError = std.mem.Allocator.Error || resident.Error || error{
+    CapacityOverflow,
+    CapacityExceeded,
+    InputTooLarge,
+    InvalidTapeKind,
+    InvalidTapeOrder,
+    PositionOutOfBounds,
+    SourceOutOfBounds,
+};
+
+pub const Parser = struct {
+    allocator: std.mem.Allocator,
+    candidates: resident.IndexBuffer(MarkdownTokenKind, false),
+    resident_state: resident.State = .{},
+    max_capacity: usize,
+    grow_on_demand: bool,
+
+    pub const InitError = std.mem.Allocator.Error || error{
+        CapacityOverflow,
+        InputTooLarge,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, max_capacity: usize) InitError!Parser {
+        if (max_capacity > std.math.maxInt(u32)) return error.InputTooLarge;
+        var candidates = resident.IndexBuffer(MarkdownTokenKind, false).init(allocator);
+        errdefer candidates.deinit();
+        if (max_capacity != 0) try candidates.reserve(max_capacity);
+        return .{
+            .allocator = allocator,
+            .candidates = candidates,
+            .max_capacity = max_capacity,
+            .grow_on_demand = max_capacity == 0,
+        };
+    }
+
+    pub fn deinit(self: *Parser) void {
+        self.resident_state.deinit();
+        self.candidates.deinit();
+        self.* = undefined;
+    }
+    fn prepare(self: *Parser, input: []const u8) MarkdownOnDemandError!void {
+        if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
+        if (!self.grow_on_demand and input.len > self.max_capacity) {
+            return error.CapacityExceeded;
+        }
+        self.candidates.count = 0;
+        try self.candidates.reserve(input.len);
+    }
+
+    pub fn initOnDemandDocument(
+        self: *Parser,
+        input: []const u8,
+    ) MarkdownOnDemandError!OnDemandDocument {
+        const lease = try self.resident_state.begin();
+        errdefer lease.release();
+        try self.prepare(input);
+
+        var count: usize = 0;
+        var sink = MarkdownResidentSink{
+            .indexes = self.candidates.indexes,
+            .kinds = self.candidates.kinds,
+            .count = &count,
+        };
+        scanMarkdown(simd.default_vector_len, input, &sink);
+        try self.candidates.finish(count, input.len);
+        return .{
+            .parser = self,
+            .input = input,
+            .lease = lease,
+            .count = count,
+        };
+    }
+};
+
+pub const Event = struct {
+    kind: MarkdownTokenKind,
+    offset: u32,
+    raw: []const u8,
+};
+
+pub const Token = Event;
+
+pub const OnDemandDocument = struct {
+    parser: *Parser,
+    input: []const u8,
+    lease: resident.Lease,
+    count: usize,
+
+    pub fn deinit(self: *OnDemandDocument) void {
+        self.lease.release();
+        self.* = undefined;
+    }
+    pub fn eventReader(self: *OnDemandDocument) MarkdownOnDemandError!EventReader {
+        return .{
+            .parser = self.parser,
+            .input = self.input,
+            .count = self.count,
+            .guard = try self.lease.claim(),
+        };
+    }
+
+    pub fn tokenCursor(self: *OnDemandDocument) MarkdownOnDemandError!TokenCursor {
+        return .{
+            .parser = self.parser,
+            .input = self.input,
+            .count = self.count,
+            .guard = try self.lease.claim(),
+        };
+    }
+};
+
+pub const MarkdownOnDemandDocument = OnDemandDocument;
+
+pub fn initOnDemandDocument(
+    parser: *Parser,
+    input: []const u8,
+) MarkdownOnDemandError!OnDemandDocument {
+    return parser.initOnDemandDocument(input);
+}
+
+const MarkdownReaderBase = struct {
+    parser: *Parser,
+    input: []const u8,
+    count: usize,
+    guard: resident.Guard,
+
+    fn event(self: *const @This()) MarkdownOnDemandError!?Event {
+        try self.guard.check();
+        const position = self.guard.expected_position;
+        if (position >= self.count) return null;
+        const offset = self.parser.candidates.indexes[position];
+        const kind = self.parser.candidates.kinds[position];
+        const source_offset: usize = @intCast(offset);
+        if (source_offset >= self.input.len) return error.SourceOutOfBounds;
+        const length = markdownMarkerLength(self.input, source_offset, kind);
+        if (length > self.input.len - source_offset) {
+            return error.SourceOutOfBounds;
+        }
+        return .{
+            .kind = kind,
+            .offset = offset,
+            .raw = self.input[source_offset .. source_offset + length],
+        };
+    }
+};
+
+pub const EventReader = struct {
+    parser: *Parser,
+    input: []const u8,
+    count: usize,
+    guard: resident.Guard,
+
+    pub fn peek(self: *const EventReader) MarkdownOnDemandError!?Event {
+        var base = MarkdownReaderBase{
+            .parser = self.parser,
+            .input = self.input,
+            .count = self.count,
+            .guard = self.guard,
+        };
+        return base.event();
+    }
+
+    pub fn next(self: *EventReader) MarkdownOnDemandError!?Event {
+        const event = try self.peek() orelse return null;
+        try self.guard.advance();
+        return event;
+    }
+
+    pub fn skip(self: *EventReader) MarkdownOnDemandError!void {
+        _ = try self.next();
+    }
+
+    pub fn position(self: *const EventReader) usize {
+        return self.guard.expected_position;
+    }
+};
+
+pub const TokenCursor = struct {
+    parser: *Parser,
+    input: []const u8,
+    count: usize,
+    guard: resident.Guard,
+
+    pub fn peek(self: *const TokenCursor) MarkdownOnDemandError!?Token {
+        var base = MarkdownReaderBase{
+            .parser = self.parser,
+            .input = self.input,
+            .count = self.count,
+            .guard = self.guard,
+        };
+        return base.event();
+    }
+
+    pub fn advance(self: *TokenCursor) MarkdownOnDemandError!?Token {
+        const token = try self.peek() orelse return null;
+        try self.guard.advance();
+        return token;
+    }
+
+    /// Markdown is a sequential marker stream, not a CommonMark tree.
+    pub fn skipChild(self: *TokenCursor) MarkdownOnDemandError!void {
+        _ = try self.advance();
+    }
+
+    pub fn position(self: *const TokenCursor) usize {
+        return self.guard.expected_position;
+    }
+};
 
 fn scalarIndexMarkdown(
     allocator: std.mem.Allocator,
@@ -1793,4 +2338,120 @@ test "Markdown Stage2 rejects forged mid-line heading" {
     const diagnostic = (try validateMarkdownIndex(input, &forged)).?;
     try testing.expectEqual(error.InvalidTokenKind, diagnostic.err);
     try testing.expectEqual(@as(usize, 5), diagnostic.byte_offset);
+}
+
+test "Markdown marker source spans preserve fences and ordered markers" {
+    const input =
+        "### heading\r\n12. item\n````lang\nx\n````\n";
+    var index = try indexMarkdown(testing.allocator, input);
+    defer index.deinit(testing.allocator);
+
+    try testing.expectEqualSlices(u32, &.{ 0, 13, 22, 33 }, index.indexes[0..index.count]);
+    try testing.expectEqualStrings("#", index.sourceSpan(0, input).?);
+    try testing.expectEqualStrings("12.", index.sourceSpan(1, input).?);
+    try testing.expectEqualStrings("````", index.sourceSpan(2, input).?);
+    try testing.expectEqualStrings("````", index.sourceSpan(3, input).?);
+}
+
+test "Markdown tape root and cursor validate source bounds and raw spans" {
+    const input = "# heading\n";
+    var document = try buildMarkdownTape(testing.allocator, input);
+    defer document.deinit(testing.allocator);
+
+    var alternate = [_]u8{ '#', ' ', 'h', 'e', 'a', 'd', 'i', 'n', 'g', '\n' };
+    try testing.expectError(error.InvalidSource, document.root(&alternate));
+
+    var cursor = try document.root(input);
+    try testing.expectEqualStrings("#", try cursor.raw());
+    try cursor.advance();
+    try testing.expectError(error.PositionOutOfBounds, cursor.peek());
+
+    document.tape[0].payload = 0;
+    try testing.expectError(error.InvalidTapeOrder, document.root(input));
+    document.tape[0].payload = 1;
+    document.tape[0].kind = @intFromEnum(MarkdownTokenKind.code_fence);
+    try testing.expectError(error.InvalidTapeKind, document.root(input));
+}
+
+test "Markdown resident traversal is lazy focused and generation guarded" {
+    const input = "# heading\n`code` [link]\n";
+    var parser = try Parser.init(testing.allocator, input.len);
+    defer parser.deinit();
+
+    var document = try initOnDemandDocument(&parser, input);
+    var reader = try document.eventReader();
+    try testing.expectError(error.FocusAlreadyClaimed, document.tokenCursor());
+
+    const first = (try reader.peek()).?;
+    try testing.expectEqual(MarkdownTokenKind.heading, first.kind);
+    try testing.expectEqual(@as(u32, 0), first.offset);
+    try testing.expectEqualStrings("#", first.raw);
+    try testing.expectEqual(@as(usize, 0), reader.position());
+
+    var copied_reader = reader;
+    _ = try reader.next();
+    try testing.expectError(error.OutOfOrderIteration, copied_reader.peek());
+
+    document.deinit();
+    try testing.expectError(error.DocumentReleased, reader.peek());
+    try testing.expectError(error.DocumentReleased, reader.next());
+    try testing.expectError(error.DocumentReleased, copied_reader.peek());
+    try testing.expectError(error.DocumentReleased, copied_reader.next());
+}
+
+test "Markdown resident parser reuses fixed capacity and reports active documents" {
+    const first_input = "# one\n";
+    const second_input = "``code``\n";
+    var parser = try Parser.init(testing.allocator, second_input.len);
+    defer parser.deinit();
+    const candidate_pointer = @intFromPtr(parser.candidates.indexes.ptr);
+
+    var first_document = try initOnDemandDocument(&parser, first_input);
+    try testing.expectError(error.DocumentActive, initOnDemandDocument(&parser, second_input));
+    first_document.deinit();
+
+    var second_document = try initOnDemandDocument(&parser, second_input);
+    defer second_document.deinit();
+    try testing.expectEqual(candidate_pointer, @intFromPtr(parser.candidates.indexes.ptr));
+}
+
+test "Markdown stream reader preserves one-shot offsets across CRLF chunks" {
+    const input = "# one\r\n12. two\n```\n# hidden\n```\n";
+    var expected = try indexMarkdown(testing.allocator, input);
+    defer expected.deinit(testing.allocator);
+
+    var reader = std.Io.Reader.fixed(input);
+    var stream = try initStreamIndexer(testing.allocator, 2);
+    defer stream.deinit();
+    try stream.feedFrom(&reader);
+    try testing.expect(stream.finished);
+    var actual = stream.take();
+    defer actual.deinit(testing.allocator);
+
+    try testing.expectEqual(expected.count, actual.count);
+    try testing.expectEqualSlices(
+        u32,
+        expected.indexes[0..expected.count],
+        actual.indexes[0..actual.count],
+    );
+    try testing.expectEqualSlices(
+        MarkdownTokenKind,
+        expected.kinds[0..expected.count],
+        actual.kinds[0..actual.count],
+    );
+}
+
+test "Markdown tape bounds marker spans independently from source size" {
+    const input = try testing.allocator.alloc(u8, @as(usize, std.math.maxInt(u24)) + 1);
+    defer testing.allocator.free(input);
+    @memset(input, ' ');
+    input[0..2].* = .{ '#', '\n' };
+    {
+        var document = try buildMarkdownTape(testing.allocator, input);
+        defer document.deinit(testing.allocator);
+        const cursor = try document.root(input);
+        try testing.expectEqualStrings("#", try cursor.raw());
+    }
+    @memset(input, '`');
+    try testing.expectError(error.TapeTooLarge, buildMarkdownTape(testing.allocator, input));
 }

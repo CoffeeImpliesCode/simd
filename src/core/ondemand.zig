@@ -1,6 +1,6 @@
 const std = @import("std");
-const simd = @import("simd.zig");
 const stage1 = @import("stage1.zig");
+const stage2 = @import("stage2.zig");
 
 const testing = std.testing;
 
@@ -12,6 +12,7 @@ pub const Error = std.mem.Allocator.Error || error{
     CapacityExceeded,
     DocumentActive,
     DocumentReleased,
+    DuplicateKey,
     EmptyDocument,
     FocusAlreadyClaimed,
     FocusLost,
@@ -46,9 +47,14 @@ pub const Parser = struct {
     indexes: []u32,
     capacity: usize,
     grow_on_demand: bool,
+    token_reader: stage2.TokenReader,
     generation: u64 = 0,
     document_active: bool = false,
-
+    focus: Focus = .none,
+    event_cached: ?stage2.ParsedToken = null,
+    event_epoch: u64 = 0,
+    position_index: usize = 0,
+    depth: usize = 0,
     pub fn init(allocator: std.mem.Allocator, max_capacity: usize) InitError!Parser {
         if (max_capacity > std.math.maxInt(u32)) return error.InputTooLarge;
         const index_capacity = std.math.add(
@@ -58,11 +64,13 @@ pub const Parser = struct {
         ) catch return error.CapacityOverflow;
 
         const indexes = try allocator.alloc(u32, index_capacity);
+        const empty_view = stage2.IndexView.init(&.{}, &.{}, 0) catch unreachable;
         return .{
             .allocator = allocator,
             .indexes = indexes,
             .capacity = max_capacity,
             .grow_on_demand = max_capacity == 0,
+            .token_reader = stage2.TokenReader.init(&.{}, empty_view, .json) catch unreachable,
         };
     }
 
@@ -107,7 +115,17 @@ pub const Parser = struct {
         input: []const u8,
         token_count: usize,
     ) Error!Document {
-        return self.completeOwnedDocument(input, token_count, .checked);
+        return self.completeOwnedDocument(input, token_count, .checked, .json);
+    }
+
+    /// Completes a JSON-family document using the requested dialect.
+    pub fn completeDialectDocument(
+        self: *Parser,
+        input: []const u8,
+        token_count: usize,
+        dialect: stage2.Dialect,
+    ) Error!Document {
+        return self.completeOwnedDocument(input, token_count, .checked, dialect);
     }
 
     /// Completes indexes emitted by a parser-owned generated indexer.
@@ -118,7 +136,7 @@ pub const Parser = struct {
         input: []const u8,
         token_count: usize,
     ) Error!Document {
-        return self.completeOwnedDocument(input, token_count, .generated);
+        return self.completeOwnedDocument(input, token_count, .generated, .json);
     }
 
     fn completeOwnedDocument(
@@ -126,11 +144,12 @@ pub const Parser = struct {
         input: []const u8,
         token_count: usize,
         mode: CompletionMode,
+        dialect: stage2.Dialect,
     ) Error!Document {
         if (self.document_active) return error.DocumentActive;
         if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
         try self.ensureCapacity(input.len, token_count);
-        return self.finishOwnedDocument(input, token_count, mode);
+        return self.finishOwnedDocument(input, token_count, mode, dialect);
     }
 
     pub fn initDocument(
@@ -157,7 +176,7 @@ pub const Parser = struct {
             self.indexes[0..source_count],
             structural_index.indexes[0..source_count],
         );
-        return self.finishOwnedDocument(input, structural_index.count, .checked);
+        return self.finishOwnedDocument(input, structural_index.count, .checked, .json);
     }
 
     pub fn iterate(
@@ -178,6 +197,7 @@ pub const Parser = struct {
         input: []const u8,
         token_count: usize,
         mode: CompletionMode,
+        dialect: stage2.Dialect,
     ) Error!Document {
         if (token_count > input.len) return error.InvalidStructuralIndex;
         const source_count = std.math.add(
@@ -199,6 +219,14 @@ pub const Parser = struct {
             try validateIndexes(input, self.indexes, token_count);
         }
 
+        const view = try stage2.IndexView.init(input, self.indexes[0..token_count], 0);
+        try self.token_reader.reset(input, view, dialect);
+        self.focus = .none;
+        self.event_cached = null;
+        self.event_epoch = 0;
+        self.position_index = 0;
+        self.depth = 0;
+
         self.generation +%= 1;
         if (self.generation == 0) self.generation = 1;
         self.document_active = true;
@@ -209,6 +237,8 @@ pub const Parser = struct {
             .indexes = self.indexes[0..source_count],
             .token_count = token_count,
             .generation = self.generation,
+            .dialect = dialect,
+            .index_view = view,
         };
     }
 };
@@ -233,13 +263,17 @@ pub const Document = struct {
     indexes: []const u32,
     token_count: usize,
     generation: u64,
-    position_index: usize = 0,
-    depth: usize = 0,
-    focus: Focus = .none,
+    dialect: stage2.Dialect,
+    index_view: stage2.IndexView,
 
     pub fn deinit(self: *Document) void {
         if (self.parser.document_active and self.parser.generation == self.generation) {
             self.parser.document_active = false;
+            self.parser.focus = .none;
+            self.parser.event_cached = null;
+            self.parser.event_epoch = 0;
+            self.parser.position_index = 0;
+            self.parser.depth = 0;
         }
         self.* = undefined;
     }
@@ -248,8 +282,9 @@ pub const Document = struct {
         try self.claimFocus(.cursor);
         return .{
             .document = self,
+            .parser = self.parser,
             .generation = self.generation,
-            .expected_position = self.position_index,
+            .expected_position = self.parser.position_index,
             .owner = .cursor,
         };
     }
@@ -265,8 +300,8 @@ pub const Document = struct {
 
     fn claimFocus(self: *Document, focus: Focus) Error!void {
         try self.ensureAlive();
-        if (self.focus != .none) return error.FocusAlreadyClaimed;
-        self.focus = focus;
+        if (self.parser.focus != .none) return error.FocusAlreadyClaimed;
+        self.parser.focus = focus;
     }
 };
 
@@ -277,10 +312,10 @@ pub const Token = struct {
 
 pub const TokenCursor = struct {
     document: *Document,
+    parser: *Parser,
     generation: u64,
     expected_position: usize,
     owner: Focus,
-
     pub fn peek(self: *const TokenCursor) Error!?Token {
         try self.ensureFocused();
         if (self.expected_position > self.document.token_count) {
@@ -299,7 +334,7 @@ pub const TokenCursor = struct {
         const token = try self.peek() orelse return null;
         try self.applyDepth(token.byte);
         self.expected_position += 1;
-        self.document.position_index = self.expected_position;
+        self.parser.position_index = self.expected_position;
         return token;
     }
 
@@ -327,10 +362,10 @@ pub const TokenCursor = struct {
         try self.ensureFocused();
         if (parent_depth < 0) return error.UnexpectedToken;
         const parent_depth_usize: usize = @intCast(parent_depth);
-        if (self.document.depth <= parent_depth_usize) return;
+        if (self.parser.depth <= parent_depth_usize) return;
 
         var steps: usize = 0;
-        while (self.document.depth > parent_depth_usize) {
+        while (self.parser.depth > parent_depth_usize) {
             if (steps >= self.document.token_count) return error.UnexpectedEnd;
             _ = try self.advance() orelse return error.UnexpectedEnd;
             steps += 1;
@@ -338,10 +373,10 @@ pub const TokenCursor = struct {
     }
 
     fn ensureFocused(self: *const TokenCursor) Error!void {
-        try self.document.ensureAlive();
-        if (self.document.generation != self.generation) return error.FocusLost;
-        if (self.document.focus != self.owner) return error.FocusLost;
-        if (self.document.position_index != self.expected_position) {
+        if (!self.parser.document_active) return error.DocumentReleased;
+        if (self.parser.generation != self.generation) return error.DocumentReleased;
+        if (self.parser.focus != self.owner) return error.FocusLost;
+        if (self.parser.position_index != self.expected_position) {
             return error.OutOfOrderIteration;
         }
     }
@@ -359,12 +394,12 @@ pub const TokenCursor = struct {
     fn applyDepth(self: *TokenCursor, byte: u8) Error!void {
         switch (byte) {
             '{', '[' => {
-                if (self.document.depth >= max_depth) return error.DepthExceeded;
-                self.document.depth += 1;
+                if (self.parser.depth >= max_depth) return error.DepthExceeded;
+                self.parser.depth += 1;
             },
             '}', ']' => {
-                if (self.document.depth == 0) return error.UnexpectedToken;
-                self.document.depth -= 1;
+                if (self.parser.depth == 0) return error.UnexpectedToken;
+                self.parser.depth -= 1;
             },
             else => {},
         }
@@ -383,64 +418,35 @@ pub const Event = union(enum) {
     null,
 };
 
-const Expect = enum {
-    value_after_open,
-    value_after_comma,
-    key_after_open,
-    key_after_comma,
-    colon,
-    value_after_colon,
-    after_value,
-};
-
-const DepthEntry = struct {
-    is_array: bool,
-    count: usize,
-    open_offset: u32,
-};
-
 pub const EventReader = struct {
-    cursor: TokenCursor,
-    stack: [max_depth]DepthEntry = @splat(.{
-        .is_array = false,
-        .count = 0,
-        .open_offset = 0,
-    }),
-    top: usize = 0,
-    byte_position: usize = 0,
-    expect: Expect = .value_after_open,
-    root_started: bool = false,
-    root_done: bool = false,
-
+    document: *Document,
+    parser: *Parser,
+    generation: u64,
+    expected_epoch: u64,
     pub fn init(document: *Document) Error!EventReader {
         try document.claimFocus(.event_reader);
         return .{
-            .cursor = .{
-                .document = document,
-                .generation = document.generation,
-                .expected_position = document.position_index,
-                .owner = .event_reader,
-            },
+            .document = document,
+            .parser = document.parser,
+            .generation = document.generation,
+            .expected_epoch = document.parser.event_epoch,
         };
     }
 
     pub fn next(self: *EventReader) Error!?Event {
-        return self.readNext();
+        const token = try self.nextParsed() orelse return null;
+        const event = try eventFromToken(token);
+        self.advanceEpoch();
+        return event;
     }
 
     pub fn peek(self: *const EventReader) Error!?Event {
-        var probe = self.*;
-        const document = probe.cursor.document;
-        const position_index = document.position_index;
-        const depth = document.depth;
-        const event = probe.readNext() catch |err| {
-            document.position_index = position_index;
-            document.depth = depth;
-            return err;
-        };
-        document.position_index = position_index;
-        document.depth = depth;
-        return event;
+        try self.ensureFocused();
+        if (self.parser.event_cached == null) {
+            self.parser.event_cached = try self.parser.token_reader.next();
+        }
+        const token = self.parser.event_cached orelse return null;
+        return try eventFromToken(token);
     }
 
     pub fn skip(self: *EventReader) Error!void {
@@ -451,8 +457,10 @@ pub const EventReader = struct {
         };
 
         var steps: usize = 0;
+        const max_steps = std.math.add(usize, self.document.input.len, 1) catch
+            std.math.maxInt(usize);
         while (open_count > 0) {
-            if (steps >= self.cursor.document.token_count) return error.UnexpectedEnd;
+            if (steps >= max_steps) return error.UnexpectedEnd;
             const event = try self.next() orelse return error.UnexpectedEnd;
             switch (event) {
                 .object_start, .array_start => open_count += 1,
@@ -463,295 +471,45 @@ pub const EventReader = struct {
         }
     }
 
-    fn readNext(self: *EventReader) Error!?Event {
-        if (self.root_done) {
-            try self.cursor.ensureFocused();
-            return self.finishRoot();
+    fn nextParsed(self: *EventReader) Error!?stage2.ParsedToken {
+        try self.ensureFocused();
+        if (self.parser.event_cached) |token| {
+            self.parser.event_cached = null;
+            return token;
         }
+        return self.parser.token_reader.next() catch |err| return err;
+    }
 
-        var separator_steps: usize = 0;
-        while (separator_steps <= self.cursor.document.token_count) : (separator_steps += 1) {
-            const token = try self.cursor.peek() orelse return self.finishDocument();
-            try self.consumeWhitespaceBefore(token.offset);
-            try self.advanceLoaded(token);
-            self.byte_position = @intCast(token.offset);
-            self.byte_position += 1;
-            switch (token.byte) {
-                '{' => return try self.openContainer(false, token.offset),
-                '[' => return try self.openContainer(true, token.offset),
-                '}' => return try self.closeContainer(false, token.offset),
-                ']' => return try self.closeContainer(true, token.offset),
-                ':' => try self.consumeColon(),
-                ',' => try self.consumeComma(),
-                '"' => return try self.consumeString(token.offset),
-                '-', '0'...'9' => return try self.consumeNumber(token.offset),
-                't' => return try self.consumeLiteral(token.offset, "true", true),
-                'f' => return try self.consumeLiteral(token.offset, "false", false),
-                'n' => return try self.consumeNull(token.offset),
-                '+', '.' => return error.InvalidNumber,
-                else => return error.UnexpectedToken,
-            }
+    fn advanceEpoch(self: *EventReader) void {
+        self.parser.event_epoch +%= 1;
+        if (self.parser.event_epoch == 0) self.parser.event_epoch = 1;
+        self.expected_epoch = self.parser.event_epoch;
+    }
+
+    fn ensureFocused(self: *const EventReader) Error!void {
+        if (!self.parser.document_active) return error.DocumentReleased;
+        if (self.parser.generation != self.generation) return error.DocumentReleased;
+        if (self.parser.focus != .event_reader) return error.FocusLost;
+        if (self.parser.event_epoch != self.expected_epoch) {
+            return error.OutOfOrderIteration;
         }
-        return error.UnexpectedToken;
-    }
-
-    fn advanceLoaded(self: *EventReader, token: Token) Error!void {
-        try self.cursor.applyDepth(token.byte);
-        self.cursor.expected_position += 1;
-        self.cursor.document.position_index = self.cursor.expected_position;
-    }
-
-    fn openContainer(
-        self: *EventReader,
-        is_array: bool,
-        offset: u32,
-    ) Error!Event {
-        if (self.top >= max_depth) return error.DepthExceeded;
-        try self.beginValue();
-        self.stack[self.top] = .{
-            .is_array = is_array,
-            .count = 0,
-            .open_offset = offset,
-        };
-        self.top += 1;
-        self.expect = if (is_array) .value_after_open else .key_after_open;
-        return if (is_array) .array_start else .object_start;
-    }
-
-    fn closeContainer(
-        self: *EventReader,
-        is_array: bool,
-        offset: u32,
-    ) Error!Event {
-        _ = offset;
-        if (self.top == 0) return error.UnexpectedToken;
-        const entry = self.stack[self.top - 1];
-        if (entry.is_array != is_array) return error.UnexpectedToken;
-
-        if (is_array) {
-            switch (self.expect) {
-                .value_after_open => {
-                    if (entry.count != 0) return error.UnexpectedToken;
-                },
-                .value_after_comma => return error.TrailingComma,
-                .after_value => {},
-                else => return error.UnexpectedToken,
-            }
-        } else {
-            switch (self.expect) {
-                .key_after_open => {
-                    if (entry.count != 0) return error.UnexpectedToken;
-                },
-                .key_after_comma => return error.TrailingComma,
-                .after_value => {},
-                else => return error.UnexpectedToken,
-            }
-        }
-
-        self.top -= 1;
-        if (self.top == 0) {
-            self.root_done = true;
-        } else {
-            self.expect = .after_value;
-        }
-        return if (is_array) .array_end else .object_end;
-    }
-
-    fn consumeColon(self: *EventReader) Error!void {
-        if (self.top == 0) return error.UnexpectedToken;
-        if (self.stack[self.top - 1].is_array) return error.UnexpectedToken;
-        if (self.expect != .colon) return error.UnexpectedToken;
-        self.expect = .value_after_colon;
-    }
-
-    fn consumeComma(self: *EventReader) Error!void {
-        if (self.top == 0) return error.UnexpectedToken;
-        if (self.expect != .after_value) return error.UnexpectedToken;
-        self.expect = if (self.stack[self.top - 1].is_array)
-            .value_after_comma
-        else
-            .key_after_comma;
-    }
-
-    fn consumeString(self: *EventReader, quote_offset: u32) Error!Event {
-        const is_key = self.isKeyExpected();
-        if (!is_key) try self.beginValue();
-
-        const token = try validateString(self.cursor.document.input, quote_offset);
-        self.byte_position = token.end_offset;
-        const raw = self.cursor.document.input[token.content_start..token.content_end];
-        if (is_key) {
-            self.expect = .colon;
-            return .{ .key = raw };
-        }
-        self.completeScalarValue();
-        return .{ .string = raw };
-    }
-
-    fn consumeNumber(self: *EventReader, start_offset: u32) Error!Event {
-        try self.beginValue();
-        const end_offset = try validateNumber(
-            self.cursor.document.input,
-            @intCast(start_offset),
-        );
-        self.byte_position = end_offset;
-        self.completeScalarValue();
-        return .{
-            .number = self.cursor.document.input[@intCast(start_offset)..end_offset],
-        };
-    }
-
-    fn consumeLiteral(
-        self: *EventReader,
-        start_offset: u32,
-        literal: []const u8,
-        value: bool,
-    ) Error!Event {
-        try self.beginValue();
-        const end_offset = try validateLiteral(
-            self.cursor.document.input,
-            @intCast(start_offset),
-            literal,
-        );
-        self.byte_position = end_offset;
-        self.completeScalarValue();
-        return .{ .bool = value };
-    }
-
-    fn consumeNull(self: *EventReader, start_offset: u32) Error!Event {
-        try self.beginValue();
-        self.byte_position = try validateLiteral(
-            self.cursor.document.input,
-            @intCast(start_offset),
-            "null",
-        );
-        self.completeScalarValue();
-        return .null;
-    }
-
-    fn beginValue(self: *EventReader) Error!void {
-        if (self.top == 0) {
-            if (self.root_started) return error.RootNotSingular;
-            self.root_started = true;
-            return;
-        }
-
-        const entry = &self.stack[self.top - 1];
-        if (entry.is_array) {
-            switch (self.expect) {
-                .value_after_open, .value_after_comma => {},
-                else => return error.UnexpectedToken,
-            }
-        } else if (self.expect != .value_after_colon) {
-            return error.UnexpectedToken;
-        }
-
-        entry.count = std.math.add(usize, entry.count, 1) catch {
-            return error.UnexpectedToken;
-        };
-        self.expect = .after_value;
-    }
-
-    fn completeScalarValue(self: *EventReader) void {
-        if (self.top == 0) self.root_done = true;
-    }
-
-    fn isKeyExpected(self: *const EventReader) bool {
-        if (self.top == 0) return false;
-        if (self.stack[self.top - 1].is_array) return false;
-        return switch (self.expect) {
-            .key_after_open, .key_after_comma => true,
-            else => false,
-        };
-    }
-
-    fn consumeWhitespaceBefore(self: *EventReader, offset: u32) Error!void {
-        const target: usize = @intCast(offset);
-        if (target < self.byte_position) return error.InvalidStructuralIndex;
-
-        const input = self.cursor.document.input;
-        if (target > input.len) return error.InvalidStructuralIndex;
-        const VLEN = simd.default_vector_len;
-        const Mask = simd.Mask(VLEN);
-        const Vec = simd.Vec(VLEN, u8);
-
-        while (target - self.byte_position >= VLEN) {
-            const block: Vec = input[self.byte_position..target][0..VLEN].*;
-
-            // Subtraction maps tab, LF, and CR to 0, 1, and 4.
-            // Folding bit 1 into bit 2 maps VT and FF from 2/3 to 6/7,
-            // so the comparison accepts only JSON control whitespace.
-            const distance_from_tab = block -% @as(Vec, @splat(0x09));
-            const folded_distance = distance_from_tab |
-                ((distance_from_tab & @as(Vec, @splat(0x02))) << @as(Vec, @splat(1)));
-            const control_whitespace = folded_distance <= @as(Vec, @splat(0x04));
-            const whitespace = control_whitespace | (block == @as(Vec, @splat(0x20)));
-            const whitespace_mask: Mask = @bitCast(whitespace);
-            const candidate_mask: Mask = ~whitespace_mask;
-            if (candidate_mask == 0) {
-                self.byte_position += VLEN;
-                continue;
-            }
-
-            const candidate_offset: usize = @intCast(@ctz(candidate_mask));
-            self.byte_position += candidate_offset;
-            break;
-        }
-
-        while (self.byte_position < target) : (self.byte_position += 1) {
-            if (!isWhitespace(input[self.byte_position])) {
-                return classifyUnindexed(input[self.byte_position]);
-            }
-        }
-    }
-
-    fn finishRoot(self: *EventReader) Error!?Event {
-        while (self.byte_position < self.cursor.document.input.len) {
-            if (!isWhitespace(self.cursor.document.input[self.byte_position])) {
-                return error.RootNotSingular;
-            }
-            self.byte_position += 1;
-        }
-        if (self.cursor.expected_position != self.cursor.document.token_count) {
-            return error.RootNotSingular;
-        }
-        return null;
-    }
-
-    fn finishDocument(self: *EventReader) Error!?Event {
-        while (self.byte_position < self.cursor.document.input.len) {
-            if (!isWhitespace(self.cursor.document.input[self.byte_position])) {
-                return classifyUnindexed(self.cursor.document.input[self.byte_position]);
-            }
-            self.byte_position += 1;
-        }
-        if (self.top > 0) {
-            if (self.stack[self.top - 1].is_array) return error.UnclosedArray;
-            return error.UnclosedObject;
-        }
-        if (!self.root_started) return error.EmptyDocument;
-        if (!self.root_done) return error.UnexpectedEnd;
-        return null;
     }
 };
 
-const StringToken = struct {
-    content_start: usize,
-    content_end: usize,
-    end_offset: usize,
-};
-
-const NumberState = enum {
-    start,
-    minus,
-    zero,
-    integer,
-    fraction_dot,
-    fraction,
-    exponent_mark,
-    exponent_sign,
-    exponent,
-};
+fn eventFromToken(token: stage2.ParsedToken) Error!Event {
+    return switch (token.word.tapeKind()) {
+        .object_start => .object_start,
+        .object_end => .object_end,
+        .array_start => .array_start,
+        .array_end => .array_end,
+        .key => .{ .key = token.raw },
+        .string => .{ .string = token.raw },
+        .number => .{ .number = token.raw },
+        .true_literal => .{ .bool = true },
+        .false_literal => .{ .bool = false },
+        .null_literal => .null,
+    };
+}
 
 fn validateStructuralIndex(
     input: []const u8,
@@ -785,203 +543,9 @@ fn validateIndexes(
     if (indexes[count + 2] != 0) return error.InvalidStructuralIndex;
 }
 
-fn validateString(input: []const u8, quote_offset: u32) Error!StringToken {
-    const quote: usize = @intCast(quote_offset);
-    if (quote >= input.len) return error.InvalidStructuralIndex;
-    if (input[quote] != '"') return error.InvalidStructuralIndex;
-
-    const content_start = quote + 1;
-    var index = content_start;
-    const VLEN = simd.default_vector_len;
-    const Mask = simd.Mask(VLEN);
-    const Shift = std.math.Log2Int(Mask);
-    const full_block_limit: usize = if (input.len >= VLEN)
-        input.len - VLEN + 1
-    else
-        0;
-    var has_high_bit = false;
-    while (index < input.len) {
-        while (index < full_block_limit) {
-            const block: simd.Vec(VLEN, u8) = input[index..][0..VLEN].*;
-            const candidate_mask: Mask =
-                simd.matchAny2(VLEN, block, '"', '\\') |
-                simd.matchRange(VLEN, block, 0, 0x1f);
-            if (candidate_mask == 0) {
-                has_high_bit = has_high_bit or simd.matchRange(VLEN, block, 0x80, 0xff) != 0;
-                index += VLEN;
-                continue;
-            }
-
-            const candidate_offset: usize = @intCast(@ctz(candidate_mask));
-            const candidate_index = index + candidate_offset;
-            const prefix_mask: Mask =
-                (@as(Mask, 1) << @as(Shift, @intCast(candidate_offset))) - 1;
-            const high_bit_mask: Mask = simd.matchRange(VLEN, block, 0x80, 0xff);
-            has_high_bit = has_high_bit or (high_bit_mask & prefix_mask) != 0;
-            if (input[candidate_index] == '"') {
-                const content = input[content_start..candidate_index];
-                if (has_high_bit) {
-                    switch (simd.validateUtf8(content)) {
-                        .valid => {},
-                        .invalid => return error.InvalidUtf8,
-                    }
-                }
-                return .{
-                    .content_start = content_start,
-                    .content_end = candidate_index,
-                    .end_offset = candidate_index + 1,
-                };
-            }
-            index = candidate_index;
-            break;
-        }
-
-        if (index >= input.len) break;
-        const byte = input[index];
-        if (byte == '"') {
-            const content = input[content_start..index];
-            if (has_high_bit) {
-                switch (simd.validateUtf8(content)) {
-                    .valid => {},
-                    .invalid => return error.InvalidUtf8,
-                }
-            }
-            return .{
-                .content_start = content_start,
-                .content_end = index,
-                .end_offset = index + 1,
-            };
-        }
-        if (byte < 0x20) return error.InvalidEscape;
-        if (byte != '\\') {
-            if (byte >= 0x80) has_high_bit = true;
-            index += 1;
-            continue;
-        }
-
-        if (index + 1 >= input.len) return error.InvalidEscape;
-        switch (input[index + 1]) {
-            '"', '\\', '/', 'b', 'f', 'n', 'r', 't' => index += 2,
-            'u' => {
-                try validateHexCodeUnit(input, index);
-                index += 6;
-            },
-            else => return error.InvalidEscape,
-        }
-    }
-    return error.UnterminatedString;
-}
-
-fn validateHexCodeUnit(input: []const u8, slash_offset: usize) Error!void {
-    if (slash_offset + 5 >= input.len) return error.InvalidEscape;
-    for (input[slash_offset + 2 .. slash_offset + 6]) |byte| {
-        _ = std.fmt.charToDigit(byte, 16) catch return error.InvalidEscape;
-    }
-}
-
-fn validateNumber(input: []const u8, start_offset: usize) Error!usize {
-    var state: NumberState = .start;
-    var index = start_offset;
-    while (index < input.len) : (index += 1) {
-        const byte = input[index];
-        if (isAtomBoundary(byte)) break;
-        state = switch (state) {
-            .start => switch (byte) {
-                '-' => .minus,
-                '0' => .zero,
-                '1'...'9' => .integer,
-                else => return invalidNumberByte(byte),
-            },
-            .minus => switch (byte) {
-                '0' => .zero,
-                '1'...'9' => .integer,
-                else => return invalidNumberByte(byte),
-            },
-            .zero => switch (byte) {
-                '.' => .fraction_dot,
-                'e', 'E' => .exponent_mark,
-                else => return error.InvalidNumber,
-            },
-            .integer => switch (byte) {
-                '0'...'9' => .integer,
-                '.' => .fraction_dot,
-                'e', 'E' => .exponent_mark,
-                else => return invalidNumberByte(byte),
-            },
-            .fraction_dot => switch (byte) {
-                '0'...'9' => .fraction,
-                else => return invalidNumberByte(byte),
-            },
-            .fraction => switch (byte) {
-                '0'...'9' => .fraction,
-                'e', 'E' => .exponent_mark,
-                else => return invalidNumberByte(byte),
-            },
-            .exponent_mark => switch (byte) {
-                '+', '-' => .exponent_sign,
-                '0'...'9' => .exponent,
-                else => return invalidNumberByte(byte),
-            },
-            .exponent_sign => switch (byte) {
-                '0'...'9' => .exponent,
-                else => return invalidNumberByte(byte),
-            },
-            .exponent => switch (byte) {
-                '0'...'9' => .exponent,
-                else => return invalidNumberByte(byte),
-            },
-        };
-    }
-
-    return switch (state) {
-        .zero, .integer, .fraction, .exponent => index,
-        else => error.InvalidNumber,
-    };
-}
-
-fn validateLiteral(
-    input: []const u8,
-    start_offset: usize,
-    literal: []const u8,
-) Error!usize {
-    const end_offset = std.math.add(usize, start_offset, literal.len) catch {
-        return error.UnexpectedEnd;
-    };
-    if (end_offset > input.len) return error.UnexpectedEnd;
-    if (!std.mem.eql(u8, input[start_offset..end_offset], literal)) {
-        return error.UnexpectedToken;
-    }
-    if (end_offset < input.len and !isAtomBoundary(input[end_offset])) {
-        return error.UnexpectedToken;
-    }
-    return end_offset;
-}
-
-fn invalidNumberByte(byte: u8) Error {
-    return switch (byte) {
-        '+', '-', '.', 'e', 'E', '0'...'9' => error.InvalidNumber,
-        else => error.UnexpectedToken,
-    };
-}
-
-fn classifyUnindexed(byte: u8) Error {
-    return switch (byte) {
-        '+', '.' => error.InvalidNumber,
-        else => error.UnexpectedToken,
-    };
-}
-
 fn isWhitespace(byte: u8) bool {
     return switch (byte) {
         ' ', '\t', '\n', '\r' => true,
-        else => false,
-    };
-}
-
-fn isAtomBoundary(byte: u8) bool {
-    if (isWhitespace(byte)) return true;
-    return switch (byte) {
-        '}', ']', ':', ',' => true,
         else => false,
     };
 }
@@ -1166,6 +730,38 @@ test "EventReader emits raw JSON events without allocation" {
     try testing.expect((try reader.next()) == null);
 }
 
+test "EventReader keeps failed peek sticky" {
+    const input = "[,]";
+    var structural_index = try indexForTest(testing.allocator, input);
+    defer structural_index.deinit(testing.allocator);
+
+    var parser = try Parser.init(testing.allocator, input.len);
+    defer parser.deinit();
+    var document = try parser.initDocument(input, &structural_index);
+    defer document.deinit();
+    var reader = try document.eventReader();
+
+    try expectEvent(.array_start, (try reader.next()).?);
+    try testing.expectError(error.UnexpectedToken, reader.peek());
+    try testing.expectError(error.UnexpectedToken, reader.next());
+}
+
+test "copied Document cannot claim shared event reader" {
+    const input = "[1]";
+    var structural_index = try indexForTest(testing.allocator, input);
+    defer structural_index.deinit(testing.allocator);
+
+    var parser = try Parser.init(testing.allocator, input.len);
+    defer parser.deinit();
+    var document = try parser.initDocument(input, &structural_index);
+    defer document.deinit();
+    var copied = document;
+
+    var reader = try document.eventReader();
+    try testing.expectError(error.FocusAlreadyClaimed, copied.eventReader());
+    try expectEvent(.array_start, (try reader.next()).?);
+}
+
 test "EventReader rejects trailing commas and malformed numbers" {
     const cases = [_]struct {
         input: []const u8,
@@ -1213,4 +809,98 @@ test "EventReader enforces the fixed depth bound" {
         try expectEvent(.array_start, (try reader.next()).?);
     }
     try testing.expectError(error.DepthExceeded, reader.next());
+}
+
+test "EventReader handles zero-index quoted dialect roots" {
+    const cases = [_]struct {
+        input: []const u8,
+        dialect: stage2.Dialect,
+    }{
+        .{ .input = "\"hello\"", .dialect = .jsonc },
+        .{ .input = "'hello'", .dialect = .json5 },
+    };
+
+    for (cases) |case| {
+        var parser = try Parser.init(testing.allocator, case.input.len);
+        defer parser.deinit();
+        _ = try parser.prepareDocument(case.input);
+        var document = try parser.completeDialectDocument(case.input, 0, case.dialect);
+        defer document.deinit();
+        var reader = try document.eventReader();
+
+        const raw = case.input[1 .. case.input.len - 1];
+        const event = (try reader.next()).?;
+        try expectEvent(.{ .string = raw }, event);
+        switch (event) {
+            .string => |actual| try testing.expect(actual.ptr == raw.ptr),
+            else => unreachable,
+        }
+        try testing.expect((try reader.next()) == null);
+    }
+}
+
+test "EventReader completes JSONC comments and JSON5 syntax" {
+    const cases = [_]struct {
+        input: []const u8,
+        offsets: []const u32,
+        dialect: stage2.Dialect,
+    }{
+        .{
+            .input = "{\"a\":1/*x*/}",
+            .offsets = &.{ 0, 4, 5, 11 },
+            .dialect = .jsonc,
+        },
+        .{
+            .input = "{a:'x',}",
+            .offsets = &.{ 0, 1, 2, 6, 7 },
+            .dialect = .json5,
+        },
+    };
+
+    for (cases) |case| {
+        var parser = try Parser.init(testing.allocator, case.input.len);
+        defer parser.deinit();
+        const slots = try parser.prepareDocument(case.input);
+        @memcpy(slots[0..case.offsets.len], case.offsets);
+        var document = try parser.completeDialectDocument(
+            case.input,
+            case.offsets.len,
+            case.dialect,
+        );
+        defer document.deinit();
+        var reader = try document.eventReader();
+
+        try expectEvent(.object_start, (try reader.next()).?);
+        try expectEvent(.{ .key = "a" }, (try reader.next()).?);
+        if (case.dialect == .jsonc) {
+            try expectEvent(.{ .number = "1" }, (try reader.next()).?);
+        } else {
+            try expectEvent(.{ .string = "x" }, (try reader.next()).?);
+        }
+        try expectEvent(.object_end, (try reader.next()).?);
+        try testing.expect((try reader.next()) == null);
+    }
+}
+
+test "EventReader rejects copies and released documents before source access" {
+    const input = "[0]";
+    var structural_index = try indexForTest(testing.allocator, input);
+    defer structural_index.deinit(testing.allocator);
+
+    var parser = try Parser.init(testing.allocator, input.len);
+    defer parser.deinit();
+    var document = try parser.initDocument(input, &structural_index);
+    var reader = try document.eventReader();
+    var copied = reader;
+
+    try expectEvent(.array_start, (try reader.next()).?);
+    try testing.expectError(error.OutOfOrderIteration, copied.next());
+
+    document.deinit();
+    try testing.expectError(error.DocumentReleased, reader.next());
+    try testing.expectError(error.DocumentReleased, copied.next());
+
+    var reused = try parser.initDocument(input, &structural_index);
+    defer reused.deinit();
+    try testing.expectError(error.DocumentReleased, reader.next());
 }

@@ -19,6 +19,7 @@ pub const Error = error{
     DepthExceeded,
     UnterminatedString,
     InvalidUtf8,
+    InvalidStructuralIndex,
 };
 
 pub const Dialect = enum {
@@ -28,8 +29,9 @@ pub const Dialect = enum {
 };
 
 pub const BuildError = std.mem.Allocator.Error || Error || error{TapeTooLarge};
-const ParseError = Error || error{TapeTooLarge};
-pub const ValidationError = std.mem.Allocator.Error || error{TapeTooLarge};
+pub const ReaderError = Error || error{TapeTooLarge};
+const ParseError = ReaderError;
+pub const ValidationError = std.mem.Allocator.Error || Error || error{TapeTooLarge};
 
 pub const TapeKind = enum(u8) {
     object_start,
@@ -429,6 +431,162 @@ pub const DepthStack = struct {
     }
 };
 
+/// A token view emitted by `TokenReader`.
+///
+/// `raw` is authoritative for borrowed spans. `word.payload` keeps the
+/// compact tape representation and is zero when a span exceeds `u24`.
+pub const ParsedToken = struct {
+    word: TapeWord,
+    raw: []const u8,
+};
+
+/// A checked borrowed view over global Stage 1 offsets.
+///
+/// `global_offsets` remains owned by the caller. The view tracks the local
+/// input extent used by the reader's validation boundary.
+pub const IndexView = struct {
+    pub const Error = error{InvalidStructuralIndex};
+
+    global_offsets: []const u32,
+    base_offset: u32,
+    limit: u32,
+
+    pub fn init(
+        input: []const u8,
+        global_offsets: []const u32,
+        base_offset: u32,
+    ) IndexView.Error!IndexView {
+        const limit = input.len;
+        if (input.len > std.math.maxInt(u32)) return error.InvalidStructuralIndex;
+        _ = std.math.add(u32, base_offset, @intCast(limit)) catch {
+            return error.InvalidStructuralIndex;
+        };
+
+        var previous: ?u32 = null;
+        for (global_offsets) |global_offset| {
+            if (global_offset < base_offset) return error.InvalidStructuralIndex;
+            const local_offset = global_offset - base_offset;
+            if (local_offset >= limit) return error.InvalidStructuralIndex;
+            if (previous) |previous_offset| {
+                if (global_offset <= previous_offset) return error.InvalidStructuralIndex;
+            }
+            previous = global_offset;
+        }
+
+        return .{
+            .global_offsets = global_offsets,
+            .base_offset = base_offset,
+            .limit = @intCast(limit),
+        };
+    }
+
+    pub fn count(self: *const IndexView) usize {
+        return self.global_offsets.len;
+    }
+
+    fn localOffset(self: *const IndexView, position: usize) IndexView.Error!usize {
+        if (position >= self.global_offsets.len) return error.InvalidStructuralIndex;
+        const global_offset = self.global_offsets[position];
+        if (global_offset < self.base_offset) return error.InvalidStructuralIndex;
+        const local_offset = global_offset - self.base_offset;
+        if (local_offset >= self.limit) return error.InvalidStructuralIndex;
+        return @intCast(local_offset);
+    }
+
+    fn validateInput(self: *const IndexView, input: []const u8) IndexView.Error!void {
+        if (input.len > std.math.maxInt(u32)) return error.InvalidStructuralIndex;
+        if (self.limit > input.len) return error.InvalidStructuralIndex;
+        _ = std.math.add(u32, self.base_offset, self.limit) catch {
+            return error.InvalidStructuralIndex;
+        };
+
+        var previous: ?u32 = null;
+        for (self.global_offsets) |global_offset| {
+            if (global_offset < self.base_offset) return error.InvalidStructuralIndex;
+            const local_offset = global_offset - self.base_offset;
+            if (local_offset >= self.limit) return error.InvalidStructuralIndex;
+            if (previous) |previous_offset| {
+                if (global_offset <= previous_offset) return error.InvalidStructuralIndex;
+            }
+            previous = global_offset;
+        }
+    }
+};
+
+/// Builds an owned tape from a checked borrowed index view.
+pub fn buildTapeView(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    view: IndexView,
+    dialect: Dialect,
+) BuildError!Document {
+    try view.validateInput(input);
+    const bounded_input = input[0..@intCast(view.limit)];
+    const tape_capacity = if (dialect == .json) view.count() else bounded_input.len;
+    var tape = try std.ArrayList(TapeWord).initCapacity(allocator, tape_capacity);
+    errdefer tape.deinit(allocator);
+
+    var reader = try TokenReader.init(bounded_input, view, dialect);
+    reader.tape = &tape;
+    try reader.run();
+
+    return .{
+        .tape = try tape.toOwnedSlice(allocator),
+        .dialect = dialect,
+    };
+}
+
+/// Validates a document from a checked borrowed index view.
+pub fn validateView(
+    input: []const u8,
+    view: IndexView,
+    dialect: Dialect,
+) ValidationError!?Diagnostic {
+    try view.validateInput(input);
+    const bounded_input = input[0..@intCast(view.limit)];
+    var reader = try TokenReader.init(bounded_input, view, dialect);
+    reader.run() catch |err| {
+        if (err == error.TapeTooLarge) return error.TapeTooLarge;
+        if (err == error.InvalidStructuralIndex) return error.InvalidStructuralIndex;
+        return diagnosticAt(bounded_input, @errorCast(err), reader.failure_offset);
+    };
+    return null;
+}
+
+fn validateStructuralIndex(
+    input: []const u8,
+    structural_index: *const stage1.StructuralIndex,
+) Error!void {
+    const source_count = std.math.add(
+        usize,
+        structural_index.count,
+        3,
+    ) catch return error.InvalidStructuralIndex;
+    if (source_count > structural_index.indexes.len) {
+        return error.InvalidStructuralIndex;
+    }
+
+    var previous: ?u32 = null;
+    for (structural_index.slice()) |offset| {
+        if (offset >= input.len) return error.InvalidStructuralIndex;
+        if (previous) |previous_offset| {
+            if (offset <= previous_offset) return error.InvalidStructuralIndex;
+        }
+        previous = offset;
+    }
+
+    const sentinel: u32 = @intCast(input.len);
+    if (structural_index.indexes[structural_index.count] != sentinel) {
+        return error.InvalidStructuralIndex;
+    }
+    if (structural_index.indexes[structural_index.count + 1] != sentinel) {
+        return error.InvalidStructuralIndex;
+    }
+    if (structural_index.indexes[structural_index.count + 2] != 0) {
+        return error.InvalidStructuralIndex;
+    }
+}
+
 /// Builds an owned tape after complete dialect-specific syntax validation.
 pub fn buildTape(
     allocator: std.mem.Allocator,
@@ -437,26 +595,9 @@ pub fn buildTape(
     dialect: Dialect,
 ) BuildError!Document {
     if (input.len > std.math.maxInt(u32)) return error.TapeTooLarge;
-
-    const indexes = structural_index.slice();
-    const tape_capacity = if (dialect == .json) indexes.len else input.len;
-    var tape = try std.ArrayList(TapeWord).initCapacity(allocator, tape_capacity);
-    errdefer tape.deinit(allocator);
-
-    var parser = Parser{
-        .input = input,
-        .indexes = indexes,
-        .tape = &tape,
-        .dialect = dialect,
-        // SAFETY: push writes every entry before top exposes it.
-        .depth = .{ .entries = undefined },
-    };
-    try parser.run();
-
-    return .{
-        .tape = try tape.toOwnedSlice(allocator),
-        .dialect = dialect,
-    };
+    try validateStructuralIndex(input, structural_index);
+    const view = try IndexView.init(input, structural_index.slice(), 0);
+    return buildTapeView(allocator, input, view, dialect);
 }
 
 /// Validates an indexed document without allocating a tape.
@@ -466,19 +607,9 @@ pub fn validate(
     dialect: Dialect,
 ) ValidationError!?Diagnostic {
     if (input.len > std.math.maxInt(u32)) return error.TapeTooLarge;
-
-    var parser = Parser{
-        .input = input,
-        .indexes = structural_index.slice(),
-        .dialect = dialect,
-        // SAFETY: push writes every entry before top exposes it.
-        .depth = .{ .entries = undefined },
-    };
-    parser.run() catch |err| {
-        if (err == error.TapeTooLarge) return error.TapeTooLarge;
-        return diagnosticAt(input, @errorCast(err), parser.failure_offset);
-    };
-    return null;
+    try validateStructuralIndex(input, structural_index);
+    const view = try IndexView.init(input, structural_index.slice(), 0);
+    return validateView(input, view, dialect);
 }
 
 /// Creates a zero-copy diagnostic view into `input`.
@@ -543,9 +674,10 @@ const StringToken = struct {
     end_offset: usize,
 };
 
-const Parser = struct {
+pub const TokenReader = struct {
     input: []const u8,
     indexes: []const u32,
+    view: ?IndexView = null,
     dialect: Dialect,
     tape: ?*std.ArrayList(TapeWord) = null,
     structural_position: usize = 0,
@@ -556,11 +688,70 @@ const Parser = struct {
     expect: Expect = .value_after_open,
     root_started: bool = false,
     root_done: bool = false,
+    pending: ?ParsedToken = null,
+    finished: bool = false,
+    failure: ?ReaderError = null,
 
-    fn run(self: *Parser) ParseError!void {
+    pub fn init(
+        input: []const u8,
+        view: IndexView,
+        dialect: Dialect,
+    ) ReaderError!TokenReader {
+        var reader = TokenReader{
+            .input = &.{},
+            .indexes = &.{},
+            .dialect = dialect,
+            // SAFETY: reset only changes scalar state and depth.top.
+            .depth = .{ .entries = undefined },
+        };
+        try reader.reset(input, view, dialect);
+        return reader;
+    }
+
+    /// Reuses this reader with a new borrowed input and index view.
+    pub fn reset(
+        self: *TokenReader,
+        input: []const u8,
+        view: IndexView,
+        dialect: Dialect,
+    ) ReaderError!void {
+        try view.validateInput(input);
+        self.input = input[0..@intCast(view.limit)];
+        self.indexes = &.{};
+        self.view = view;
+        self.dialect = dialect;
+        self.tape = null;
+        self.structural_position = 0;
+        self.byte_position = 0;
+        self.failure_offset = 0;
+        self.tape_count = 0;
+        self.depth.top = 0;
+        self.expect = .value_after_open;
+        self.root_started = false;
+        self.root_done = false;
+        self.pending = null;
+        self.failure = null;
+        self.finished = false;
+    }
+
+    pub fn next(self: *TokenReader) ReaderError!?ParsedToken {
+        if (self.failure) |err| return err;
+        if (self.finished) return null;
+
+        return self.nextUncached() catch |err| {
+            self.failure = err;
+            return err;
+        };
+    }
+
+    fn nextUncached(self: *TokenReader) ReaderError!?ParsedToken {
         while (true) {
             try self.skipIgnored();
-            if (self.byte_position == self.input.len) break;
+            if (self.byte_position == self.input.len) {
+                try self.finish();
+                self.finished = true;
+                return null;
+            }
             if (self.root_done) {
                 return self.fail(error.RootNotSingular, self.byte_position);
             }
@@ -572,75 +763,85 @@ const Parser = struct {
             if (self.dialect != .json and (is_double_quote or is_single_quote)) {
                 self.byte_position += 1;
                 try self.consumeString();
-                continue;
+            } else {
+                const byte = try self.takeIndexedByte();
+                switch (byte) {
+                    '{' => try self.openContainer(false),
+                    '[' => try self.openContainer(true),
+                    '}' => try self.closeContainer(false),
+                    ']' => try self.closeContainer(true),
+                    ':' => try self.consumeColon(),
+                    ',' => try self.consumeComma(),
+                    '"' => try self.consumeString(),
+                    '-' => try self.consumeNumber(),
+                    '0'...'9' => try self.consumeNumber(),
+                    '+' => {
+                        if (self.dialect != .json5) {
+                            return self.fail(error.InvalidNumber, self.byte_position - 1);
+                        }
+                        try self.consumeNumber();
+                    },
+                    '.' => {
+                        if (self.dialect != .json5) {
+                            return self.fail(error.InvalidNumber, self.byte_position - 1);
+                        }
+                        try self.consumeNumber();
+                    },
+                    't' => {
+                        if (self.dialect == .json5 and self.isKeyExpected()) {
+                            try self.consumeIdentifier(self.byte_position - 1);
+                        } else {
+                            try self.consumeLiteral("true", .true_literal);
+                        }
+                    },
+                    'f' => {
+                        if (self.dialect == .json5 and self.isKeyExpected()) {
+                            try self.consumeIdentifier(self.byte_position - 1);
+                        } else {
+                            try self.consumeLiteral("false", .false_literal);
+                        }
+                    },
+                    'n' => {
+                        if (self.dialect == .json5 and self.isKeyExpected()) {
+                            try self.consumeIdentifier(self.byte_position - 1);
+                        } else {
+                            try self.consumeLiteral("null", .null_literal);
+                        }
+                    },
+                    'I', 'N' => {
+                        if (self.dialect != .json5) {
+                            return self.fail(error.UnexpectedToken, self.byte_position - 1);
+                        }
+                        if (self.isKeyExpected()) {
+                            try self.consumeIdentifier(self.byte_position - 1);
+                        } else {
+                            try self.consumeNumber();
+                        }
+                    },
+                    else => {
+                        if (self.dialect == .json5 and self.isKeyExpected()) {
+                            try self.consumeIdentifier(self.byte_position - 1);
+                        } else {
+                            return self.fail(error.UnexpectedToken, self.byte_position - 1);
+                        }
+                    },
+                }
             }
 
-            const byte = try self.takeIndexedByte();
-            switch (byte) {
-                '{' => try self.openContainer(false),
-                '[' => try self.openContainer(true),
-                '}' => try self.closeContainer(false),
-                ']' => try self.closeContainer(true),
-                ':' => try self.consumeColon(),
-                ',' => try self.consumeComma(),
-                '"' => try self.consumeString(),
-                '-' => try self.consumeNumber(),
-                '0'...'9' => try self.consumeNumber(),
-                '+' => {
-                    if (self.dialect != .json5) {
-                        return self.fail(error.InvalidNumber, self.byte_position - 1);
-                    }
-                    try self.consumeNumber();
-                },
-                '.' => {
-                    if (self.dialect != .json5) {
-                        return self.fail(error.InvalidNumber, self.byte_position - 1);
-                    }
-                    try self.consumeNumber();
-                },
-                't' => {
-                    if (self.dialect == .json5 and self.isKeyExpected()) {
-                        try self.consumeIdentifier(self.byte_position - 1);
-                    } else {
-                        try self.consumeLiteral("true", .true_literal);
-                    }
-                },
-                'f' => {
-                    if (self.dialect == .json5 and self.isKeyExpected()) {
-                        try self.consumeIdentifier(self.byte_position - 1);
-                    } else {
-                        try self.consumeLiteral("false", .false_literal);
-                    }
-                },
-                'n' => {
-                    if (self.dialect == .json5 and self.isKeyExpected()) {
-                        try self.consumeIdentifier(self.byte_position - 1);
-                    } else {
-                        try self.consumeLiteral("null", .null_literal);
-                    }
-                },
-                'I', 'N' => {
-                    if (self.dialect != .json5) {
-                        return self.fail(error.UnexpectedToken, self.byte_position - 1);
-                    }
-                    if (self.isKeyExpected()) {
-                        try self.consumeIdentifier(self.byte_position - 1);
-                    } else {
-                        try self.consumeNumber();
-                    }
-                },
-                else => {
-                    if (self.dialect == .json5 and self.isKeyExpected()) {
-                        try self.consumeIdentifier(self.byte_position - 1);
-                    } else {
-                        return self.fail(error.UnexpectedToken, self.byte_position - 1);
-                    }
-                },
+            if (self.pending) |token| {
+                self.pending = null;
+                return token;
             }
         }
+    }
 
+    fn run(self: *TokenReader) ParseError!void {
+        while (try self.next()) |_| {}
+    }
+
+    fn finish(self: *TokenReader) ParseError!void {
         self.failure_offset = self.byte_position;
-        if (self.structural_position != self.indexes.len) {
+        if (self.structural_position != self.indexCount()) {
             return self.fail(error.UnexpectedToken, self.byte_position);
         }
         if (self.depth.top > 0) {
@@ -653,12 +854,13 @@ const Parser = struct {
         if (!self.root_done) return self.fail(error.UnexpectedToken, self.byte_position);
     }
 
-    fn fail(self: *Parser, err: Error, offset: usize) Error {
+    fn fail(self: *TokenReader, err: Error, offset: usize) Error {
         self.failure_offset = offset;
+        self.failure = err;
         return err;
     }
 
-    fn skipIgnored(self: *Parser) ParseError!void {
+    fn skipIgnored(self: *TokenReader) ParseError!void {
         while (self.byte_position < self.input.len) {
             if (try self.skipWhitespace()) continue;
             if (self.dialect == .json) return;
@@ -723,7 +925,7 @@ const Parser = struct {
         }
     }
 
-    fn skipWhitespace(self: *Parser) ParseError!bool {
+    fn skipWhitespace(self: *TokenReader) ParseError!bool {
         if (self.byte_position >= self.input.len) return false;
         if (isWhitespace(self.input[self.byte_position])) {
             self.byte_position += 1;
@@ -745,18 +947,29 @@ const Parser = struct {
         return false;
     }
 
-    fn takeIndexedByte(self: *Parser) Error!u8 {
+    fn indexCount(self: *const TokenReader) usize {
+        if (self.view) |view| return view.count();
+        return self.indexes.len;
+    }
+
+    fn indexAt(self: *const TokenReader, position: usize) Error!usize {
+        if (self.view) |view| return view.localOffset(position);
+        if (position >= self.indexes.len) return error.InvalidStructuralIndex;
+        return @intCast(self.indexes[position]);
+    }
+
+    fn takeIndexedByte(self: *TokenReader) Error!u8 {
         if (self.byte_position >= self.input.len) {
             return self.fail(error.UnexpectedToken, self.byte_position);
         }
-        if (self.structural_position == self.indexes.len) {
+        if (self.structural_position == self.indexCount()) {
             return self.fail(
                 classifyUnindexed(self.input[self.byte_position]),
                 self.byte_position,
             );
         }
 
-        const indexed_offset: usize = @intCast(self.indexes[self.structural_position]);
+        const indexed_offset = try self.indexAt(self.structural_position);
         if (indexed_offset != self.byte_position) {
             return self.fail(
                 classifyUnindexed(self.input[self.byte_position]),
@@ -772,18 +985,15 @@ const Parser = struct {
         return self.input[indexed_offset];
     }
 
-    fn openContainer(self: *Parser, is_array: bool) ParseError!void {
+    fn openContainer(self: *TokenReader, is_array: bool) ParseError!void {
         const offset = self.byte_position - 1;
         if (self.depth.top >= max_depth) {
             return self.fail(error.DepthExceeded, offset);
         }
         try self.beginValue();
 
-        const tape_index = try self.emit(
-            if (is_array) .array_start else .object_start,
-            0,
-            offset,
-        );
+        const kind = if (is_array) TapeKind.array_start else TapeKind.object_start;
+        const tape_index = try self.emit(kind, 0, offset);
         try self.depth.push(.{
             .is_array = is_array,
             .tape_index = @intCast(tape_index),
@@ -791,9 +1001,10 @@ const Parser = struct {
             .count = 0,
         });
         self.expect = if (is_array) .value_after_open else .key_after_open;
+        try self.setPending(kind, 0, offset, self.input[offset .. offset + 1]);
     }
 
-    fn closeContainer(self: *Parser, is_array: bool) ParseError!void {
+    fn closeContainer(self: *TokenReader, is_array: bool) ParseError!void {
         const close_offset = self.byte_position - 1;
         if (self.depth.top == 0) {
             if (self.root_done) {
@@ -843,11 +1054,9 @@ const Parser = struct {
         if (self.tape) |tape| {
             tape.items[open_index].payload = try self.encodeTapePayload(entry.count);
         }
-        _ = try self.emit(
-            if (is_array) .array_end else .object_end,
-            try self.encodeTapePayload(open_index),
-            close_offset,
-        );
+        const kind = if (is_array) TapeKind.array_end else TapeKind.object_end;
+        const backlink = try self.encodeTapePayload(open_index);
+        _ = try self.emit(kind, backlink, close_offset);
         _ = self.depth.pop();
 
         if (self.depth.top == 0) {
@@ -855,9 +1064,14 @@ const Parser = struct {
         } else {
             self.expect = .after_value;
         }
+        try self.setPending(
+            kind,
+            backlink,
+            close_offset,
+            self.input[close_offset .. close_offset + 1],
+        );
     }
-
-    fn consumeColon(self: *Parser) Error!void {
+    fn consumeColon(self: *TokenReader) Error!void {
         const offset = self.byte_position - 1;
         if (self.depth.top == 0) return self.fail(error.UnexpectedToken, offset);
         if (self.depth.peekConst().is_array) {
@@ -869,7 +1083,7 @@ const Parser = struct {
         self.expect = .value_after_colon;
     }
 
-    fn consumeComma(self: *Parser) Error!void {
+    fn consumeComma(self: *TokenReader) Error!void {
         const offset = self.byte_position - 1;
         if (self.depth.top == 0) return self.fail(error.UnexpectedToken, offset);
         if (self.expect != .after_value) {
@@ -881,7 +1095,7 @@ const Parser = struct {
             .key_after_comma;
     }
 
-    fn consumeString(self: *Parser) ParseError!void {
+    fn consumeString(self: *TokenReader) ParseError!void {
         const quote_offset = self.byte_position - 1;
         const is_key = self.isKeyExpected();
         if (!is_key) try self.beginValue();
@@ -893,19 +1107,24 @@ const Parser = struct {
             &self.failure_offset,
         );
         self.byte_position = token.end_offset;
-        const payload = try self.encodeTapePayload(token.content_length);
+        const tape_payload = try self.encodeTapePayload(token.content_length);
+        const token_payload = self.encodeTokenPayload(token.content_length);
+        const raw_start = quote_offset + 1;
+        const raw = self.input[raw_start .. raw_start + token.content_length];
 
         if (is_key) {
-            _ = try self.emit(.key, payload, quote_offset);
+            _ = try self.emit(.key, tape_payload, quote_offset);
             self.expect = .colon;
+            try self.setPending(.key, token_payload, quote_offset, raw);
             return;
         }
 
-        _ = try self.emit(.string, payload, quote_offset);
+        _ = try self.emit(.string, tape_payload, quote_offset);
         self.completeScalarValue();
+        try self.setPending(.string, token_payload, quote_offset, raw);
     }
 
-    fn consumeNumber(self: *Parser) ParseError!void {
+    fn consumeNumber(self: *TokenReader) ParseError!void {
         const start_offset = self.byte_position - 1;
         try self.beginValue();
         self.byte_position = try validateNumber(
@@ -916,9 +1135,15 @@ const Parser = struct {
         );
         _ = try self.emit(.number, 0, start_offset);
         self.completeScalarValue();
+        try self.setPending(
+            .number,
+            0,
+            start_offset,
+            self.input[start_offset..self.byte_position],
+        );
     }
 
-    fn consumeIdentifier(self: *Parser, start_offset: usize) ParseError!void {
+    fn consumeIdentifier(self: *TokenReader, start_offset: usize) ParseError!void {
         if (!self.isKeyExpected()) {
             return self.fail(error.UnexpectedToken, start_offset);
         }
@@ -929,13 +1154,20 @@ const Parser = struct {
             &self.failure_offset,
         );
         self.byte_position = end_offset;
-        const payload = try self.encodeTapePayload(end_offset - start_offset);
-        _ = try self.emit(.key, payload, start_offset);
+        const tape_payload = try self.encodeTapePayload(end_offset - start_offset);
+        const token_payload = self.encodeTokenPayload(end_offset - start_offset);
+        _ = try self.emit(.key, tape_payload, start_offset);
         self.expect = .colon;
+        try self.setPending(
+            .key,
+            token_payload,
+            start_offset,
+            self.input[start_offset..end_offset],
+        );
     }
 
     fn consumeLiteral(
-        self: *Parser,
+        self: *TokenReader,
         literal: []const u8,
         kind: TapeKind,
     ) ParseError!void {
@@ -961,9 +1193,10 @@ const Parser = struct {
         self.byte_position = end_offset;
         _ = try self.emit(kind, 0, start_offset);
         self.completeScalarValue();
+        try self.setPending(kind, 0, start_offset, self.input[start_offset..end_offset]);
     }
 
-    fn beginValue(self: *Parser) Error!void {
+    fn beginValue(self: *TokenReader) Error!void {
         const offset = self.byte_position - 1;
         if (self.depth.top == 0) {
             if (self.root_started) return self.fail(error.RootNotSingular, offset);
@@ -987,11 +1220,11 @@ const Parser = struct {
         self.expect = .after_value;
     }
 
-    fn completeScalarValue(self: *Parser) void {
+    fn completeScalarValue(self: *TokenReader) void {
         if (self.depth.top == 0) self.root_done = true;
     }
 
-    fn isKeyExpected(self: *const Parser) bool {
+    fn isKeyExpected(self: *const TokenReader) bool {
         if (self.depth.top == 0) return false;
         if (self.depth.peekConst().is_array) return false;
         return switch (self.expect) {
@@ -1000,8 +1233,26 @@ const Parser = struct {
         };
     }
 
+    fn setPending(
+        self: *TokenReader,
+        kind: TapeKind,
+        payload: u24,
+        offset: usize,
+        raw: []const u8,
+    ) ParseError!void {
+        if (offset > std.math.maxInt(u32)) return error.TapeTooLarge;
+        self.pending = .{
+            .word = .{
+                .kind = @intFromEnum(kind),
+                .payload = payload,
+                .offset = @intCast(offset),
+            },
+            .raw = raw,
+        };
+    }
+
     fn encodeTapePayload(
-        self: *const Parser,
+        self: *const TokenReader,
         value: usize,
     ) error{TapeTooLarge}!u24 {
         if (self.tape == null) return 0;
@@ -1009,8 +1260,14 @@ const Parser = struct {
         return @intCast(value);
     }
 
+    fn encodeTokenPayload(self: *const TokenReader, value: usize) u24 {
+        _ = self;
+        if (value > std.math.maxInt(u24)) return 0;
+        return @intCast(value);
+    }
+
     fn emit(
-        self: *Parser,
+        self: *TokenReader,
         kind: TapeKind,
         payload: u24,
         offset: usize,
@@ -1044,6 +1301,29 @@ fn firstInvalidUtf8Byte(input: []const u8) ?usize {
     };
 }
 
+fn skipStringBody(
+    input: []const u8,
+    start: usize,
+    quote: u8,
+    dialect: Dialect,
+) usize {
+    std.debug.assert(start <= input.len);
+    const VLEN = simd.default_vector_len;
+    var index = start;
+    while (input.len - index >= VLEN) {
+        const block: simd.Vec(VLEN, u8) = input[index..][0..VLEN].*;
+        const forbidden = if (dialect == .json5)
+            simd.matchAny2(VLEN, block, '\n', '\r')
+        else
+            simd.matchRange(VLEN, block, 0, 0x1f);
+        const special = simd.matchAny2(VLEN, block, quote, '\\') | forbidden;
+        const advance: usize = @intCast(@ctz(special));
+        if (advance < VLEN) return index + advance;
+        index += VLEN;
+    }
+    return index;
+}
+
 fn validateString(
     input: []const u8,
     quote_offset: usize,
@@ -1067,6 +1347,8 @@ fn validateString(
     const content_start = quote_offset + 1;
     var index = content_start;
     while (index < input.len) {
+        index = skipStringBody(input, index, quote, dialect);
+        if (index == input.len) break;
         const byte = input[index];
         if (byte == quote) {
             const content = input[content_start..index];
@@ -2161,7 +2443,7 @@ test "TapeWord payload encoding never truncates u24 values" {
     const payload_max: usize = std.math.maxInt(u24);
     const payload_too_large = payload_max + 1;
 
-    const validating_parser = Parser{
+    const validating_parser = TokenReader{
         .input = &.{},
         .indexes = &.{},
         .dialect = .json,
@@ -2173,7 +2455,7 @@ test "TapeWord payload encoding never truncates u24 values" {
     );
 
     var tape: std.ArrayList(TapeWord) = .empty;
-    const building_parser = Parser{
+    const building_parser = TokenReader{
         .input = &.{},
         .indexes = &.{},
         .dialect = .json,
@@ -2593,4 +2875,123 @@ test "TapeCursor rejects malformed kinds order bounds counts and source ranges" 
     const number_document = Document{ .tape = number_tape[0..], .dialect = .json };
     var number_cursor = try number_document.root("0");
     try testing.expectError(error.TypeMismatch, number_cursor.containerCount());
+}
+
+test "TokenReader yields valid prefix before malformed suffix" {
+    const input = "[1,true,]";
+    var structural_index = try indexForTest(testing.allocator, input);
+    defer structural_index.deinit(testing.allocator);
+
+    const view = try IndexView.init(input, structural_index.slice(), 0);
+    var reader = try TokenReader.init(input, view, .json);
+
+    try testing.expectEqual(
+        TapeKind.array_start,
+        (try reader.next()).?.word.tapeKind(),
+    );
+    try testing.expectEqual(TapeKind.number, (try reader.next()).?.word.tapeKind());
+    try testing.expectEqual(
+        TapeKind.true_literal,
+        (try reader.next()).?.word.tapeKind(),
+    );
+    try testing.expectError(error.TrailingComma, reader.next());
+    try testing.expectEqual(
+        std.mem.indexOfScalar(u8, input, ']').?,
+        reader.failure_offset,
+    );
+}
+
+test "TokenReader retains an unexpected token failure" {
+    const input = "[,]";
+    var structural_index = try indexForTest(testing.allocator, input);
+    defer structural_index.deinit(testing.allocator);
+
+    const view = try IndexView.init(input, structural_index.slice(), 0);
+    var reader = try TokenReader.init(input, view, .json);
+
+    try testing.expectEqual(
+        TapeKind.array_start,
+        (try reader.next()).?.word.tapeKind(),
+    );
+    try testing.expectError(error.UnexpectedToken, reader.next());
+    try testing.expectError(error.UnexpectedToken, reader.next());
+}
+
+test "IndexView borrows and rebases checked global record offsets" {
+    const source = "xx[0]yy";
+    const input = source[2..5];
+    const global_offsets = [_]u32{ 2, 3, 4 };
+    const view = try IndexView.init(input, &global_offsets, 2);
+
+    try testing.expectEqual(
+        @intFromPtr(global_offsets[0..].ptr),
+        @intFromPtr(view.global_offsets.ptr),
+    );
+
+    var reader = try TokenReader.init(input, view, .json);
+    const open = (try reader.next()).?;
+    try testing.expectEqual(TapeKind.array_start, open.word.tapeKind());
+    try testing.expectEqual(@as(u32, 0), open.word.offset);
+    try testing.expectEqualStrings("[", open.raw);
+    try testing.expect(open.raw.ptr == input.ptr);
+
+    const number = (try reader.next()).?;
+    try testing.expectEqual(TapeKind.number, number.word.tapeKind());
+    try testing.expectEqualStrings("0", number.raw);
+    try testing.expect(number.raw.ptr == input.ptr + 1);
+
+    const close = (try reader.next()).?;
+    try testing.expectEqual(TapeKind.array_end, close.word.tapeKind());
+    try testing.expectEqual(@as(u32, 2), close.word.offset);
+    try testing.expect((try reader.next()) == null);
+
+    var document = try buildTapeView(testing.allocator, input, view, .json);
+    defer document.deinit(testing.allocator);
+    try testing.expectEqual(@as(u24, 1), document.tape[0].payload);
+    try testing.expectEqual(@as(u24, 0), document.tape[2].payload);
+    try testing.expect((try validateView(input, view, .json)) == null);
+}
+
+test "IndexView rejects record underflow range and ordering errors" {
+    const input = "[0]";
+    const underflow = [_]u32{1};
+    const endpoint = [_]u32{5};
+    const unsorted = [_]u32{ 3, 2 };
+
+    try testing.expectError(
+        error.InvalidStructuralIndex,
+        IndexView.init(input, &underflow, 2),
+    );
+    try testing.expectError(
+        error.InvalidStructuralIndex,
+        IndexView.init(input, &endpoint, 2),
+    );
+    try testing.expectError(
+        error.InvalidStructuralIndex,
+        IndexView.init(input, &unsorted, 2),
+    );
+}
+
+test "TokenReader reset reuses depth storage across documents" {
+    const first_input = "[0]";
+    const second_input = "{\"key\":1}";
+    var first_index = try indexForTest(testing.allocator, first_input);
+    defer first_index.deinit(testing.allocator);
+    var second_index = try indexForTest(testing.allocator, second_input);
+    defer second_index.deinit(testing.allocator);
+
+    const first_view = try IndexView.init(first_input, first_index.slice(), 0);
+    const second_view = try IndexView.init(second_input, second_index.slice(), 0);
+    var reader = try TokenReader.init(first_input, first_view, .json);
+
+    _ = try reader.next();
+    try testing.expectEqual(@as(usize, 1), reader.depth.top);
+    try reader.reset(second_input, second_view, .json);
+    try testing.expectEqual(@as(usize, 0), reader.depth.top);
+
+    try testing.expectEqual(TapeKind.object_start, (try reader.next()).?.word.tapeKind());
+    try testing.expectEqual(TapeKind.key, (try reader.next()).?.word.tapeKind());
+    try testing.expectEqual(TapeKind.number, (try reader.next()).?.word.tapeKind());
+    try testing.expectEqual(TapeKind.object_end, (try reader.next()).?.word.tapeKind());
+    try testing.expect((try reader.next()) == null);
 }

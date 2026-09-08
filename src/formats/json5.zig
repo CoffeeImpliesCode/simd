@@ -3,8 +3,38 @@ const simd = @import("../core/simd.zig");
 const stage1 = @import("../core/stage1.zig");
 const stream = @import("../core/stream.zig");
 const stage2 = @import("../core/stage2.zig");
+const ondemand = @import("../core/ondemand.zig");
+const lexical = @import("../core/json_lexical.zig");
 const testing = std.testing;
 const sentinel_count: usize = 3;
+
+const IndexSink = struct {
+    indexes: []u32,
+    count: usize = 0,
+
+    pub fn appendOffset(self: *@This(), offset: usize) lexical.Error!void {
+        if (offset > std.math.maxInt(u32)) return error.InputTooLarge;
+        if (self.count >= self.indexes.len) return error.CapacityExceeded;
+        self.indexes[self.count] = @intCast(offset);
+        self.count += 1;
+    }
+
+    pub fn appendMask(
+        self: *@This(),
+        comptime T: type,
+        mask: T,
+        base_offset: usize,
+    ) lexical.Error!void {
+        const output = self.indexes[self.count..];
+        const written = try simd.extractBitIndexesChecked(
+            T,
+            mask,
+            base_offset,
+            output,
+        );
+        self.count += written;
+    }
+};
 
 /// Initializes a chunk-fed JSON5 Stage 1 indexer in document mode.
 pub fn initStreamIndexer(
@@ -16,6 +46,15 @@ pub fn initStreamIndexer(
         chunk_len,
         stream.Options{ .dialect = .json5, .mode = .document },
     );
+}
+/// Initializes a lazy JSON5 document over parser-owned indexes.
+pub fn initOnDemandDocument(
+    parser: *ondemand.Parser,
+    input: []const u8,
+) !ondemand.Document {
+    const indexes = try parser.prepareDocument(input);
+    const token_count = try indexJson5Into(simd.default_vector_len, indexes, input);
+    return parser.completeDialectDocument(input, token_count, .json5);
 }
 
 pub fn indexJson5(
@@ -51,228 +90,48 @@ pub fn validateJson5(
     return stage2.validate(input, &structural_index, .json5);
 }
 
+pub fn indexJson5Into(
+    comptime VLEN: usize,
+    indexes: []u32,
+    input: []const u8,
+) lexical.Error!usize {
+    if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
+
+    var sink = IndexSink{ .indexes = indexes };
+    var state: lexical.State = .{};
+    lexical.feed(VLEN, .json5, &state, input, 0, &sink) catch |err| switch (err) {
+        error.NonContiguousInput => unreachable,
+        error.CapacityExceeded => return error.CapacityExceeded,
+        error.InputTooLarge => return error.InputTooLarge,
+    };
+    lexical.finish(.json5, &state, &sink) catch |err| switch (err) {
+        error.NonContiguousInput => unreachable,
+        error.CapacityExceeded => return error.CapacityExceeded,
+        error.InputTooLarge => return error.InputTooLarge,
+    };
+    return sink.count;
+}
+
 pub fn indexJson5Impl(
     comptime VLEN: usize,
     allocator: std.mem.Allocator,
     input: []const u8,
 ) !stage1.StructuralIndex {
-    const Mask = simd.Mask(VLEN);
-    const Shift = std.math.Log2Int(Mask);
-
     if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
     var result = try stage1.StructuralIndex.init(allocator, input.len);
     errdefer result.deinit(allocator);
 
-    var in_string = false;
-    var string_quote: u8 = 0;
-    var in_single_comment = false;
-    var in_multi_comment = false;
-    var previous_chunk_ends_in_backslash = false;
-    var previous_backslash_run_odd = false;
-    var skip_after_multi_comment = false;
-    var previous_atom_candidate = false;
-    var windows = simd.windows(u8, VLEN, input, ' ');
-    var chunk_offset: usize = 0;
-
-    while (windows.next()) |chunk| : (chunk_offset += VLEN) {
-        const chunk_bytes: [VLEN]u8 = chunk;
-        const chunk_length = @min(@as(usize, VLEN), input.len -|
-            @min(chunk_offset, input.len));
-        const valid_mask = validByteMask(VLEN, chunk_length);
-        const top_bit: Mask = @as(Mask, 1) <<
-            @as(Shift, @intCast(VLEN - 1));
-        const double_quote_mask: Mask =
-            simd.matchByte(VLEN, chunk, '"') & valid_mask;
-        const single_quote_mask: Mask =
-            simd.matchByte(VLEN, chunk, '\'') & valid_mask;
-        const backslash_mask: Mask =
-            simd.matchByte(VLEN, chunk, '\\') & valid_mask;
-        const backslash_result = simd.computeBackslashRuns(
-            simd.Mask(VLEN),
-            backslash_mask,
-            previous_chunk_ends_in_backslash,
-        );
-        var odd_backslash_ends = backslash_result.odd_length_ends & valid_mask;
-        if (previous_chunk_ends_in_backslash) {
-            if ((backslash_mask & @as(Mask, 1)) == 0) {
-                if (previous_backslash_run_odd) {
-                    odd_backslash_ends |= 1;
-                } else {
-                    odd_backslash_ends &= ~@as(Mask, 1);
-                }
-            } else if (previous_backslash_run_odd) {
-                odd_backslash_ends ^= leadingRunEndMask(
-                    VLEN,
-                    backslash_mask,
-                    chunk_length,
-                );
-            }
-        }
-        const unescaped_double_quote_mask =
-            double_quote_mask & ~odd_backslash_ends;
-        const unescaped_single_quote_mask =
-            single_quote_mask & ~odd_backslash_ends;
-        const structural_mask: Mask = (simd.matchAny4(
-            VLEN,
-            chunk,
-            '{',
-            '}',
-            '[',
-            ']',
-        ) | simd.matchAny2(VLEN, chunk, ':', ',')) & valid_mask;
-        const identifier_mask: Mask = (simd.matchRange(
-            VLEN,
-            chunk,
-            'a',
-            'z',
-        ) | simd.matchRange(VLEN, chunk, 'A', 'Z') |
-            simd.matchAny2(VLEN, chunk, '_', '$')) & valid_mask;
-        const atom_mask: Mask = (simd.matchAny2(VLEN, chunk, '-', '+') |
-            simd.matchByte(VLEN, chunk, '.') |
-            simd.matchRange(VLEN, chunk, '0', '9') |
-            identifier_mask) & valid_mask;
-        var trailing_backslash_parity = previous_backslash_run_odd;
-
-        var visible_mask: Mask = 0;
-        var byte_offset: usize = 0;
-        while (byte_offset < chunk_length) : (byte_offset += 1) {
-            const byte = chunk_bytes[byte_offset];
-            const bit: Mask = @as(Mask, 1) <<
-                @as(Shift, @intCast(byte_offset));
-            const absolute_offset = chunk_offset + byte_offset;
-            if (byte == '\\') {
-                trailing_backslash_parity = !trailing_backslash_parity;
-            } else {
-                trailing_backslash_parity = false;
-            }
-
-            if (skip_after_multi_comment) {
-                skip_after_multi_comment = false;
-                continue;
-            }
-
-            if (in_string) {
-                const quote_mask = if (string_quote == '\'')
-                    unescaped_single_quote_mask
-                else
-                    unescaped_double_quote_mask;
-                if ((quote_mask & bit) != 0) {
-                    in_string = false;
-                    string_quote = 0;
-                    previous_atom_candidate = false;
-                }
-                continue;
-            }
-
-            if (in_single_comment) {
-                if (json5LineTerminatorWidth(input, absolute_offset) != null) {
-                    in_single_comment = false;
-                    previous_atom_candidate = false;
-                }
-                continue;
-            }
-
-            if (in_multi_comment) {
-                if (byte == '*' and absolute_offset + 1 < input.len and
-                    input[absolute_offset + 1] == '/')
-                {
-                    in_multi_comment = false;
-                    previous_atom_candidate = false;
-                    skip_after_multi_comment = true;
-                }
-                continue;
-            }
-
-            if ((unescaped_double_quote_mask & bit) != 0 or
-                (unescaped_single_quote_mask & bit) != 0)
-            {
-                in_string = true;
-                string_quote = byte;
-                previous_atom_candidate = false;
-                continue;
-            }
-
-            if (byte == '/' and absolute_offset + 1 < input.len) {
-                const next_byte = input[absolute_offset + 1];
-                if (next_byte == '/') {
-                    in_single_comment = true;
-                    previous_atom_candidate = false;
-                    continue;
-                }
-                if (next_byte == '*') {
-                    in_multi_comment = true;
-                    previous_atom_candidate = false;
-                    continue;
-                }
-            }
-
-            const is_structural = (structural_mask & bit) != 0;
-            if (is_structural) {
-                visible_mask |= bit;
-                previous_atom_candidate = false;
-                continue;
-            }
-
-            const is_atom_candidate = (atom_mask & bit) != 0 or isJson5AtomByte(
-                byte,
-                previous_atom_candidate,
-                input,
-                absolute_offset,
-            );
-            if (is_atom_candidate) {
-                if (!previous_atom_candidate) {
-                    visible_mask |= bit;
-                }
-                previous_atom_candidate = true;
-                continue;
-            }
-
-            previous_atom_candidate = false;
-        }
-
-        var indexes: [VLEN]u32 = undefined;
-        const index_count = simd.extractBitIndexes(
-            simd.Mask(VLEN),
-            visible_mask,
-            chunk_offset,
-            &indexes,
-        );
-        for (indexes[0..index_count]) |index| {
-            result.indexes[result.count] = index;
-            result.count += 1;
-        }
-
-        previous_chunk_ends_in_backslash = chunk_length == VLEN and
-            (backslash_mask & top_bit) != 0;
-        previous_backslash_run_odd = trailing_backslash_parity;
-    }
+    result.count = indexJson5Into(
+        VLEN,
+        result.indexes[0 .. result.indexes.len - sentinel_count],
+        input,
+    ) catch |err| switch (err) {
+        error.CapacityExceeded => unreachable,
+        error.NonContiguousInput => unreachable,
+        error.InputTooLarge => return error.InputTooLarge,
+    };
     try result.finish(input.len);
-
     return result;
-}
-
-fn validByteMask(comptime VLEN: usize, valid_count: usize) simd.Mask(VLEN) {
-    const Mask = simd.Mask(VLEN);
-    const Shift = std.math.Log2Int(Mask);
-
-    if (valid_count == VLEN) return ~@as(Mask, 0);
-    if (valid_count == 0) return 0;
-    return (@as(Mask, 1) << @as(Shift, @intCast(valid_count))) - 1;
-}
-
-fn leadingRunEndMask(
-    comptime VLEN: usize,
-    backslashes: simd.Mask(VLEN),
-    valid_count: usize,
-) simd.Mask(VLEN) {
-    const Mask = simd.Mask(VLEN);
-    const Shift = std.math.Log2Int(Mask);
-
-    const non_backslashes = ~backslashes | ~validByteMask(VLEN, valid_count);
-    if (non_backslashes == 0) return 0;
-    const run_length: usize = @intCast(@ctz(non_backslashes));
-    if (run_length >= valid_count) return 0;
-    return @as(Mask, 1) << @as(Shift, @intCast(run_length));
 }
 
 fn isJson5AtomByte(
@@ -349,7 +208,7 @@ fn scalarIndexJson5(
     var string_quote: u8 = 0;
     var in_single_comment = false;
     var in_multi_comment = false;
-    var skip_after_multi_comment = false;
+    var skip_comment_byte = false;
     var previous_atom_candidate = false;
     var backslash_run_length: usize = 0;
 
@@ -357,8 +216,8 @@ fn scalarIndexJson5(
         const unescaped_double_quote = byte == '"' and backslash_run_length % 2 == 0;
         const unescaped_single_quote = byte == '\'' and backslash_run_length % 2 == 0;
 
-        if (skip_after_multi_comment) {
-            skip_after_multi_comment = false;
+        if (skip_comment_byte) {
+            skip_comment_byte = false;
         } else if (in_string) {
             const closes_string = if (string_quote == '\'')
                 unescaped_single_quote
@@ -380,7 +239,7 @@ fn scalarIndexJson5(
             {
                 in_multi_comment = false;
                 previous_atom_candidate = false;
-                skip_after_multi_comment = true;
+                skip_comment_byte = true;
             }
         } else if (unescaped_double_quote or unescaped_single_quote) {
             in_string = true;
@@ -393,6 +252,7 @@ fn scalarIndexJson5(
                 previous_atom_candidate = false;
             } else if (next_byte == '*') {
                 in_multi_comment = true;
+                skip_comment_byte = true;
                 previous_atom_candidate = false;
             } else {
                 previous_atom_candidate = false;
@@ -468,7 +328,7 @@ test "indexJson5 implementations match scalar around vector boundaries" {
         0, 1, 14, 15, 16, 17, 30, 31, 32, 33, 62, 63, 64, 65, 66,
     };
 
-    inline for ([_]usize{ 16, 32, 64 }) |VLEN| {
+    inline for ([_]usize{ 4, 5, 7, 16, 32, 64 }) |VLEN| {
         for (boundary_lengths) |length| {
             var boundary_input: [66]u8 = @splat(' ');
             if (length > 0) {
@@ -609,6 +469,20 @@ test "indexJson5 excludes comments and comment markers in single strings" {
     defer index.deinit(testing.allocator);
 
     try testing.expectEqualSlices(u32, &expected, index.slice());
+}
+
+test "indexJson5 tracks opposite quote delimiters inside strings" {
+    const input = "{\"text\":\"a'b\", next:1}";
+    inline for ([_]usize{ 4, 5, 7, 16, 32, 64 }) |VLEN| {
+        try expectJson5ImplMatchesScalar(VLEN, input);
+    }
+}
+
+test "indexJson5 keeps adjacent escaped and Unicode atom bytes together" {
+    const input = "{foo\\u004bar:1, éfoo:2}";
+    inline for ([_]usize{ 4, 5, 7, 16, 32, 64 }) |VLEN| {
+        try expectJson5ImplMatchesScalar(VLEN, input);
+    }
 }
 
 test "indexJson5 carries quote and comment state across SIMD chunks" {
@@ -753,7 +627,7 @@ test "indexJson5 matches scalar for adversarial lexical forms" {
         "['escaped \\' quote',\"double // /*\",-0X2b,]",
     };
 
-    inline for ([_]usize{ 16, 32, 64 }) |VLEN| {
+    inline for ([_]usize{ 4, 5, 7, 16, 32, 64 }) |VLEN| {
         for (cases) |input| {
             try expectJson5ImplMatchesScalar(VLEN, input);
         }
@@ -857,7 +731,7 @@ test "indexJson5 matches scalar for every byte value" {
     for (0..input.len) |byte_offset| {
         input[byte_offset] = @as(u8, @truncate(byte_offset));
     }
-    inline for ([_]usize{ 16, 32, 64 }) |VLEN| {
+    inline for ([_]usize{ 4, 5, 7, 16, 32, 64 }) |VLEN| {
         try expectJson5ImplMatchesScalar(VLEN, &input);
     }
 }
@@ -999,4 +873,21 @@ test "JSON5 stream terminates comments at split Unicode separators" {
             try expectJson5StreamIndexEqual(&expected, &actual);
         }
     }
+}
+
+test "JSON5 comment delimiters cannot overlap" {
+    const input = "/*/1";
+    var scalar = try scalarIndexJson5(testing.allocator, input);
+    defer scalar.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), scalar.count);
+    inline for (.{ 4, 5, 7, 16, 32, 64 }) |width| {
+        try expectJson5ImplMatchesScalar(width, input);
+    }
+    var indexer = try initStreamIndexer(testing.allocator, 1);
+    defer indexer.deinit();
+    for (0..input.len) |offset| try indexer.feed(input[offset..][0..1]);
+    try indexer.finish();
+    var streamed = indexer.take();
+    defer streamed.deinit(testing.allocator);
+    try expectJson5StreamIndexEqual(&scalar, &streamed);
 }

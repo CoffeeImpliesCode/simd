@@ -1,6 +1,7 @@
 const std = @import("std");
 const lib = @import("simd_lib");
 const checking = @import("checking.zig");
+const resident_contract = @import("resident_contract_test.zig");
 const testing = std.testing;
 
 const vector_len = lib.default_vector_len;
@@ -21,6 +22,7 @@ test "refAllDecls" {
     testing.refAllDecls(lib.formats.markdown);
     testing.refAllDecls(lib.formats.xml);
     testing.refAllDecls(lib.formats.yaml);
+    testing.refAllDecls(resident_contract);
 }
 
 test "core: prefixXor matches mathematical parity" {
