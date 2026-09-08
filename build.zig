@@ -54,6 +54,19 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     lib_test_mod.addOptions("build_options", build_options);
+    const library_test_mod = b.createModule(.{
+        .root_source_file = b.path("library_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    library_test_mod.addOptions("build_options", build_options);
+
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bench_mod.addOptions("build_options", build_options);
 
     const fuzz_test_mod = b.createModule(.{
         .root_source_file = b.path("test/fuzz_test.zig"),
@@ -137,29 +150,40 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
-    // Creates a step for unit testing. This only builds the test executable
-    // but does not run it.
+    // Creates test executables for the public root, source-local library
+    // declarations, executable, and deterministic fuzz roots.
+    const library_unit_tests = b.addTest(.{
+        .root_module = library_test_mod,
+    });
+    const run_library_unit_tests = b.addRunArtifact(library_unit_tests);
+
     const lib_unit_tests = b.addTest(.{
         .root_module = lib_test_mod,
     });
-
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 
     const exe_unit_tests = b.addTest(.{
         .root_module = exe_mod,
     });
-
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 
     const smith_fuzz_tests = b.addTest(.{
         .root_module = fuzz_test_mod,
     });
-
     const run_smith_fuzz_tests = b.addRunArtifact(smith_fuzz_tests);
     const corpus_tests = b.addTest(.{
         .root_module = corpus_test_mod,
     });
     const run_corpus_tests = b.addRunArtifact(corpus_tests);
+
+    const bench_exe = b.addExecutable(.{
+        .name = "simd-bench",
+        .root_module = bench_mod,
+    });
+    const bench_cmd = b.addRunArtifact(bench_exe);
+    if (b.args) |args| {
+        bench_cmd.addArgs(args);
+    }
 
     const corpus_step = b.step("corpus", "Run offline corpus catalogs");
     corpus_step.dependOn(&run_corpus_tests.step);
@@ -167,10 +191,14 @@ pub fn build(b: *std.Build) void {
     const fuzz_step = b.step("fuzz", "Run deterministic Smith fuzz tests");
     fuzz_step.dependOn(&run_smith_fuzz_tests.step);
 
+    const bench_step = b.step("bench", "Run deterministic parser benchmarks");
+    bench_step.dependOn(&bench_cmd.step);
+
     // Similar to creating the run step earlier, this exposes a `test` step to
     // the `zig build --help` menu, providing a way for the user to request
     // running the unit tests.
     const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_library_unit_tests.step);
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_exe_unit_tests.step);
     test_step.dependOn(&run_smith_fuzz_tests.step);
