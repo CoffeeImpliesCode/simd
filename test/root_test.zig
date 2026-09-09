@@ -324,6 +324,75 @@ test "public Stage 2 JSONL corpus exposes records and global diagnostics" {
     );
 }
 
+test "public Stage 2 rejects a mutated index view before allocation" {
+    const input = "[0]";
+    var offsets = [_]u32{ 0, 1, 2 };
+    const view = try lib.stage2.IndexView.init(input, &offsets, 0);
+    offsets[1] = @intCast(input.len);
+
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+
+    try testing.expectError(
+        error.InvalidStructuralIndex,
+        lib.stage2.buildTapeView(failing.allocator(), input, view, .json),
+    );
+    try testing.expectError(
+        error.InvalidStructuralIndex,
+        lib.stage2.validateView(input, view, .json),
+    );
+}
+
+test "public JSONL tapes keep nested links local through final record" {
+    const input = "\n{\"a\":[1,{\"b\":[]}]}\r\n[[2],{\"c\":3}]";
+    var document = try lib.formats.jsonl.buildJsonlTape(testing.allocator, input);
+    defer document.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 2), document.records.len);
+    try testing.expectEqualStrings(
+        "{\"a\":[1,{\"b\":[]}]}\r",
+        document.records[0].source,
+    );
+    try testing.expectEqualStrings("[[2],{\"c\":3}]", document.records[1].source);
+    try testing.expectEqual(input.len, document.records[1].source_end);
+
+    var first = try document.cursor(0);
+    var second = try document.cursor(1);
+    try testing.expectEqual(
+        lib.stage2.TapeKind.object_start,
+        (try first.peek()).tapeKind(),
+    );
+    try testing.expectEqual(
+        lib.stage2.TapeKind.array_start,
+        (try second.peek()).tapeKind(),
+    );
+    try first.advance();
+    try second.advance();
+    try testing.expectEqual(lib.stage2.TapeKind.key, (try first.peek()).tapeKind());
+    try testing.expectEqual(
+        lib.stage2.TapeKind.array_start,
+        (try second.peek()).tapeKind(),
+    );
+
+    for (document.records) |*record_value| {
+        var cursor = try record_value.root();
+        while (cursor.position() < record_value.document.tape.len) {
+            const word = try cursor.peek();
+            switch (word.tapeKind()) {
+                .object_end, .array_end => {
+                    const end_position = cursor.position();
+                    const start = try cursor.matchingStart();
+                    try testing.expect(start.position() < end_position);
+                    try testing.expect(start.position() < record_value.document.tape.len);
+                },
+                else => {},
+            }
+            try cursor.advance();
+        }
+    }
+}
+
 test "public Stage 2 Markdown corpus preserves token parity and local limits" {
     const input = @embedFile("corpus/markdown/document.md");
     var index = try lib.formats.markdown.indexMarkdown(testing.allocator, input);
@@ -1453,6 +1522,23 @@ fn checkPublicJsonStreamAllocationFailure(allocator: std.mem.Allocator) !void {
     try stream.finish();
     var index = stream.take();
     defer index.deinit(allocator);
+}
+
+fn checkPublicJsonlAllocationFailure(allocator: std.mem.Allocator) !void {
+    const input =
+        "{\"a\":[1,{\"b\":[]}]}\n" ++
+        "[[2],{\"c\":3}]\n" ++
+        "{\"d\":4}";
+    var document = try lib.formats.jsonl.buildJsonlTape(allocator, input);
+    defer document.deinit(allocator);
+}
+
+test "public JSONL tape construction handles partial allocation failure" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        checkPublicJsonlAllocationFailure,
+        .{},
+    );
 }
 
 test "public JSON index, tape, and stream operations propagate allocation failure" {

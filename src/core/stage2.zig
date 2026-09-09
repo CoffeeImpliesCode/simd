@@ -520,18 +520,23 @@ pub fn buildTapeView(
     view: IndexView,
     dialect: Dialect,
 ) BuildError!Document {
-    try view.validateInput(input);
-    const bounded_input = input[0..@intCast(view.limit)];
-    const tape_capacity = if (dialect == .json) view.count() else bounded_input.len;
+    // SAFETY: reset validates before slicing and initializes every live reader field.
+    var reader: TokenReader = undefined;
+    try reader.reset(input, view, dialect);
+    const bounded_input = reader.input;
+    const tape_capacity = try tapeCapacity(bounded_input, &view, dialect);
     var tape = try std.ArrayList(TapeWord).initCapacity(allocator, tape_capacity);
     errdefer tape.deinit(allocator);
 
-    var reader = try TokenReader.init(bounded_input, view, dialect);
     reader.tape = &tape;
     try reader.run();
 
+    const owned_tape = if (dialect == .json)
+        tape.toOwnedSliceAssert()
+    else
+        try tape.toOwnedSlice(allocator);
     return .{
-        .tape = try tape.toOwnedSlice(allocator),
+        .tape = owned_tape,
         .dialect = dialect,
     };
 }
@@ -542,15 +547,53 @@ pub fn validateView(
     view: IndexView,
     dialect: Dialect,
 ) ValidationError!?Diagnostic {
-    try view.validateInput(input);
-    const bounded_input = input[0..@intCast(view.limit)];
-    var reader = try TokenReader.init(bounded_input, view, dialect);
+    // SAFETY: reset validates before slicing and initializes every live reader field.
+    var reader: TokenReader = undefined;
+    try reader.reset(input, view, dialect);
     reader.run() catch |err| {
         if (err == error.TapeTooLarge) return error.TapeTooLarge;
         if (err == error.InvalidStructuralIndex) return error.InvalidStructuralIndex;
-        return diagnosticAt(bounded_input, @errorCast(err), reader.failure_offset);
+        return diagnosticAt(reader.input, @errorCast(err), reader.failure_offset);
     };
     return null;
+}
+
+/// Returns an upper bound for words emitted by `TokenReader`.
+///
+/// Strict JSON indexes include every opening quote, while dialect indexes
+/// deliberately omit quotes and only include structural bytes and atom starts.
+/// Colons and commas never emit words. Counting raw dialect quote bytes
+/// overestimates escaped and closing quotes, and the input-length clamp is
+/// always safe because each emitted word consumes at least one source byte.
+fn tapeCapacity(
+    input: []const u8,
+    view: *const IndexView,
+    dialect: Dialect,
+) BuildError!usize {
+    var capacity: usize = 0;
+    for (0..view.count()) |position| {
+        const local_offset = try view.localOffset(position);
+        const byte = input[local_offset];
+        if (byte == ':' or byte == ',') continue;
+        capacity = std.math.add(usize, capacity, 1) catch {
+            return input.len;
+        };
+    }
+
+    if (dialect != .json) {
+        for (input) |byte| {
+            const is_quote = if (dialect == .json5)
+                byte == '"' or byte == '\''
+            else
+                byte == '"';
+            if (!is_quote) continue;
+            capacity = std.math.add(usize, capacity, 1) catch {
+                return input.len;
+            };
+        }
+    }
+
+    return @min(capacity, input.len);
 }
 
 fn validateStructuralIndex(
@@ -2969,6 +3012,23 @@ test "IndexView rejects record underflow range and ordering errors" {
     try testing.expectError(
         error.InvalidStructuralIndex,
         IndexView.init(input, &unsorted, 2),
+    );
+}
+
+test "buildTapeView rejects externally inconsistent strict offsets" {
+    const input = "[0] ";
+    const missing = [_]u32{ 0, 2 };
+    const extra = [_]u32{ 0, 1, 2, 3 };
+    const missing_view = try IndexView.init(input, &missing, 0);
+    const extra_view = try IndexView.init(input, &extra, 0);
+
+    try testing.expectError(
+        error.UnexpectedToken,
+        buildTapeView(testing.allocator, input, missing_view, .json),
+    );
+    try testing.expectError(
+        error.UnexpectedToken,
+        buildTapeView(testing.allocator, input, extra_view, .json),
     );
 }
 
