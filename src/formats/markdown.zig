@@ -56,26 +56,55 @@ const MarkdownIndexSink = struct {
     }
 };
 
+const markdown_tape_capacity_initial: usize = 4096;
+const MarkdownTapeSinkError = std.mem.Allocator.Error || error{TapeTooLarge};
+
 const MarkdownTapeSink = struct {
-    tape: []MarkdownTapeWord,
-    count: *usize,
+    allocator: std.mem.Allocator,
+    tape: *std.ArrayList(MarkdownTapeWord),
     input: []const u8,
-    span_too_large: bool = false,
+    capacity_max: usize,
+    failure: ?MarkdownTapeSinkError = null,
 
     fn append(self: *@This(), offset: usize, kind: MarkdownTokenKind) void {
-        if (self.span_too_large) return;
-        assert(self.count.* < self.tape.len);
+        if (self.failure != null) return;
         const length = markdownMarkerLength(self.input, offset, kind);
         if (length > std.math.maxInt(u24)) {
-            self.span_too_large = true;
+            self.failure = error.TapeTooLarge;
             return;
         }
-        self.tape[self.count.*] = .{
+        if (self.tape.items.len == self.tape.capacity) {
+            if (self.tape.capacity == self.capacity_max) {
+                self.failure = error.TapeTooLarge;
+                return;
+            }
+            self.grow() catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+        self.tape.appendAssumeCapacity(.{
             .kind = @intFromEnum(kind),
             .payload = @intCast(length),
             .offset = @intCast(offset),
-        };
-        self.count.* += 1;
+        });
+    }
+
+    fn grow(self: *@This()) std.mem.Allocator.Error!void {
+        assert(self.tape.items.len == self.tape.capacity);
+        assert(self.tape.capacity < self.capacity_max);
+        const doubled_capacity = std.math.mul(
+            usize,
+            self.tape.capacity,
+            2,
+        ) catch self.capacity_max;
+        const new_capacity = @min(
+            self.capacity_max,
+            @max(markdown_tape_capacity_initial, doubled_capacity),
+        );
+        assert(new_capacity > self.tape.capacity);
+        try self.tape.ensureTotalCapacityPrecise(self.allocator, new_capacity);
+        assert(self.tape.capacity == new_capacity);
     }
 };
 
@@ -1000,7 +1029,7 @@ fn validateMarkdownTape(
     try sink.finish();
 }
 
-/// Builds a validated tape directly from the trusted marker scanner.
+/// Builds a validated tape in one pass through the trusted marker scanner.
 pub fn buildMarkdownTape(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -1008,17 +1037,17 @@ pub fn buildMarkdownTape(
     if (input.len > std.math.maxInt(u32)) {
         return error.TapeTooLarge;
     }
-    const tape = try allocator.alloc(MarkdownTapeWord, input.len);
-    errdefer allocator.free(tape);
-    var count: usize = 0;
+    var tape: std.ArrayList(MarkdownTapeWord) = .empty;
+    errdefer tape.deinit(allocator);
     var sink = MarkdownTapeSink{
-        .tape = tape,
-        .count = &count,
+        .allocator = allocator,
+        .tape = &tape,
         .input = input,
+        .capacity_max = input.len,
     };
     scanMarkdown(simd.default_vector_len, input, &sink);
-    if (sink.span_too_large) return error.TapeTooLarge;
-    const owned_tape = try allocator.realloc(tape, count);
+    if (sink.failure) |err| return err;
+    const owned_tape = try tape.toOwnedSlice(allocator);
     return .{
         .tape = owned_tape,
         .source = input,
@@ -2225,6 +2254,37 @@ test "Markdown Stage2 accepts empty input and unclosed fences" {
     try testing.expectEqual(@as(usize, 1), document.tape.len);
     try testing.expectEqual(MarkdownTokenKind.code_fence, document.tape[0].tapeKind());
     try testing.expectEqual(@as(u32, 0), document.tape[0].offset);
+}
+
+fn checkMarkdownTapeGrowthAllocationFailure(allocator: std.mem.Allocator) !void {
+    var input: [4101]u8 = undefined;
+    for (input[0..4096], 0..) |*character, offset| {
+        character.* = switch (offset % 4) {
+            0 => '[',
+            1 => ']',
+            2 => '(',
+            3 => ')',
+            else => unreachable,
+        };
+    }
+    input[4096..].* = .{ '\\', '[', 0xc3, 0xa9, ']' };
+
+    var document = try buildMarkdownTape(allocator, &input);
+    defer document.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 4098), document.tape.len);
+    try testing.expectEqual(MarkdownTokenKind.link_open, document.tape[4096].tapeKind());
+    try testing.expectEqual(@as(u32, 4097), document.tape[4096].offset);
+    try testing.expectEqual(MarkdownTokenKind.link_close, document.tape[4097].tapeKind());
+    try testing.expectEqual(@as(u32, 4100), document.tape[4097].offset);
+}
+
+test "Markdown tape growth propagates allocation failure without leaks" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        checkMarkdownTapeGrowthAllocationFailure,
+        .{},
+    );
 }
 
 test "Markdown Stage2 rejects forged index count and tape size" {
