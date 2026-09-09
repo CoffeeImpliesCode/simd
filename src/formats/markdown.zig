@@ -1994,6 +1994,26 @@ test "Markdown SIMD widths match scalar across structural boundaries" {
     }
 }
 
+test "Markdown scanning preserves CRLF at SIMD edges" {
+    inline for ([_]usize{ 4, 16, 32, 64 }) |vlen| {
+        var input: [96]u8 = @splat('x');
+        input[0] = '#';
+        input[vlen - 1] = '\r';
+        input[vlen] = '\n';
+
+        const second_start = vlen + 1;
+        input[second_start] = '[';
+        input[second_start + 2] = ']';
+        input[second_start + 3] = '(';
+        input[second_start + 5] = ')';
+        input[second_start + 6] = '\n';
+
+        const third_start = second_start + 7;
+        input[third_start] = '#';
+        try expectMatchesScalarOracleAtWidth(vlen, input[0 .. third_start + 1]);
+    }
+}
+
 test "Markdown fence and line state cross SIMD window boundaries" {
     var input: [130]u8 = undefined;
     @memset(input[0..], 'x');

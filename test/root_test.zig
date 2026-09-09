@@ -2,6 +2,9 @@ const std = @import("std");
 const lib = @import("simd_lib");
 const checking = @import("checking.zig");
 const resident_contract = @import("resident_contract_test.zig");
+const json_value_contract = @import("json_value_test.zig");
+const jsonl_record_tape_contract = @import("jsonl_record_tape_test.zig");
+const xml_value_views_contract = @import("xml_value_views_test.zig");
 const testing = std.testing;
 
 const vector_len = lib.default_vector_len;
@@ -23,6 +26,9 @@ test "refAllDecls" {
     testing.refAllDecls(lib.formats.xml);
     testing.refAllDecls(lib.formats.yaml);
     testing.refAllDecls(resident_contract);
+    testing.refAllDecls(json_value_contract);
+    testing.refAllDecls(jsonl_record_tape_contract);
+    testing.refAllDecls(xml_value_views_contract);
 }
 
 test "core: prefixXor matches mathematical parity" {

@@ -300,7 +300,7 @@ pub fn extractBitIndexesChecked(
     bitmask: T,
     base_offset: usize,
     out_indexes: []u32,
-) error{CapacityExceeded, InputTooLarge}!usize {
+) error{ CapacityExceeded, InputTooLarge }!usize {
     comptime validateMaskType(T);
 
     const required_count: usize = @intCast(@popCount(bitmask));

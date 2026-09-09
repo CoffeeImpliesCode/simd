@@ -200,6 +200,509 @@ pub const OnDemandDocument = struct {
     }
 };
 
+pub const TapeRecordInitError = std.mem.Allocator.Error || error{
+    CapacityOverflow,
+    InputTooLarge,
+    TapeTooLarge,
+};
+
+pub const TapeRecordError = std.mem.Allocator.Error || resident.Error ||
+    stage2.NavigationError || error{
+    CapacityExceeded,
+    CapacityOverflow,
+    InputTooLarge,
+    TapeTooLarge,
+    InvalidStructuralIndex,
+};
+
+pub const TapeRecordResult = union(enum) {
+    record: TapeRecord,
+    diagnostic: JsonlDiagnostic,
+};
+
+/// Configuration for the reusable strict-LF JSONL record parser.
+///
+/// A zero limit means that the corresponding resource may grow to the checked
+/// u32 boundary. Tape capacity is measured in `stage2.TapeWord` values.
+pub const TapeRecordOptions = struct {
+    input_capacity_max: usize = 0,
+    tape_capacity_max: usize = 0,
+};
+
+/// A reusable parser for sequential, strict-LF JSONL records.
+///
+/// The parser owns the global structural index and one high-water tape. Source
+/// bytes are borrowed from the caller. A record and every cursor made from it
+/// become invalid when the iterator advances, is deinitialized, or the parser
+/// resets.
+pub const TapeRecordParser = struct {
+    allocator: std.mem.Allocator,
+    options: TapeRecordOptions,
+    storage: resident.IndexBuffer(void, false),
+    tape_storage: []stage2.TapeWord,
+    tape_len: usize = 0,
+    reader: ?stage2.TokenReader = null,
+    state: resident.State = .{},
+    record_generation: u64 = 0,
+    input: []const u8 = &.{},
+
+    pub const InitError = TapeRecordInitError;
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        options: TapeRecordOptions,
+    ) InitError!TapeRecordParser {
+        if (options.input_capacity_max > std.math.maxInt(u32)) {
+            return error.InputTooLarge;
+        }
+        if (options.tape_capacity_max > std.math.maxInt(u32)) {
+            return error.TapeTooLarge;
+        }
+
+        var parser = TapeRecordParser{
+            .allocator = allocator,
+            .options = options,
+            .storage = resident.IndexBuffer(void, false).init(allocator),
+            .tape_storage = &.{},
+        };
+        errdefer parser.storage.deinit();
+
+        if (options.input_capacity_max != 0) {
+            try parser.storage.reserve(options.input_capacity_max);
+            parser.storage.count = 0;
+        }
+        return parser;
+    }
+
+    pub fn deinit(self: *TapeRecordParser) void {
+        self.releaseLease();
+        self.state.deinit();
+        self.storage.deinit();
+        if (self.tape_storage.len != 0) {
+            self.allocator.free(self.tape_storage);
+        }
+        self.* = undefined;
+    }
+
+    /// Invalidates all borrowed records and releases the active iterator.
+    pub fn reset(self: *TapeRecordParser) void {
+        self.releaseLease();
+        self.storage.count = 0;
+        self.tape_len = 0;
+        self.reader = null;
+        self.input = &.{};
+        self.nextRecordGeneration();
+    }
+
+    pub fn tapeCapacity(self: *const TapeRecordParser) usize {
+        return self.tape_storage.len;
+    }
+
+    pub fn inputCapacity(self: *const TapeRecordParser) usize {
+        return self.storage.capacity;
+    }
+
+    pub fn iterate(
+        self: *TapeRecordParser,
+        input: []const u8,
+    ) (TapeRecordError || error{DocumentActive})!TapeRecordIterator {
+        if (self.state.active) return error.DocumentActive;
+        if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
+        if (self.options.input_capacity_max != 0 and
+            input.len > self.options.input_capacity_max)
+        {
+            return error.CapacityExceeded;
+        }
+
+        try self.storage.reserve(input.len);
+        const count = indexJsonlInto(
+            simd.default_vector_len,
+            self.storage.indexes[0 .. self.storage.indexes.len - sentinel_count],
+            input,
+        ) catch |err| switch (err) {
+            error.InputTooLarge => return error.InputTooLarge,
+            error.CapacityExceeded => return error.CapacityExceeded,
+            error.NonContiguousInput => unreachable,
+        };
+        try self.storage.finish(count, input.len);
+        self.input = input;
+        self.tape_len = 0;
+        self.nextRecordGeneration();
+
+        const lease = try self.state.begin();
+        errdefer lease.release();
+        const guard = try lease.claim();
+        return .{
+            .parser = self,
+            .lease = lease,
+            .guard = guard,
+            .record_iterator = RecordIterator.init(
+                input,
+                self.storage.indexes[0..self.storage.count],
+            ),
+        };
+    }
+
+    fn releaseLease(self: *TapeRecordParser) void {
+        self.state.active = false;
+        self.state.claimed = false;
+        self.state.position = 0;
+    }
+
+    fn nextRecordGeneration(self: *TapeRecordParser) void {
+        self.record_generation = if (self.record_generation == std.math.maxInt(u64))
+            1
+        else
+            self.record_generation + 1;
+    }
+
+    fn invalidateRecord(self: *TapeRecordParser) void {
+        self.tape_len = 0;
+        self.nextRecordGeneration();
+    }
+
+    fn checkRecord(
+        self: *const TapeRecordParser,
+        lease: resident.Lease,
+        generation: u64,
+    ) TapeRecordError!void {
+        try lease.check();
+        if (self.record_generation != generation) {
+            return error.OutOfOrderIteration;
+        }
+    }
+
+    fn recordView(
+        self: *TapeRecordParser,
+        source: []const u8,
+        view: stage2.IndexView,
+        record_range: RecordRange,
+        record_index: usize,
+        lease: resident.Lease,
+        generation: u64,
+    ) TapeRecordError!TapeRecordResult {
+        var tape_allocator = TapeReuseAllocator{ .parser = self };
+        const document = stage2.buildTapeView(
+            tape_allocator.allocator(),
+            source,
+            view,
+            .json,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => {
+                if (tape_allocator.denied) return error.CapacityExceeded;
+                return error.OutOfMemory;
+            },
+            error.TapeTooLarge => return error.TapeTooLarge,
+            error.InvalidStructuralIndex => return error.InvalidStructuralIndex,
+            else => {
+                const diagnostic = try self.validateRecord(source, view);
+                if (diagnostic) |value| {
+                    return .{ .diagnostic = globalRecordDiagnostic(
+                        self.input,
+                        record_range,
+                        record_index,
+                        value,
+                    ) };
+                }
+                return error.InvalidStructuralIndex;
+            },
+        };
+        self.tape_len = document.tape.len;
+        return .{
+            .record = .{
+                .parser = self,
+                .lease = lease,
+                .generation = generation,
+                .record_index = record_index,
+                .source = source,
+                .source_start = record_range.source_start,
+                .source_end = record_range.source_end,
+                .tape_start = 0,
+                .tape_end = document.tape.len,
+            },
+        };
+    }
+    fn validateRecord(
+        self: *TapeRecordParser,
+        source: []const u8,
+        view: stage2.IndexView,
+    ) TapeRecordError!?stage2.Diagnostic {
+        // Reader setup only checks the index view; next() reports syntax failures.
+        if (self.reader) |*reader| {
+            reader.reset(source, view, .json) catch |err| return @errorCast(err);
+        } else {
+            self.reader = stage2.TokenReader.init(source, view, .json) catch |err| return @errorCast(err);
+        }
+        var reader = &self.reader.?;
+        while (true) {
+            const token = reader.next() catch |err| {
+                if (err == error.TapeTooLarge) return error.TapeTooLarge;
+                if (err == error.InvalidStructuralIndex) {
+                    return error.InvalidStructuralIndex;
+                }
+                return stage2.diagnosticAt(
+                    source,
+                    @errorCast(err),
+                    reader.failure_offset,
+                );
+            };
+            if (token == null) return null;
+        }
+    }
+};
+
+const TapeReuseAllocator = struct {
+    parser: *TapeRecordParser,
+    denied: bool = false,
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = std.mem.Allocator.noResize,
+        .remap = std.mem.Allocator.noRemap,
+        .free = std.mem.Allocator.noFree,
+    };
+
+    fn allocator(self: *TapeReuseAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn alloc(
+        context: *anyopaque,
+        byte_len: usize,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) ?[*]u8 {
+        const self: *TapeReuseAllocator = @ptrCast(@alignCast(context));
+        if (byte_len % @sizeOf(stage2.TapeWord) != 0) return null;
+        const word_count = byte_len / @sizeOf(stage2.TapeWord);
+        if (self.parser.options.tape_capacity_max != 0 and
+            word_count > self.parser.options.tape_capacity_max)
+        {
+            self.denied = true;
+            return null;
+        }
+
+        if (word_count <= self.parser.tape_storage.len and word_count != 0) {
+            return @ptrCast(self.parser.tape_storage.ptr);
+        }
+        if (word_count == 0) return null;
+
+        const byte_ptr = self.parser.allocator.rawAlloc(
+            byte_len,
+            alignment,
+            return_address,
+        ) orelse return null;
+        const tape_ptr: [*]stage2.TapeWord = @ptrCast(@alignCast(byte_ptr));
+        const new_storage = tape_ptr[0..word_count];
+        const old_storage = self.parser.tape_storage;
+        self.parser.tape_storage = new_storage;
+        if (old_storage.len != 0) {
+            self.parser.allocator.rawFree(
+                @as([*]u8, @ptrCast(old_storage.ptr))[0 .. old_storage.len * @sizeOf(stage2.TapeWord)],
+                .of(stage2.TapeWord),
+                return_address,
+            );
+        }
+        return byte_ptr;
+    }
+};
+
+/// A borrowed reusable JSONL record.
+pub const TapeRecord = struct {
+    parser: *TapeRecordParser,
+    lease: resident.Lease,
+    generation: u64,
+    record_index: usize,
+    source: []const u8,
+    source_start: usize,
+    source_end: usize,
+    tape_start: usize,
+    tape_end: usize,
+
+    pub fn root(self: *const TapeRecord) TapeRecordError!TapeRecordCursor {
+        try self.check();
+        const words = self.parser.tape_storage[self.tape_start..self.tape_end];
+        const document = stage2.Document{ .tape = words, .dialect = .json };
+        const base_cursor = try document.root(self.source);
+        return .{
+            .parser = self.parser,
+            .lease = self.lease,
+            .generation = self.generation,
+            .cursor = base_cursor,
+        };
+    }
+
+    pub fn cursor(self: *const TapeRecord) TapeRecordError!TapeRecordCursor {
+        return self.root();
+    }
+
+    pub fn tapeWords(self: *const TapeRecord) TapeRecordError![]const stage2.TapeWord {
+        try self.check();
+        return self.parser.tape_storage[self.tape_start..self.tape_end];
+    }
+
+    fn check(self: *const TapeRecord) TapeRecordError!void {
+        try self.parser.checkRecord(self.lease, self.generation);
+
+        if (self.source_start > self.source_end or
+            self.source_end > self.parser.input.len)
+        {
+            return error.SourceOutOfBounds;
+        }
+        const expected_source = self.parser.input[self.source_start..self.source_end];
+        if (expected_source.ptr != self.source.ptr or
+            expected_source.len != self.source.len)
+        {
+            return error.SourceOutOfBounds;
+        }
+
+        if (self.tape_start > self.tape_end or
+            self.tape_end > self.parser.tape_len or
+            self.tape_end > self.parser.tape_storage.len)
+        {
+            return error.TapeOutOfBounds;
+        }
+    }
+};
+
+/// A checked cursor over a borrowed reusable record tape.
+pub const TapeRecordCursor = struct {
+    parser: *TapeRecordParser,
+    lease: resident.Lease,
+    generation: u64,
+    cursor: stage2.TapeCursor,
+
+    pub fn peek(self: *const TapeRecordCursor) TapeRecordError!stage2.TapeWord {
+        try self.check();
+        return self.cursor.peek();
+    }
+
+    pub fn advance(self: *TapeRecordCursor) TapeRecordError!void {
+        try self.check();
+        try self.cursor.advance();
+    }
+
+    pub fn skipValue(self: *TapeRecordCursor) TapeRecordError!void {
+        try self.check();
+        try self.cursor.skipValue();
+    }
+
+    pub fn position(self: *const TapeRecordCursor) TapeRecordError!usize {
+        try self.check();
+        return self.cursor.position();
+    }
+
+    pub fn containerCount(self: *const TapeRecordCursor) TapeRecordError!u32 {
+        try self.check();
+        return self.cursor.containerCount();
+    }
+
+    pub fn matchingStart(self: *const TapeRecordCursor) TapeRecordError!TapeRecordCursor {
+        try self.check();
+        return .{
+            .parser = self.parser,
+            .lease = self.lease,
+            .generation = self.generation,
+            .cursor = try self.cursor.matchingStart(),
+        };
+    }
+
+    pub fn rawValue(self: *const TapeRecordCursor) TapeRecordError![]const u8 {
+        try self.check();
+        return self.cursor.rawValue();
+    }
+
+    fn check(self: *const TapeRecordCursor) TapeRecordError!void {
+        try self.parser.checkRecord(self.lease, self.generation);
+    }
+};
+
+pub const TapeRecordIterator = struct {
+    parser: *TapeRecordParser,
+    lease: resident.Lease,
+    guard: resident.Guard,
+    record_iterator: RecordIterator,
+    record_index: usize = 0,
+    finished: bool = false,
+
+    pub fn next(self: *TapeRecordIterator) TapeRecordError!?TapeRecordResult {
+        try self.guard.check();
+        if (self.finished) return null;
+        try self.guard.advance();
+        self.parser.invalidateRecord();
+
+        const record_range = self.record_iterator.next() catch |err| {
+            self.finished = true;
+            return err;
+        } orelse {
+            self.finished = true;
+            return null;
+        };
+        const record_source =
+            self.parser.input[record_range.source_start..record_range.source_end];
+        const view = stage2.IndexView.init(
+            record_source,
+            self.parser.storage.indexes[record_range.index_start..record_range.index_end],
+            @intCast(record_range.source_start),
+        ) catch |err| {
+            self.finished = true;
+            return err;
+        };
+
+        const generation = self.parser.record_generation;
+        const result = self.parser.recordView(
+            record_source,
+            view,
+            record_range,
+            self.record_index,
+            self.lease,
+            generation,
+        ) catch |err| {
+            self.finished = true;
+            return err;
+        };
+        switch (result) {
+            .diagnostic => self.finished = true,
+            .record => self.record_index += 1,
+        }
+        return result;
+    }
+
+    pub fn recordCount(self: *const TapeRecordIterator) usize {
+        return self.record_index;
+    }
+
+    pub fn deinit(self: *TapeRecordIterator) void {
+        if (self.guard.check()) |_| {
+            self.parser.invalidateRecord();
+            self.lease.release();
+        } else |_| {}
+        self.* = undefined;
+    }
+};
+
+fn globalRecordDiagnostic(
+    input: []const u8,
+    record_range: RecordRange,
+    record_index: usize,
+    local: stage2.Diagnostic,
+) JsonlDiagnostic {
+    const record_len = record_range.source_end - record_range.source_start;
+    const global_offset = record_range.source_start + @min(local.byte_offset, record_len);
+    const global = stage2.diagnosticAt(input, local.err, global_offset);
+    return .{
+        .record_index = record_index,
+        .source_start = record_range.source_start,
+        .source_end = record_range.source_end,
+        .err = global.err,
+        .byte_offset = global.byte_offset,
+        .line = global.line,
+        .column = global.column,
+        .snippet = global.snippet,
+        .snippet_start = global.snippet_start,
+    };
+}
+
 const ActiveRecord = struct {
     range: RecordRange,
     source: []const u8,
@@ -1437,7 +1940,6 @@ fn expectJsonlStreamIndexEqual(
         actual.indexes[0 .. actual.count + 3],
     );
 }
-
 
 fn feedJsonlStream(
     input: []const u8,

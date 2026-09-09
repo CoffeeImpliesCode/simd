@@ -3,8 +3,8 @@
 ## Scope and decision
 
 This document combines the independently reviewed reference studies for strict JSON, JSONL, JSONC,
-JSON5, Markdown, XML, and YAML. It is a research and implementation plan. It does not change source,
-benchmarks, or public APIs.
+JSON5, Markdown, XML, and YAML. The plan is followed by an implementation record
+that distinguishes shipped contracts from rejected experiments.
 
 **DECISION:** The implementation order is deliberate:
 
@@ -590,3 +590,85 @@ arithmetic, and reports transcode-plus-parse separately. It must never change th
 - No parser speed claim from benchmark-only checksum, wrapper, or allocator work.
 - No silent expansion of a restricted grammar.
 - No unsupported percentage attribution from profile shares, syscall counts, or source inspection.
+
+## Implementation record
+
+The implementation workspace is `~/projects/simd-performance`, based
+on `1dc602534a8419056a476af2d71b1be67d015995`. The original dirty parser checkout
+was not changed. Benchmark integration lives in `~/simd-bench-corpus`.
+
+### Shipped contracts
+
+- JSON provides caller-storage string decoding and raw-preserving typed number
+  views. The APIs do not introduce implicit allocation or change number grammar.
+- JSONL provides a reusable record-tape parser with explicit document leases,
+  record-local offsets, and record/global diagnostics. The checked public index
+  path remains. Validation-only, reusable record-tape, and libc-allocation
+  benchmark selectors have separate work or allocator contracts; the default
+  allocator and retained-batch ownership are unchanged.
+- XML provides checked decoded-value access, declaration information, and lexical
+  QName splitting. Source overlap and malformed raw boundaries are rejected.
+  QName splitting does not resolve namespaces. No transcoder, DTD processing,
+  external entity loading, or unchecked public reader was added.
+- `yaml-basic-1.2.2` remains restricted. The opt-in `yaml-extended-e2b` profile
+  adds literal/folded blocks, multiline quoted scalars, and compact sequence
+  mappings with owned cooked values. Source characters, collection depth,
+  scalar source bytes, physical scalar lines, cooked bytes, and tape words have
+  checked limits. Root scalars and explicit document-end markers work. Aliases,
+  anchors, directives, tags, multiple documents, and implicit typing remain out
+  of scope.
+- `formats.commonmark` is separate from the marker-only Markdown module.
+  `parseCommonMark` owns flat semantic nodes and normalized text while borrowing
+  source bytes. `renderCommonMarkHtml` has a safe default and an explicit
+  conformance mode. Safe rendering filters autolinks as well as ordinary links
+  and images, including schemes with decoded URL controls. Rendering checks root
+  ancestry and bounds sibling traversal. Destruction is iterative.
+
+### Optimization decisions
+
+All rows below describe isolated attribution probes, not cross-library rankings
+or complete-adapter speedup claims. The five-percent band remains a decision
+threshold, not a significance test.
+
+| Experiment | Decision |
+|---|---|
+| YAML resident source validation | Retained. Final seven-pair full-size medians are 0.829 sparse, 0.909 dense, 0.923 quoted, 0.851 Unicode, and 0.882 real input. Longer small-input controls remove the unresolved short-batch regression. Allocation counts and requested bytes match. |
+| XML private source proof | Retained. Full-size candidate/baseline medians range from 0.867 to 0.971. Checked public access remains unchanged. |
+| XML attribute duplicate prefilter | Retained with exact collision confirmation. Medians are 0.190 for 32 attributes and 0.101 for 128; ordinary accepted fixtures range from 0.931 to 0.969. |
+| XML ASCII name unroll | Rejected. The 32- and 128-attribute controls regress; the original continuation loop is restored. |
+| Markdown fused first-vector scan | Rejected. Escaped and Unicode controls are 1.236 and 1.208. The original scanner and the CRLF boundary regression coverage remain. |
+| JSON5 high-byte suppression | Rejected. Unicode JSON5 improves, but the broader JSONC/rejection controls do not pass the gate. |
+| Dialect bulk comment scan | Rejected. JSONC comment-heavy input is 1.091 in the final native-width run. |
+| JSON5 ASCII identifier fast path | Rejected. Identifier-heavy input improves, but real and comment-heavy JSONC controls regress. |
+| YAML quoted-span scan | Rejected. The focused controls did not establish the required gain without regressions; the scalar path remains. |
+| Private JSONL index bypass and flat/resident storage variants | Rejected. The retained checked path and ownership model remain; new selectors do not imply a default-policy change. |
+| Strict number, event dispatch, rejection, and sparse-index rewrites | No rewrite retained. Semantic, allocation, diagnostic-offset, and scalar-width probes remain attribution evidence, not a latency or speedup claim. |
+
+The private dialect capacity calculation reports arithmetic overflow instead of
+silently changing the bound. No quote-count metadata was added to public views.
+Boundary tests defend behavior rather than a particular reservation count.
+
+### Source verification
+
+After integration and removal of rejected candidates:
+
+- `zig build` passes.
+- `zig build test corpus commonmark` passes **482/482 tests** at native width and
+  explicit widths **4, 16, and 64**. Native width on this AVX2 host is 32.
+- The CommonMark conformance test compares exact HTML for **all 652 pinned
+  CommonMark 0.31.2 examples**. No example is skipped.
+- The YAML scalar differential matches libyaml on **273/273 cases**, including
+  indentation, chomping, blank lines, quoting, and escaped whitespace.
+- The final YAML acceptance harness passes **52/52** semantic, stream, and
+  cross-width controls, including **20** checked public-mutation cases.
+- `zig fmt --check src test build.zig` and the actual `zig build run` visualizer
+  smoke command pass.
+
+Raw evidence is retained locally under
+`~/simd-bench-corpus/results/2026-09-09-reference-analysis/`:
+`final-native-verification.json`, `final-candidate-decisions.json`,
+`yaml-scalar-differential-final.json`, `yaml-final-source-correctness.jsonl`,
+`yaml-final-long-controls-timing.jsonl`, `xml-pinned-timing.jsonl`,
+`markdown-fused-final-timing.jsonl`, and
+`dialect-final-native-width-pairs.jsonl`. Final external adapter build and report
+evidence belongs to the benchmark packet, separate from these source gates.

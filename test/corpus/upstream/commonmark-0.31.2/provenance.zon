@@ -1,0 +1,20 @@
+.{
+    .project = "commonmark/commonmark-spec",
+    .release = "0.31.2",
+    .tag = "0.31.2",
+    .commit = "9103e341a973013013bb1a80e13567007c5cef6f",
+    .artifact = .{
+        .url = "https://spec.commonmark.org/0.31.2/spec.json",
+        .bytes = 140487,
+        .sha256 = "d431b29d97b6f73e69d547109cf5081578fac931e72afe95639ebe766c1b2a20",
+        .examples = 652,
+        .sections = 26,
+        .changes = "none",
+    },
+    .license = .{
+        .url = "https://raw.githubusercontent.com/commonmark/commonmark-spec/9103e341a973013013bb1a80e13567007c5cef6f/LICENSE",
+        .bytes = 2792,
+        .sha256 = "3e4806ba6f20073e8ce40da5a0c4b59f7f44287965f538e195a4d734d833557b",
+    },
+    .attribution = "CommonMark specification examples, version 0.31.2. Copyright (C) 2014-16 John MacFarlane. Licensed under CC BY-SA 4.0: https://creativecommons.org/licenses/by-sa/4.0/",
+}

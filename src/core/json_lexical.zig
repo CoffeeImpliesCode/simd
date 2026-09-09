@@ -268,7 +268,6 @@ fn processDialectBlock(
         candidates |= line_end;
     }
 
-
     var visible: Mask = 0;
     var cursor: usize = 0;
     while (cursor < valid_count) {
@@ -623,7 +622,6 @@ fn updateOrdinarySpan(
         else => unreachable,
     };
 }
-
 
 fn recordOffset(
     comptime VLEN: usize,

@@ -787,6 +787,44 @@ therefore still require independent complete input owned by the caller.
    duration of the call only; the indexer retains parser state and indexes, not
    source bytes.
 
+## Current reference-guided API additions
+
+- `json_value.decodeString` decodes into caller-owned storage. It validates
+  before writing and rejects overlapping source and output buffers.
+  `json_value.parseNumber` returns the original source span and a typed
+  `NumberValue`; it does not change strict JSON number grammar.
+- `formats.jsonl.TapeRecordParser` retains reusable index and record-tape
+  storage. Its active iterator borrows the complete source. Advancing or
+  releasing the iterator, or resetting the parser, invalidates prior records
+  and cursors.
+  This API is separate from the eager document that owns all record tapes.
+- XML text, CDATA, and attribute events expose checked `decodedLength` and
+  `decodeInto` operations. `XmlDeclarationInfo` borrows declaration values;
+  `XmlQName` splits lexical names without resolving namespaces. The parser
+  remains UTF-8-only: declaration inspection is not a transcoder.
+- `formats.yaml` retains `yaml-basic-1.2.2`. The opt-in
+  `formats.yaml_extended` module implements `yaml-extended-e2b`: literal and
+  folded block scalars, multiline quotes, and compact sequence mappings.
+  Its document owns tape, metadata, and cooked bytes and borrows source bytes.
+  `Limits` applies to both basic and extended syntax. Collection depth can be
+  lowered from the shared 1024 limit, not raised. A quoted scalar's opening
+  line counts toward its scalar-line limit; block headers and terminal line
+  sentinels do not. Aliases, anchors, tags, complex keys, directives, multiple
+  documents, schema resolution, and streaming remain outside this profile.
+- `formats.commonmark` is a separate CommonMark 0.31.2 semantic parser, not
+  an extension of the marker-only `formats.markdown` tape. Its flat document
+  owns nodes and semantic text and borrows source bytes. Parsing has explicit
+  input, node, text, delimiter, bracket, reference, depth, and work limits.
+  More than 64 prefixes on one line returns `NestingTooDeep`. Rendering bounds
+  output bytes and rejects malformed traversal links. Default safe rendering
+  omits raw HTML and filters dangerous URL schemes, including autolinks and
+  schemes containing browser-stripped controls. Conformance rendering is
+  intentionally unsafe; the caller owns the trust or sanitization boundary.
+
+`zig build commonmark` runs all 652 pinned examples without exclusions and
+the ownership, safety, and resource regressions. `zig build corpus` includes
+this suite. The YAML extension regressions run through `zig build test`.
+
 ## Future roadmap
 
 1. Error recovery: validators fail at the first diagnostic; recovery by

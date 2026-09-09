@@ -563,8 +563,8 @@ pub fn validateView(
 /// Strict JSON indexes include every opening quote, while dialect indexes
 /// deliberately omit quotes and only include structural bytes and atom starts.
 /// Colons and commas never emit words. Counting raw dialect quote bytes
-/// overestimates escaped and closing quotes, and the input-length clamp is
-/// always safe because each emitted word consumes at least one source byte.
+/// overestimates escaped and closing quotes. The clamp keeps caller-created
+/// views from reserving more than one word per source byte.
 fn tapeCapacity(
     input: []const u8,
     view: *const IndexView,
@@ -576,7 +576,7 @@ fn tapeCapacity(
         const byte = input[local_offset];
         if (byte == ':' or byte == ',') continue;
         capacity = std.math.add(usize, capacity, 1) catch {
-            return input.len;
+            return error.TapeTooLarge;
         };
     }
 
@@ -588,7 +588,7 @@ fn tapeCapacity(
                 byte == '"';
             if (!is_quote) continue;
             capacity = std.math.add(usize, capacity, 1) catch {
-                return input.len;
+                return error.TapeTooLarge;
             };
         }
     }
@@ -2306,6 +2306,75 @@ test "JSONC and JSON5 reject malformed UTF-8 in comments" {
     try testing.expectEqual(@as(usize, 6), json5_block_diagnostic.byte_offset);
 }
 
+test "dialect comment scans preserve vector-boundary diagnostics" {
+    const VLEN = simd.default_vector_len;
+
+    var line_input: [VLEN + 4]u8 = @splat('a');
+    line_input[0..2].* = "//".*;
+    line_input[VLEN - 1] = 0xe2;
+    line_input[VLEN] = '(';
+    line_input[VLEN + 1] = '\n';
+    line_input[VLEN + 2] = '{';
+    line_input[VLEN + 3] = '}';
+    const line_offsets = [_]u32{
+        @intCast(VLEN + 2),
+        @intCast(VLEN + 3),
+    };
+    const line_view = try IndexView.init(&line_input, &line_offsets, 0);
+    const line_diagnostic = (try validateView(&line_input, line_view, .jsonc)).?;
+    try testing.expectEqual(error.InvalidUtf8, line_diagnostic.err);
+    try testing.expectEqual(@as(usize, VLEN), line_diagnostic.byte_offset);
+
+    var block_input: [VLEN + 3]u8 = @splat('a');
+    block_input[0..2].* = "/*".*;
+    block_input[VLEN - 1] = '*';
+    block_input[VLEN] = '/';
+    block_input[VLEN + 1] = '{';
+    block_input[VLEN + 2] = '}';
+    const block_offsets = [_]u32{
+        @intCast(VLEN + 1),
+        @intCast(VLEN + 2),
+    };
+    const block_view = try IndexView.init(&block_input, &block_offsets, 0);
+    try testing.expect((try validateView(&block_input, block_view, .jsonc)) == null);
+
+    var separator_input: [VLEN + 4]u8 = @splat('a');
+    separator_input[0..2].* = "//".*;
+    separator_input[VLEN - 1 .. VLEN + 2].* = "\xe2\x80\xa8".*;
+    separator_input[VLEN + 2] = '{';
+    separator_input[VLEN + 3] = '}';
+    const separator_offsets = [_]u32{
+        @intCast(VLEN + 2),
+        @intCast(VLEN + 3),
+    };
+    const separator_view = try IndexView.init(
+        &separator_input,
+        &separator_offsets,
+        0,
+    );
+    try testing.expect(
+        (try validateView(&separator_input, separator_view, .json5)) == null,
+    );
+
+    var unterminated_input: [VLEN + 2]u8 = @splat('a');
+    unterminated_input[0..2].* = "/*".*;
+    unterminated_input[VLEN] = 0xe2;
+    unterminated_input[VLEN + 1] = '(';
+    const no_offsets = [_]u32{};
+    const unterminated_view = try IndexView.init(
+        &unterminated_input,
+        &no_offsets,
+        0,
+    );
+    const unterminated_diagnostic =
+        (try validateView(&unterminated_input, unterminated_view, .json5)).?;
+    try testing.expectEqual(error.InvalidUtf8, unterminated_diagnostic.err);
+    try testing.expectEqual(
+        @as(usize, VLEN + 1),
+        unterminated_diagnostic.byte_offset,
+    );
+}
+
 test "JSON5 accepts raw line separators and rejects invalid identifier code points" {
     const raw_u2028 = [_]u8{ '[', '\'', 'a', 0xe2, 0x80, 0xa8, 'b', '\'', ']' };
     const raw_u2029 = [_]u8{ '[', '\'', 'a', 0xe2, 0x80, 0xa9, 'b', '\'', ']' };
@@ -2343,6 +2412,40 @@ test "JSON5 accepts raw line separators and rejects invalid identifier code poin
     for (invalid_identifiers) |input| {
         try expectJson5Stage2Error(error.UnexpectedToken, input);
     }
+}
+
+test "JSON5 ASCII identifiers preserve continuation and fallback boundaries" {
+    const input = "{a9$:0,a\\u0030:1,aé:2,a/*gap*/:3}";
+    var structural_index = try indexJson5ForTest(testing.allocator, input);
+    defer structural_index.deinit(testing.allocator);
+    var document = try buildTape(
+        testing.allocator,
+        input,
+        &structural_index,
+        .json5,
+    );
+    defer document.deinit(testing.allocator);
+
+    var cursor = try document.root(input);
+    try cursor.advance();
+    for ([_][]const u8{ "a9$", "a\\u0030", "aé", "a" }) |expected_key| {
+        try testing.expectEqualStrings(expected_key, try cursor.rawValue());
+        try cursor.advance();
+        try testing.expectEqual(TapeKind.number, (try cursor.peek()).tapeKind());
+        try cursor.advance();
+    }
+    try testing.expectEqual(TapeKind.object_end, (try cursor.peek()).tapeKind());
+
+    const invalid_input = "{a-b:0}";
+    var invalid_index = try indexJson5ForTest(testing.allocator, invalid_input);
+    defer invalid_index.deinit(testing.allocator);
+    const diagnostic = try expectDialectStage2Diagnostic(
+        error.UnexpectedToken,
+        invalid_input,
+        &invalid_index,
+        .json5,
+    );
+    try testing.expectEqual(@as(usize, 2), diagnostic.byte_offset);
 }
 
 fn expectStage2Error(expected: Error, input: []const u8) !void {

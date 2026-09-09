@@ -2,10 +2,27 @@ const std = @import("std");
 const simd = @import("../core/simd.zig");
 const stage1 = @import("../core/stage1.zig");
 const resident = @import("../core/resident.zig");
+const source = @import("yaml_source.zig");
 
 const testing = std.testing;
 const max_u24: usize = std.math.maxInt(u24);
 pub const yaml_max_depth: usize = 1024;
+
+/// Named parser profiles. The default remains the restricted basic grammar.
+pub const Profile = enum {
+    basic,
+    extended,
+};
+
+pub const profile: Profile = .basic;
+pub const profile_label = "yaml-basic-1.2.2";
+
+pub fn profileLabel(selected: Profile) []const u8 {
+    return switch (selected) {
+        .basic => "yaml-basic-1.2.2",
+        .extended => "yaml-extended-e2b-1.2.2",
+    };
+}
 
 /// The restricted YAML token stream emitted by Stage 1 and retained by Stage 2.
 ///
@@ -265,26 +282,15 @@ pub const YamlCursor = struct {
         var depth: usize = 1;
         var steps: usize = 0;
         while (depth > 0) {
-            if (steps >= self.tape.len) return error.UnexpectedEnd;
+            if (steps >= self.tape.len or self.position_index + 1 >= self.tape.len) {
+                return error.UnexpectedEnd;
+            }
+            const next_kind = try checkedYamlTapeKind(self.tape[self.position_index + 1]);
             try self.advance();
             steps += 1;
-            if (self.position_index >= self.tape.len) {
-                if (depth != 0) return error.UnexpectedEnd;
-                break;
-            }
-            const kind = try checkedYamlTapeKind(self.tape[self.position_index]);
-            switch (kind) {
-                .mapping_start, .sequence_start => {
-                    depth += 1;
-                },
-                .mapping_end => {
-                    if (depth == 0) return error.InvalidStructure;
-                    depth -= 1;
-                },
-                .sequence_end => {
-                    if (depth == 0) return error.InvalidStructure;
-                    depth -= 1;
-                },
+            switch (next_kind) {
+                .mapping_start, .sequence_start => depth += 1,
+                .mapping_end, .sequence_end => depth -= 1,
                 else => {},
             }
         }
@@ -1239,7 +1245,11 @@ fn validateYamlInput(
     input: []const u8,
     failure: *?Failure,
 ) error{ Invalid, InputTooLarge }!void {
-    return validateYamlInputImpl(simd.default_vector_len, input, failure);
+    const invalid_offset = source.failureOffset(input) catch |err| return err;
+    if (invalid_offset) |offset| {
+        failure.* = .{ .err = error.Invalid, .kind = .syntax, .offset = offset };
+        return error.Invalid;
+    }
 }
 
 fn validateYamlInputImpl(
@@ -1247,84 +1257,22 @@ fn validateYamlInputImpl(
     input: []const u8,
     failure: *?Failure,
 ) error{ Invalid, InputTooLarge }!void {
-    comptime {
-        if (VLEN < 4) {
-            @compileError("YAML validation vector width must be at least four bytes");
-        }
-    }
-    if (input.len > std.math.maxInt(u32)) {
-        return error.InputTooLarge;
-    }
-    var index: usize = 0;
-    if (input.len >= 3 and input[0] == 0xef and input[1] == 0xbb and input[2] == 0xbf) {
-        index = 3;
-    }
-    const printable_mask = std.math.maxInt(simd.Mask(VLEN));
-    while (index < input.len) {
-        while (input.len - index >= VLEN) {
-            const bytes: simd.Vec(VLEN, u8) = input[index..][0..VLEN].*;
-            if (simd.matchRange(VLEN, bytes, 0x20, 0x7e) != printable_mask) break;
-            index += VLEN;
-        }
-        if (index >= input.len) break;
-        const scalar_end = index + @min(VLEN, input.len - index);
-        while (index < scalar_end) {
-            index = try validateYamlInputByte(input, index, failure);
-        }
+    const invalid_offset = source.failureOffsetImpl(VLEN, input) catch |err| return err;
+    if (invalid_offset) |offset| {
+        failure.* = .{ .err = error.Invalid, .kind = .syntax, .offset = offset };
+        return error.Invalid;
     }
 }
 
-// Keep the original scalar classifier as the differential oracle.
 fn validateYamlInputScalar(
     input: []const u8,
     failure: *?Failure,
 ) error{ Invalid, InputTooLarge }!void {
-    return validateYamlInputScalarFrom(input, 0, failure);
-}
-
-fn validateYamlInputScalarFrom(
-    input: []const u8,
-    start: usize,
-    failure: *?Failure,
-) error{ Invalid, InputTooLarge }!void {
-    if (input.len > std.math.maxInt(u32)) {
-        return error.InputTooLarge;
-    }
-    var index = start;
-    if (start == 0 and input.len >= 3 and input[0] == 0xef and input[1] == 0xbb and input[2] == 0xbf) {
-        index = 3;
-    }
-    while (index < input.len) {
-        index = try validateYamlInputByte(input, index, failure);
-    }
-}
-
-fn validateYamlInputByte(
-    input: []const u8,
-    index: usize,
-    failure: *?Failure,
-) error{Invalid}!usize {
-    const byte = input[index];
-    if (byte == 0xef and index != 0 and index + 2 < input.len and
-        input[index + 1] == 0xbb and input[index + 2] == 0xbf)
-    {
-        failure.* = .{ .err = error.Invalid, .kind = .syntax, .offset = index };
+    const invalid_offset = source.failureOffsetScalarFrom(input, 0) catch |err| return err;
+    if (invalid_offset) |offset| {
+        failure.* = .{ .err = error.Invalid, .kind = .syntax, .offset = offset };
         return error.Invalid;
     }
-    if (byte < 0x20 and byte != '\n' and byte != '\r' and byte != ' ' and byte != '\t') {
-        failure.* = .{ .err = error.Invalid, .kind = .syntax, .offset = index };
-        return error.Invalid;
-    }
-    if (byte == 0x7f) {
-        failure.* = .{ .err = error.Invalid, .kind = .syntax, .offset = index };
-        return error.Invalid;
-    }
-    if (byte < 0x80) return index + 1;
-    const sequence_len = utf8SequenceLength(input, index) orelse {
-        failure.* = .{ .err = error.Invalid, .kind = .syntax, .offset = index };
-        return error.Invalid;
-    };
-    return index + sequence_len;
 }
 
 fn validateYamlSource(input: []const u8, failure: *?Failure) error{ Invalid, InputTooLarge }!void {
@@ -1344,49 +1292,6 @@ fn validateYamlSource(input: []const u8, failure: *?Failure) error{ Invalid, Inp
             indentation = false;
         }
     }
-}
-
-fn utf8SequenceLength(input: []const u8, index: usize) ?usize {
-    const first = input[index];
-    if (first >= 0xc2 and first <= 0xdf) {
-        if (index + 1 >= input.len or !isContinuation(input[index + 1])) return null;
-        return 2;
-    }
-    if (first == 0xe0) {
-        if (index + 2 >= input.len or input[index + 1] < 0xa0 or input[index + 1] > 0xbf or
-            !isContinuation(input[index + 2])) return null;
-        return 3;
-    }
-    if (first >= 0xe1 and first <= 0xec or first >= 0xee and first <= 0xef) {
-        if (index + 2 >= input.len or !isContinuation(input[index + 1]) or
-            !isContinuation(input[index + 2])) return null;
-        return 3;
-    }
-    if (first == 0xed) {
-        if (index + 2 >= input.len or input[index + 1] < 0x80 or input[index + 1] > 0x9f or
-            !isContinuation(input[index + 2])) return null;
-        return 3;
-    }
-    if (first == 0xf0) {
-        if (index + 3 >= input.len or input[index + 1] < 0x90 or input[index + 1] > 0xbf or
-            !isContinuation(input[index + 2]) or !isContinuation(input[index + 3])) return null;
-        return 4;
-    }
-    if (first >= 0xf1 and first <= 0xf3) {
-        if (index + 3 >= input.len or !isContinuation(input[index + 1]) or
-            !isContinuation(input[index + 2]) or !isContinuation(input[index + 3])) return null;
-        return 4;
-    }
-    if (first == 0xf4) {
-        if (index + 3 >= input.len or input[index + 1] < 0x80 or input[index + 1] > 0x8f or
-            !isContinuation(input[index + 2]) or !isContinuation(input[index + 3])) return null;
-        return 4;
-    }
-    return null;
-}
-
-fn isContinuation(byte: u8) bool {
-    return byte >= 0x80 and byte <= 0xbf;
 }
 
 fn collectLines(
@@ -1699,7 +1604,7 @@ pub fn buildYamlTape(
     errdefer tape.deinit(allocator);
 
     var engine = YamlResidentEngine.init();
-    engine.reset(input);
+    engine.resetValidated(input);
     while (true) {
         const event = engine.next(tape.items.len) catch |err| {
             return switch (err) {
@@ -1997,9 +1902,11 @@ const YamlEngineError = YamlError || error{
 const YamlResidentEngine = struct {
     input: []const u8 = &.{},
     input_base: usize = 0,
+    source_pos: usize = 0,
     metadata: ?*const YamlLexicalMetadata = null,
     metadata_cursor: usize = 0,
-    source_pos: usize = 0,
+    // Complete-input callers set this only after validateYamlSource succeeds.
+    source_checked: bool = false,
     line: ?ResidentLine = null,
     close_pending: usize = 0,
     resolve_pending: ?usize = null,
@@ -2042,12 +1949,20 @@ const YamlResidentEngine = struct {
         };
     }
 
+    /// Use only after validateYamlSource on a complete input.
+    fn resetValidated(self: *Self, input: []const u8) void {
+        self.* = .{
+            .input = input,
+            .source_checked = true,
+        };
+    }
+
     fn resetWithMetadata(
         self: *Self,
         input: []const u8,
         metadata: ?*const YamlLexicalMetadata,
     ) void {
-        self.reset(input);
+        self.resetValidated(input);
         self.metadata = metadata;
     }
 
@@ -2060,6 +1975,7 @@ const YamlResidentEngine = struct {
         if (self.line != null or self.flow_len != 0) return self.record(error.Invalid);
         self.input = input;
         self.input_base = input_base;
+        self.source_checked = false;
         self.source_pos = input.len;
         self.window_mode = true;
         self.window_complete = false;
@@ -2141,7 +2057,7 @@ const YamlResidentEngine = struct {
     }
 
     fn record(self: *Self, err: YamlError) YamlEngineError {
-        if (!self.window_mode) {
+        if (!self.window_mode and !self.source_checked) {
             var source_failure: ?Failure = null;
             validateYamlSource(self.input, &source_failure) catch |source_err| switch (source_err) {
                 error.Invalid => {
@@ -2215,11 +2131,13 @@ const YamlResidentEngine = struct {
             if (end > start and self.input[end - 1] == '\r') {
                 end -= 1;
             }
-            var scan = start;
-            while (scan < end) : (scan += 1) {
-                if (self.input[scan] == '\r') return self.record(error.Invalid);
+            if (!self.source_checked) {
+                var scan = start;
+                while (scan < end) : (scan += 1) {
+                    if (self.input[scan] == '\r') return self.record(error.Invalid);
+                }
+                if (!has_newline and end < self.input.len) return self.record(error.Invalid);
             }
-            if (!has_newline and end < self.input.len) return self.record(error.Invalid);
 
             const bom_prefix: usize = if (start == 0 and end >= 3 and
                 self.input[0] == 0xef and self.input[1] == 0xbb and self.input[2] == 0xbf)
@@ -2229,14 +2147,16 @@ const YamlResidentEngine = struct {
             if (start != 0 and std.mem.startsWith(u8, self.input[start..end], "\xef\xbb\xbf")) {
                 return self.record(error.Invalid);
             }
-            var failure: ?Failure = null;
-            validateYamlInput(self.input[start + bom_prefix .. end], &failure) catch |err| switch (err) {
-                error.Invalid => return self.record(error.Invalid),
-                error.InputTooLarge => return error.InputTooLarge,
-            };
+            if (!self.source_checked) {
+                var failure: ?Failure = null;
+                validateYamlInput(self.input[start + bom_prefix .. end], &failure) catch |err| switch (err) {
+                    error.Invalid => return self.record(error.Invalid),
+                    error.InputTooLarge => return error.InputTooLarge,
+                };
+            }
             var content_start = start + bom_prefix;
             while (content_start < end and self.input[content_start] == ' ') : (content_start += 1) {}
-            if (content_start < end and self.input[content_start] == '\t') {
+            if (!self.source_checked and content_start < end and self.input[content_start] == '\t') {
                 return self.record(error.Invalid);
             }
             self.source_pos = line_next;
@@ -2317,14 +2237,10 @@ const YamlResidentEngine = struct {
         };
         self.flow_len += 1;
         self.flow_pos = open + 1;
-        try self.emit(
-            if (kind == .sequence) .sequence_start else .mapping_start,
-            open,
-            0,
-        );
     }
 
     fn parseQuoted(self: *Self, start: usize, end: usize, kind: YamlTokenKind) YamlEngineError!ResidentSpan {
+        _ = kind;
         const quote = self.input[start];
         var pos = start + 1;
         if (quote == '\'') {
@@ -2341,6 +2257,7 @@ const YamlResidentEngine = struct {
             }
             return self.failUnclosed(start);
         }
+
         while (pos < end) {
             const byte = self.input[pos];
             if (byte == '"') {
@@ -2371,7 +2288,6 @@ const YamlResidentEngine = struct {
                 pos += 1;
             }
         }
-        _ = kind;
         return self.failUnclosed(start);
     }
 
@@ -2457,7 +2373,9 @@ const YamlResidentEngine = struct {
                 if (byte == ']' or byte == ',') return self.record(error.Invalid);
                 if (byte == '[' or byte == '{') {
                     frame.expect = .after_value;
-                    return self.pushFlow(if (byte == '[') .sequence else .mapping, self.flow_pos);
+                    const open = self.flow_pos;
+                    try self.pushFlow(if (byte == '[') .sequence else .mapping, open);
+                    return self.emit(if (byte == '[') .sequence_start else .mapping_start, open, 0);
                 }
                 const span = try self.parseScalar(self.flow_pos, self.flow_end, .flow_value, .scalar);
                 self.flow_pos = span.next;
@@ -2515,7 +2433,9 @@ const YamlResidentEngine = struct {
                 }
                 if (byte == '[' or byte == '{') {
                     frame.expect = .after_value;
-                    return self.pushFlow(if (byte == '[') .sequence else .mapping, self.flow_pos);
+                    const open = self.flow_pos;
+                    try self.pushFlow(if (byte == '[') .sequence else .mapping, open);
+                    return self.emit(if (byte == '[') .sequence_start else .mapping_start, open, 0);
                 }
                 const span = try self.parseScalar(self.flow_pos, self.flow_end, .flow_value, .scalar);
                 self.flow_pos = span.next;
@@ -2536,8 +2456,12 @@ const YamlResidentEngine = struct {
         line.phase = .flow;
         self.line = line.*;
         self.flow_end = line.visible_end;
-        if (self.block_len > 0) self.block_frames[self.block_len - 1].end_offset = line.end;
-        try self.pushFlow(if (byte == '[') .sequence else .mapping, start);
+        if (self.block_len > 0) {
+            self.block_frames[self.block_len - 1].end_offset = line.end;
+        }
+        const open = start;
+        try self.pushFlow(if (byte == '[') .sequence else .mapping, open);
+        return self.emit(if (byte == '[') .sequence_start else .mapping_start, open, 0);
     }
 
     fn stepLine(self: *Self) YamlEngineError!void {
