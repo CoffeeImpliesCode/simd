@@ -1227,8 +1227,31 @@ fn tokenCapacity(input_len: usize) !usize {
     const doubled = std.math.mul(usize, input_len, 2) catch return error.CapacityOverflow;
     return std.math.add(usize, doubled, 8) catch return error.CapacityOverflow;
 }
+fn validateTapeInputCapacity(input_len: usize) !void {
+    const token_capacity = tokenCapacity(input_len) catch return error.CapacityOverflow;
+    if (token_capacity > std.math.maxInt(usize) - stage1_sentinel_count) {
+        return error.CapacityOverflow;
+    }
+    if (token_capacity > std.math.maxInt(u32)) return error.InputTooLarge;
+}
 
-fn validateYamlInput(input: []const u8, failure: *?Failure) error{ Invalid, InputTooLarge }!void {
+fn validateYamlInput(
+    input: []const u8,
+    failure: *?Failure,
+) error{ Invalid, InputTooLarge }!void {
+    return validateYamlInputImpl(simd.default_vector_len, input, failure);
+}
+
+fn validateYamlInputImpl(
+    comptime VLEN: usize,
+    input: []const u8,
+    failure: *?Failure,
+) error{ Invalid, InputTooLarge }!void {
+    comptime {
+        if (VLEN < 4) {
+            @compileError("YAML validation vector width must be at least four bytes");
+        }
+    }
     if (input.len > std.math.maxInt(u32)) {
         return error.InputTooLarge;
     }
@@ -1236,32 +1259,72 @@ fn validateYamlInput(input: []const u8, failure: *?Failure) error{ Invalid, Inpu
     if (input.len >= 3 and input[0] == 0xef and input[1] == 0xbb and input[2] == 0xbf) {
         index = 3;
     }
+    const printable_mask = std.math.maxInt(simd.Mask(VLEN));
     while (index < input.len) {
-        const byte = input[index];
-        if (byte == 0xef and index != 0 and index + 2 < input.len and
-            input[index + 1] == 0xbb and input[index + 2] == 0xbf)
-        {
-            failure.* = .{ .err = error.Invalid, .kind = .syntax, .offset = index };
-            return error.Invalid;
+        while (input.len - index >= VLEN) {
+            const bytes: simd.Vec(VLEN, u8) = input[index..][0..VLEN].*;
+            if (simd.matchRange(VLEN, bytes, 0x20, 0x7e) != printable_mask) break;
+            index += VLEN;
         }
-        if (byte < 0x20 and byte != '\n' and byte != '\r' and byte != ' ' and byte != '\t') {
-            failure.* = .{ .err = error.Invalid, .kind = .syntax, .offset = index };
-            return error.Invalid;
+        if (index >= input.len) break;
+        const scalar_end = index + @min(VLEN, input.len - index);
+        while (index < scalar_end) {
+            index = try validateYamlInputByte(input, index, failure);
         }
-        if (byte == 0x7f) {
-            failure.* = .{ .err = error.Invalid, .kind = .syntax, .offset = index };
-            return error.Invalid;
-        }
-        if (byte < 0x80) {
-            index += 1;
-            continue;
-        }
-        const sequence_len = utf8SequenceLength(input, index) orelse {
-            failure.* = .{ .err = error.Invalid, .kind = .syntax, .offset = index };
-            return error.Invalid;
-        };
-        index += sequence_len;
     }
+}
+
+// Keep the original scalar classifier as the differential oracle.
+fn validateYamlInputScalar(
+    input: []const u8,
+    failure: *?Failure,
+) error{ Invalid, InputTooLarge }!void {
+    return validateYamlInputScalarFrom(input, 0, failure);
+}
+
+fn validateYamlInputScalarFrom(
+    input: []const u8,
+    start: usize,
+    failure: *?Failure,
+) error{ Invalid, InputTooLarge }!void {
+    if (input.len > std.math.maxInt(u32)) {
+        return error.InputTooLarge;
+    }
+    var index = start;
+    if (start == 0 and input.len >= 3 and input[0] == 0xef and input[1] == 0xbb and input[2] == 0xbf) {
+        index = 3;
+    }
+    while (index < input.len) {
+        index = try validateYamlInputByte(input, index, failure);
+    }
+}
+
+fn validateYamlInputByte(
+    input: []const u8,
+    index: usize,
+    failure: *?Failure,
+) error{Invalid}!usize {
+    const byte = input[index];
+    if (byte == 0xef and index != 0 and index + 2 < input.len and
+        input[index + 1] == 0xbb and input[index + 2] == 0xbf)
+    {
+        failure.* = .{ .err = error.Invalid, .kind = .syntax, .offset = index };
+        return error.Invalid;
+    }
+    if (byte < 0x20 and byte != '\n' and byte != '\r' and byte != ' ' and byte != '\t') {
+        failure.* = .{ .err = error.Invalid, .kind = .syntax, .offset = index };
+        return error.Invalid;
+    }
+    if (byte == 0x7f) {
+        failure.* = .{ .err = error.Invalid, .kind = .syntax, .offset = index };
+        return error.Invalid;
+    }
+    if (byte < 0x80) return index + 1;
+    const sequence_len = utf8SequenceLength(input, index) orelse {
+        failure.* = .{ .err = error.Invalid, .kind = .syntax, .offset = index };
+        return error.Invalid;
+    };
+    return index + sequence_len;
 }
 
 fn validateYamlSource(input: []const u8, failure: *?Failure) error{ Invalid, InputTooLarge }!void {
@@ -1622,31 +1685,42 @@ pub fn buildYamlTape(
     allocator: std.mem.Allocator,
     input: []const u8,
 ) YamlBuildError!YamlDocument {
-    var failure: ?Failure = null;
-    var structural_index = parseYamlIndex(allocator, input, &failure, null) catch |err| {
-        switch (err) {
-            error.Invalid, error.Unsupported, error.DepthExceeded => return err,
-            error.OutOfMemory => return error.OutOfMemory,
-            error.CapacityOverflow => return error.CapacityOverflow,
-            error.InputTooLarge => return error.InputTooLarge,
-            error.TapeTooLarge => return error.TapeTooLarge,
-        }
-    };
-    defer structural_index.deinit(allocator);
-    const tape = try allocator.alloc(YamlTapeWord, structural_index.count);
-    errdefer allocator.free(tape);
-
-    for (tape, 0..) |*word, token_index| {
-        const kind = structural_index.kinds[token_index];
-        const length = structural_index.lengths[token_index];
-        if (length > max_u24) return error.TapeTooLarge;
-        word.* = .{
-            .kind = @intFromEnum(kind),
-            .payload = @intCast(length),
-            .offset = structural_index.indexes[token_index],
+    var source_failure: ?Failure = null;
+    validateYamlSource(input, &source_failure) catch |err| {
+        return switch (err) {
+            error.Invalid => error.Invalid,
+            error.InputTooLarge => error.InputTooLarge,
         };
+    };
+    try validateTapeInputCapacity(input.len);
+
+    // Resident events are the tape authority; avoid materializing structural arrays.
+    var tape = try std.ArrayList(YamlTapeWord).initCapacity(allocator, @min(input.len, 64));
+    errdefer tape.deinit(allocator);
+
+    var engine = YamlResidentEngine.init();
+    engine.reset(input);
+    while (true) {
+        const event = engine.next(tape.items.len) catch |err| {
+            return switch (err) {
+                error.Invalid => error.Invalid,
+                error.Unsupported => error.Unsupported,
+                error.DepthExceeded => error.DepthExceeded,
+                error.InputTooLarge => error.InputTooLarge,
+                error.CapacityOverflow => error.CapacityOverflow,
+                error.TapeTooLarge => error.TapeTooLarge,
+            };
+        };
+        const value = event orelse break;
+        try tape.append(allocator, .{
+            .kind = @intFromEnum(value.kind),
+            .payload = @intCast(value.raw.len),
+            .offset = value.offset,
+        });
     }
-    return .{ .tape = tape, .source = input };
+
+    const owned_tape = try tape.toOwnedSlice(allocator);
+    return .{ .tape = owned_tape, .source = input };
 }
 
 const StreamFrame = struct {
@@ -2762,6 +2836,174 @@ fn whileSpaces(line: []const u8, start: usize, end: usize) usize {
 // the YAML index never depends on JSON Stage 2 storage or dialects.
 
 // ------------------------------ tests ----------------------------------
+fn expectYamlFailureEqual(expected: ?Failure, actual: ?Failure) !void {
+    if (expected) |expected_value| {
+        const actual_value = actual orelse return error.ExpectedYamlFailure;
+        try testing.expectEqual(expected_value.err, actual_value.err);
+        try testing.expectEqual(expected_value.kind, actual_value.kind);
+        try testing.expectEqual(expected_value.offset, actual_value.offset);
+    } else {
+        try testing.expect(actual == null);
+    }
+}
+
+fn expectYamlInputValidationEqual(input: []const u8) !void {
+    var expected_failure: ?Failure = null;
+    validateYamlInputScalar(input, &expected_failure) catch |expected_error| {
+        inline for ([_]usize{ 4, 16, 32, 64 }) |vector_len| {
+            var actual_failure: ?Failure = null;
+            try testing.expectError(
+                expected_error,
+                validateYamlInputImpl(vector_len, input, &actual_failure),
+            );
+            try expectYamlFailureEqual(expected_failure, actual_failure);
+        }
+        return;
+    };
+
+    inline for ([_]usize{ 4, 16, 32, 64 }) |vector_len| {
+        var actual_failure: ?Failure = null;
+        try validateYamlInputImpl(vector_len, input, &actual_failure);
+        try expectYamlFailureEqual(expected_failure, actual_failure);
+    }
+}
+
+fn expectYamlTapeMatchesIndexAndResident(input: []const u8) !void {
+    var index = try indexYaml(testing.allocator, input);
+    defer index.deinit(testing.allocator);
+    var tape_document = try buildYamlTape(testing.allocator, input);
+    defer tape_document.deinit(testing.allocator);
+    try testing.expectEqual(index.count, tape_document.tape.len);
+
+    var parser = try Parser.init(testing.allocator, 0);
+    defer parser.deinit();
+    var resident_document = try initOnDemandDocument(&parser, input);
+    defer resident_document.deinit();
+    var reader = try resident_document.eventReader();
+
+    for (tape_document.tape, 0..) |word, token_index| {
+        try testing.expectEqual(index.indexes[token_index], word.offset);
+        try testing.expectEqual(index.kinds[token_index], word.tapeKind());
+        try testing.expectEqual(
+            @as(usize, @intCast(index.lengths[token_index])),
+            word.sourceLength(),
+        );
+
+        const event = (try reader.next()) orelse return error.UnexpectedEnd;
+        try testing.expectEqual(word.tapeKind(), event.kind);
+        try testing.expectEqual(word.offset, event.offset);
+        try testing.expectEqual(word.sourceLength(), event.raw.len);
+    }
+    try testing.expectEqual(null, try reader.next());
+
+    var cursor = try tape_document.root(input);
+    for (tape_document.tape) |expected_word| {
+        try testing.expectEqual(expected_word, try cursor.peek());
+        try cursor.advance();
+    }
+    try testing.expectEqual(tape_document.tape.len, cursor.position());
+}
+
+test "YAML direct tape matches index and resident event order" {
+    const inputs = [_][]const u8{
+        "plain",
+        "mapping:\n" ++
+            "  empty:\n" ++
+            "  nested:\n" ++
+            "    -\n" ++
+            "    - value\n",
+        "root: {plain: [one, 'two''s', \"three\\u0033\"], empty:}\n",
+        "\xef\xbb\xbf--- # start\r\n" ++
+            "key: value\r\n" ++
+            "... # end\r\n",
+    };
+    for (inputs) |input| {
+        try expectYamlTapeMatchesIndexAndResident(input);
+    }
+}
+
+test "YAML printable ASCII validation matches scalar at vector boundaries" {
+    var input: [2 * 64 + 8]u8 = undefined;
+    inline for ([_]usize{ 4, 16, 32, 64 }) |boundary| {
+        const input_len = boundary + 4;
+        @memset(input[0..input_len], 'a');
+        try expectYamlInputValidationEqual(input[0..input_len]);
+
+        for ([_]usize{ boundary - 1, boundary, boundary + 1 }) |offset| {
+            @memset(input[0..input_len], 'a');
+            input[offset] = '\n';
+            try expectYamlInputValidationEqual(input[0..input_len]);
+
+            input[offset] = '\t';
+            try expectYamlInputValidationEqual(input[0..input_len]);
+
+            input[offset] = 0x1f;
+            try expectYamlInputValidationEqual(input[0..input_len]);
+
+            input[offset] = 0x7f;
+            try expectYamlInputValidationEqual(input[0..input_len]);
+        }
+
+        @memset(input[0..input_len], 'a');
+        input[boundary - 1] = 0xc3;
+        input[boundary] = 0xa9;
+        try expectYamlInputValidationEqual(input[0..input_len]);
+
+        @memset(input[0..input_len], 'a');
+        input[boundary - 1] = 0xc3;
+        var utf8_failure: ?Failure = null;
+        try testing.expectError(
+            error.Invalid,
+            validateYamlInputImpl(boundary, input[0..input_len], &utf8_failure),
+        );
+        try testing.expectEqual(boundary - 1, utf8_failure.?.offset);
+        try expectYamlInputValidationEqual(input[0..input_len]);
+
+        @memset(input[0..input_len], 'a');
+        input[boundary - 1 .. boundary + 2].* = .{ 0xef, 0xbb, 0xbf };
+        var bom_failure: ?Failure = null;
+        try testing.expectError(
+            error.Invalid,
+            validateYamlInputImpl(boundary, input[0..input_len], &bom_failure),
+        );
+        try testing.expectEqual(boundary - 1, bom_failure.?.offset);
+        try expectYamlInputValidationEqual(input[0..input_len]);
+    }
+
+    @memset(input[0..], 'a');
+    input[0..3].* = .{ 0xef, 0xbb, 0xbf };
+    try expectYamlInputValidationEqual(input[0..]);
+}
+
+test "YAML input validity retains precedence over indentation errors" {
+    var input: [72]u8 = undefined;
+    @memset(input[0..], 'a');
+    input[0] = '\t';
+    input[64] = 0x7f;
+
+    var failure: ?Failure = null;
+    try testing.expectError(error.Invalid, validateYamlSource(&input, &failure));
+    try testing.expectEqual(@as(usize, 64), failure.?.offset);
+
+    input[64] = 0xc0;
+    input[65] = 0x80;
+    failure = null;
+    try testing.expectError(error.Invalid, validateYamlSource(&input, &failure));
+    try testing.expectEqual(@as(usize, 64), failure.?.offset);
+
+    input[64] = 'a';
+    input[65] = 'a';
+    failure = null;
+    try testing.expectError(error.Invalid, validateYamlSource(&input, &failure));
+    try testing.expectEqual(@as(usize, 0), failure.?.offset);
+
+    failure = null;
+    try testing.expectError(
+        error.Invalid,
+        validateYamlSource("\xef\xbb\xbf\tkey: value\n", &failure),
+    );
+    try testing.expectEqual(@as(usize, 3), failure.?.offset);
+}
 
 test "YAML accepts one document with block mapping and nested sequence" {
     const input =
@@ -3097,6 +3339,20 @@ test "YAML resident reader is lazy borrowed guarded and reusable" {
     try testing.expect((try cursor.peek()) == null);
 }
 
+test "YAML direct tape preserves u24 span rejection" {
+    const input = try testing.allocator.alloc(u8, max_u24 + 1);
+    defer testing.allocator.free(input);
+    @memset(input, 'a');
+    try testing.expectError(error.TapeTooLarge, buildYamlTape(testing.allocator, input));
+
+    var parser = try Parser.init(testing.allocator, 0);
+    defer parser.deinit();
+    var document = try initOnDemandDocument(&parser, input);
+    defer document.deinit();
+    var reader = try document.eventReader();
+    try testing.expectError(error.TapeTooLarge, reader.next());
+}
+
 test "YAML resident parser enforces capacity and depth limits" {
     var fixed = try Parser.init(testing.allocator, 4);
     defer fixed.deinit();
@@ -3117,6 +3373,10 @@ test "YAML resident parser enforces capacity and depth limits" {
     try testing.expectError(
         error.DepthExceeded,
         indexYaml(testing.allocator, input.items),
+    );
+    try testing.expectError(
+        error.DepthExceeded,
+        buildYamlTape(testing.allocator, input.items),
     );
 }
 
