@@ -359,3 +359,30 @@ Evidence is under
 Earlier `initial-paired-*`, `final-paired-*`, and `final-summary.json` describe
 the rejected two-pass Markdown binary. `single-pass-paired-*` precedes the final
 YAML fallback correction. Only the `accepted-*` series describes the final source.
+
+External integration also passed: the declared Nix environment completed the
+full Release build in `build-performance` against the clean parser snapshot.
+All seven CTest targets passed. A 56-invocation baseline/candidate smoke matrix
+covered all seven native adapters, both modes, and both corpus groups. Its 106
+case pairs match source hashes, byte counts, outcomes, checksums, work profiles,
+preparation policies, timed iteration counts, and CPU affinity. See
+`external-checks.json` and `external-*.json`. This is correctness smoke evidence,
+not an external timing ranking or a change to the packet comparator policy.
+
+Focused XML counters over the attribute/text probe decreased from 12.675 to
+3.007 billion user cycles and from 21.642 to 10.606 billion retired instructions.
+The combined probe includes validation and tape consumption; see
+`xml-counters.json` for exact commands.
+
+Seven additional paired YAML validation probes exercised long printable spans.
+Median candidate/baseline user-cycle ratios were 0.770 for ASCII and 0.815 for
+mixed UTF-8; instruction ratios were 0.793 and 0.856. Every pair improved.
+The separate 32-byte-line boundary probe had neutral ASCII timing and about
+0.7% more instructions: it cannot skip a full printable block. These results
+bound the claim to inputs with useful printable spans. Sources and raw counters
+are in `yaml-validation-probe.zig` and `yaml-validation*-counters.json`.
+
+`reproduce-pairs.py` checks archived executable hashes, alternates process order,
+and verifies all 210 cases and 35 input hashes per pair. Its standalone
+`reproduction-check` run passed all seven pairs. `accepted-identity.json` records
+the final executable hashes and measurement limits.
