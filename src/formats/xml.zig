@@ -1978,9 +1978,7 @@ const XmlParser = struct {
 
     fn parseText(self: *XmlParser) XmlParseError!void {
         const start = self.position;
-        while (self.position < self.input.len and self.input[self.position] != '<') {
-            self.position += 1;
-        }
+        self.position = findXmlTextEnd(self.input, start);
         try self.validateData(start, self.position, true, true, false);
         if (self.stack_top == 0) {
             if (!isXmlWhitespaceOnly(self.input[start..self.position])) {
@@ -2001,6 +1999,18 @@ const XmlParser = struct {
     ) XmlParseError!void {
         var cursor = start;
         while (cursor < end) {
+            const ascii_end = skipXmlAsciiData(
+                self.input,
+                cursor,
+                end,
+                entities,
+                forbid_cdata_end,
+                forbid_less_than,
+            );
+            if (ascii_end != cursor) {
+                cursor = ascii_end;
+                if (cursor >= end) break;
+            }
             if (forbid_less_than and self.input[cursor] == '<') {
                 return self.fail(error.InvalidAttribute, cursor);
             }
@@ -2815,12 +2825,86 @@ pub fn initStreamIndexer(
 ) XmlStreamIndexer.InitError!XmlStreamIndexer {
     return XmlStreamIndexer.init(allocator, chunk_len);
 }
+// Text candidate: find the next markup delimiter without decoding ordinary bytes.
+fn findXmlTextEnd(input: []const u8, start: usize) usize {
+    const vector_len = simd.default_vector_len;
+    const Mask = simd.Mask(vector_len);
+    const MaskStorage = if (vector_len <= 8)
+        u8
+    else if (vector_len <= 16)
+        u16
+    else if (vector_len <= 32)
+        u32
+    else if (vector_len <= 64)
+        u64
+    else
+        @Int(.unsigned, (vector_len + 7) / 8 * 8);
+    const logical_mask: MaskStorage = @intCast(std.math.maxInt(Mask));
+    var cursor = start;
+    while (input.len - cursor >= vector_len) {
+        const block: simd.Vec(vector_len, u8) = input[cursor..][0..vector_len].*;
+        const less_than: Mask = simd.matchByte(vector_len, block, '<');
+        // Non-byte-aligned masks have spare storage bits; clear them before `@ctz`.
+        const less_than_storage =
+            @as(MaskStorage, @intCast(less_than)) & logical_mask;
+        if (less_than_storage != 0) {
+            return cursor + @as(usize, @intCast(@ctz(less_than_storage)));
+        }
+        cursor += vector_len;
+    }
+    while (cursor < input.len and input[cursor] != '<') : (cursor += 1) {}
+    return cursor;
+}
+
+// Text candidate: stop before bytes that require entity, delimiter, or UTF-8 checks.
+fn skipXmlAsciiData(
+    input: []const u8,
+    start: usize,
+    end: usize,
+    entities: bool,
+    forbid_cdata_end: bool,
+    forbid_less_than: bool,
+) usize {
+    var cursor = start;
+    while (cursor < end) {
+        const byte = input[cursor];
+        if (byte >= 0x20 and byte <= 0x7E) {
+            if (entities and byte == '&') break;
+            if (forbid_cdata_end and byte == ']') break;
+            if (forbid_less_than and byte == '<') break;
+            cursor += 1;
+            continue;
+        }
+        if (byte == '\t' or byte == '\n' or byte == '\r') {
+            cursor += 1;
+            continue;
+        }
+        break;
+    }
+    return cursor;
+}
+// Name candidate: classify ASCII bytes directly and retain checked Unicode fallback.
 fn parseXmlName(input: []const u8, start: usize) ?usize {
     if (start >= input.len) return null;
-    const first = decodeXml(input, start) orelse return null;
-    if (!isXmlNameStart(first.codepoint)) return null;
-    var cursor = start + first.length;
+
+    var cursor = start;
+    const first_byte = input[cursor];
+    if (first_byte < 0x80) {
+        if (!isAsciiXmlNameStart(first_byte)) return null;
+        cursor += 1;
+    } else {
+        const decoded = decodeXml(input, cursor) orelse return null;
+        if (!isXmlNameStart(decoded.codepoint)) return null;
+        cursor += decoded.length;
+    }
+
     while (cursor < input.len) {
+        const byte = input[cursor];
+        if (byte < 0x80) {
+            if (!isAsciiXmlNameChar(byte)) break;
+            cursor += 1;
+            continue;
+        }
         const decoded = decodeXml(input, cursor) orelse return cursor;
         if (!isXmlNameChar(decoded.codepoint)) break;
         cursor += decoded.length;
@@ -2828,6 +2912,18 @@ fn parseXmlName(input: []const u8, start: usize) ?usize {
     return cursor;
 }
 
+fn isAsciiXmlNameStart(byte: u8) bool {
+    return byte == ':' or byte == '_' or
+        (byte >= 'A' and byte <= 'Z') or
+        (byte >= 'a' and byte <= 'z');
+}
+
+fn isAsciiXmlNameChar(byte: u8) bool {
+    return isAsciiXmlNameStart(byte) or byte == '-' or byte == '.' or
+        (byte >= '0' and byte <= '9');
+}
+
+// Attribute candidate: retain exact name equality while accelerating bounded value skips.
 fn hasPreviousXmlAttribute(
     input: []const u8,
     attributes_start: usize,
@@ -2848,9 +2944,12 @@ fn hasPreviousXmlAttribute(
         if (cursor >= current_start or (input[cursor] != '\'' and input[cursor] != '"')) return false;
         const quote = input[cursor];
         cursor += 1;
-        while (cursor < current_start and input[cursor] != quote) : (cursor += 1) {}
-        if (cursor >= current_start) return false;
-        cursor += 1;
+        const quote_end = std.mem.indexOfScalar(
+            u8,
+            input[cursor..current_start],
+            quote,
+        ) orelse return false;
+        cursor += quote_end + 1;
     }
     return false;
 }
@@ -3109,6 +3208,11 @@ test "validateXml reports matching and root errors at the first invalid byte" {
     try testing.expectEqual(@as(usize, 0), unclosed.byte_offset);
 }
 
+test "XML fast paths preserve Unicode name and text boundaries" {
+    const input = "<\xC3\xA9 attr\xC3\xA9=\"v\">\xC3\xA9&amp;ok</\xC3\xA9>";
+    try testing.expectEqual(@as(?XmlDiagnostic, null), try validateXml(input));
+}
+
 test "validateXml rejects malformed attributes names entities and XML characters" {
     const duplicate = try expectXmlDiagnostic(error.DuplicateAttribute, "<a x='1' x=\"2\"/>");
     try testing.expectEqual(@as(usize, 9), duplicate.byte_offset);
@@ -3134,6 +3238,8 @@ test "validateXml rejects malformed attributes names entities and XML characters
     const invalid_utf8 = [_]u8{ '<', 'a', '>', 0xc0, 0xaf, '<', '/', 'a', '>' };
     const utf8 = try expectXmlDiagnostic(error.InvalidUtf8, &invalid_utf8);
     try testing.expectEqual(@as(usize, 3), utf8.byte_offset);
+    const cdata_end = try expectXmlDiagnostic(error.InvalidCharacter, "<a>text]]>tail</a>");
+    try testing.expectEqual(@as(usize, 7), cdata_end.byte_offset);
 }
 
 test "validateXml preserves the earliest lexical or grammar diagnostic" {
