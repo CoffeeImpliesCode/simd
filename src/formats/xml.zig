@@ -2063,7 +2063,7 @@ fn findFirstInvalidXmlChar(input: []const u8, limit: usize) ?usize {
         const ef_mask = @as(MaskStorage, @intCast(ef_mask_raw)) & logical_mask;
 
         if ((ctrl_mask | ef_mask) != 0) {
-            var earliest: usize = cursor + vector_len;
+            var earliest: ?usize = null;
             if (ctrl_mask != 0) {
                 earliest = cursor + @as(usize, @intCast(@ctz(ctrl_mask)));
             }
@@ -2075,13 +2075,15 @@ fn findFirstInvalidXmlChar(input: []const u8, limit: usize) ?usize {
                     if (idx + 2 < input.len and input[idx + 1] == 0xBF and
                         (input[idx + 2] == 0xBE or input[idx + 2] == 0xBF))
                     {
-                        if (idx < earliest) earliest = idx;
+                        if (earliest == null or idx < earliest.?) earliest = idx;
                         break;
                     }
                     remaining_ef &= remaining_ef - 1;
                 }
             }
-            if (earliest < limit) return earliest;
+            if (earliest) |pos| {
+                if (pos < limit) return pos;
+            }
         }
     }
 
