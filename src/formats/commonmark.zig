@@ -255,6 +255,11 @@ const Prefixes = struct {
     items: [64]Prefix = undefined,
     len: u32 = 0,
     content_start: usize = 0,
+
+    pub fn clear(self: *Prefixes) void {
+        self.len = 0;
+        self.content_start = 0;
+    }
 };
 
 const PrefixDepth = 128;
@@ -314,6 +319,16 @@ const Builder = struct {
     fn appendNormalizedBytes(self: *Builder, bytes: []const u8) ParseError!void {
         var index: usize = 0;
         while (index < bytes.len) {
+            var run_end = index;
+            while (run_end < bytes.len and bytes[run_end] != 0 and bytes[run_end] < 0x80) : (run_end += 1) {}
+            if (run_end > index) {
+                const run_len = run_end - index;
+                try self.charge(run_len);
+                try self.appendBytesToCurrent(bytes[index..run_end]);
+                index = run_end;
+                if (index == bytes.len) break;
+            }
+
             try self.charge(1);
             const byte = bytes[index];
             if (byte == 0 and self.options.replace_nul) {
@@ -520,8 +535,8 @@ fn scanLines(builder: *Builder) ParseError!void {
     // Empty input has no physical lines and therefore no blocks.
 }
 
-fn parsePrefixes(builder: *Builder, line: Line) ParseError!Prefixes {
-    var result = Prefixes{};
+fn parsePrefixes(builder: *Builder, line: Line, result: *Prefixes) ParseError!void {
+    result.clear();
     var cursor: usize = line.start;
     var column: usize = 0;
     while (cursor < line.end) {
@@ -675,7 +690,6 @@ fn parsePrefixes(builder: *Builder, line: Line) ParseError!Prefixes {
         break;
     }
     result.content_start = if (result.len == 0) line.start else cursor;
-    return result;
 }
 
 fn leadingIndentColumns(source: []const u8, start: usize, end: usize) usize {
@@ -725,39 +739,39 @@ fn parseBlocks(builder: *Builder) ParseError!void {
     var blank_line_pending = false;
     while (line_index < builder.lines.items.len) : (line_index += 1) {
         const line = builder.lines.items[line_index];
-        var prefixes: Prefixes = undefined;
+        var prefixes = Prefixes{};
         if (active) |block| {
             const block_node = builder.nodes.items[@intFromEnum(block.node)];
             if (block_node.kind == .html_block or
                 (block_node.kind == .code_block and block.code_fence != 0))
             {
                 if (container_len == 0) {
-                    prefixes = .{};
+                    prefixes.clear();
                     prefixes.content_start = line.start;
                 } else {
-                    prefixes = try parsePrefixes(builder, line);
+                    try parsePrefixes(builder, line, &prefixes);
                 }
             } else {
-                prefixes = try parsePrefixes(builder, line);
+                try parsePrefixes(builder, line, &prefixes);
             }
         } else {
-            prefixes = try parsePrefixes(builder, line);
+            try parsePrefixes(builder, line, &prefixes);
         }
         if (container_len == 0 and prefixes.len != 0 and prefixes.items[0].kind == .list and prefixes.items[0].ordered and
             prefixes.items[0].list_start != 1 and
             active != null and builder.nodes.items[@intFromEnum(active.?.node)].kind == .paragraph)
         {
-            prefixes = .{};
+            prefixes.clear();
             prefixes.content_start = line.start;
         }
         if (line.indent <= 3 and isThematicBreak(builder.source[line.content_start..line.end])) {
-            prefixes = .{};
+            prefixes.clear();
             prefixes.content_start = line.content_start;
         }
         if (container_len == 0 and active != null and prefixes.len == 1 and
             prefixes.items[0].kind == .list and prefixes.content_start == line.end)
         {
-            prefixes = .{};
+            prefixes.clear();
             prefixes.content_start = line.content_start;
         }
         var next_len: u32 = 0;
@@ -931,7 +945,7 @@ fn parseBlocks(builder: *Builder) ParseError!void {
                 next_len = container_len;
             }
             if (prefix_index == 0 and prefixes.len != 0 and prefixes.items[0].indent >= 4) {
-                prefixes = .{};
+                prefixes.clear();
                 prefixes.content_start = line.start;
             }
             var retain_lazy_quotes = false;
