@@ -2021,7 +2021,83 @@ const XmlTapeOutput = struct {
     }
 };
 
-const XmlSourceProof = struct {};
+const XmlSourceProof = struct {
+    char_proven: bool = true,
+};
+
+fn findFirstInvalidXmlChar(input: []const u8, limit: usize) ?usize {
+    const vector_len = simd.default_vector_len;
+    const Mask = simd.Mask(vector_len);
+    const MaskStorage = if (vector_len <= 8)
+        u8
+    else if (vector_len <= 16)
+        u16
+    else if (vector_len <= 32)
+        u32
+    else if (vector_len <= 64)
+        u64
+    else
+        @Int(.unsigned, (vector_len + 7) / 8 * 8);
+    const logical_mask: MaskStorage = @intCast(std.math.maxInt(Mask));
+    var cursor: usize = 0;
+
+    const Vec = simd.Vec(vector_len, u8);
+    const splat_20: Vec = @splat(0x20);
+    const splat_tab: Vec = @splat(0x09);
+    const splat_lf: Vec = @splat(0x0A);
+    const splat_cr: Vec = @splat(0x0D);
+    const splat_ef: Vec = @splat(0xEF);
+
+    while (limit - cursor >= vector_len) : (cursor += vector_len) {
+        const block: Vec = input[cursor..][0..vector_len].*;
+        const is_ctrl = block < splat_20;
+        const is_tab = block == splat_tab;
+        const is_lf = block == splat_lf;
+        const is_cr = block == splat_cr;
+        const is_ws = is_tab | is_lf | is_cr;
+        const invalid_ctrl = is_ctrl & ~is_ws;
+        const ctrl_mask_raw: Mask = @bitCast(invalid_ctrl);
+        const ctrl_mask = @as(MaskStorage, @intCast(ctrl_mask_raw)) & logical_mask;
+        const ef_eq = block == splat_ef;
+        const ef_mask_raw: Mask = @bitCast(ef_eq);
+        const ef_mask = @as(MaskStorage, @intCast(ef_mask_raw)) & logical_mask;
+
+        if ((ctrl_mask | ef_mask) != 0) {
+            var earliest: usize = cursor + vector_len;
+            if (ctrl_mask != 0) {
+                earliest = cursor + @as(usize, @intCast(@ctz(ctrl_mask)));
+            }
+            if (ef_mask != 0) {
+                var remaining_ef = ef_mask;
+                while (remaining_ef != 0) {
+                    const bit: usize = @intCast(@ctz(remaining_ef));
+                    const idx = cursor + bit;
+                    if (idx + 2 < input.len and input[idx + 1] == 0xBF and
+                        (input[idx + 2] == 0xBE or input[idx + 2] == 0xBF))
+                    {
+                        if (idx < earliest) earliest = idx;
+                        break;
+                    }
+                    remaining_ef &= remaining_ef - 1;
+                }
+            }
+            if (earliest < limit) return earliest;
+        }
+    }
+
+    while (cursor < limit) : (cursor += 1) {
+        const byte = input[cursor];
+        if (byte < 0x20 and byte != 0x09 and byte != 0x0A and byte != 0x0D) {
+            return cursor;
+        }
+        if (byte == 0xEF and cursor + 2 < input.len and input[cursor + 1] == 0xBF and
+            (input[cursor + 2] == 0xBE or input[cursor + 2] == 0xBF))
+        {
+            return cursor;
+        }
+    }
+    return null;
+}
 
 const XmlParser = struct {
     input: []const u8,
@@ -2131,26 +2207,17 @@ const XmlParser = struct {
             ),
         };
 
-        var source_index: usize = 0;
-        while (source_index < self.input.len) {
-            if (invalid_utf8_offset) |offset| {
-                if (source_index >= offset) {
-                    self.source_error = error.InvalidUtf8;
-                    self.source_failure_offset = offset;
-                    return;
-                }
-            }
-            const decoded = decodeXml(self.input, source_index) orelse {
-                self.source_error = error.InvalidUtf8;
-                self.source_failure_offset = source_index;
-                return;
-            };
-            if (!isXmlCharacter(decoded.codepoint)) {
-                self.source_error = error.InvalidCharacter;
-                self.source_failure_offset = source_index;
-                return;
-            }
-            source_index += decoded.length;
+        const utf8_limit = invalid_utf8_offset orelse self.input.len;
+        if (findFirstInvalidXmlChar(self.input, utf8_limit)) |invalid_char_offset| {
+            self.source_error = error.InvalidCharacter;
+            self.source_failure_offset = invalid_char_offset;
+            return;
+        }
+
+        if (invalid_utf8_offset) |offset| {
+            self.source_error = error.InvalidUtf8;
+            self.source_failure_offset = offset;
+            return;
         }
     }
 
@@ -2288,17 +2355,7 @@ const XmlParser = struct {
             if (forbid_cdata_end and startsWithAt(self.input, cursor, "]]>")) {
                 return self.fail(error.InvalidCharacter, cursor);
             }
-            if (self.input[cursor] < 0x80) {
-                cursor += 1;
-                continue;
-            }
-            const sequence_length = xmlUtf8SequenceLength(self.input[cursor]) orelse {
-                return self.fail(error.InvalidUtf8, cursor);
-            };
-            if (sequence_length > end - cursor) {
-                return self.fail(error.InvalidUtf8, cursor);
-            }
-            cursor += sequence_length;
+            cursor += 1;
         }
     }
 
@@ -3191,22 +3248,42 @@ fn skipXmlProvenData(
     forbid_less_than: bool,
 ) usize {
     if (!entities and !forbid_cdata_end and !forbid_less_than) return end;
+    const vector_len = simd.default_vector_len;
+    const Mask = simd.Mask(vector_len);
+    const MaskStorage = if (vector_len <= 8)
+        u8
+    else if (vector_len <= 16)
+        u16
+    else if (vector_len <= 32)
+        u32
+    else if (vector_len <= 64)
+        u64
+    else
+        @Int(.unsigned, (vector_len + 7) / 8 * 8);
+    const logical_mask: MaskStorage = @intCast(std.math.maxInt(Mask));
+
     var cursor = start;
+    while (end - cursor >= vector_len) {
+        const block: simd.Vec(vector_len, u8) = input[cursor..][0..vector_len].*;
+        var mask: Mask = 0;
+        if (entities) mask |= simd.matchByte(vector_len, block, '&');
+        if (forbid_cdata_end) mask |= simd.matchByte(vector_len, block, ']');
+        if (forbid_less_than) mask |= simd.matchByte(vector_len, block, '<');
+        const storage = @as(MaskStorage, @intCast(mask)) & logical_mask;
+        if (storage != 0) {
+            return cursor + @as(usize, @intCast(@ctz(storage)));
+        }
+        cursor += vector_len;
+    }
     while (cursor < end) {
         const byte = input[cursor];
-        if (byte < 0x80) {
-            if ((entities and byte == '&') or
-                (forbid_cdata_end and byte == ']') or
-                (forbid_less_than and byte == '<'))
-            {
-                break;
-            }
-            cursor += 1;
-            continue;
+        if ((entities and byte == '&') or
+            (forbid_cdata_end and byte == ']') or
+            (forbid_less_than and byte == '<'))
+        {
+            break;
         }
-        const sequence_length = xmlUtf8SequenceLength(byte) orelse break;
-        if (sequence_length > end - cursor) break;
-        cursor += sequence_length;
+        cursor += 1;
     }
     return cursor;
 }
@@ -3244,13 +3321,31 @@ fn parseXmlName(input: []const u8, start: usize) ?usize {
     return cursor;
 }
 
+const ascii_name_start_table: [256]bool = blk: {
+    var table = [_]bool{false} ** 256;
+    for (0..256) |i| {
+        const b: u8 = @intCast(i);
+        if (b < 0x80 and isAsciiXmlNameStart(b)) {
+            table[i] = true;
+        }
+    }
+    break :blk table;
+};
+
+const ascii_name_char_table: [256]bool = blk: {
+    var table = [_]bool{false} ** 256;
+    for (0..256) |i| {
+        const b: u8 = @intCast(i);
+        if (b < 0x80 and isAsciiXmlNameChar(b)) {
+            table[i] = true;
+        }
+    }
+    break :blk table;
+};
+
 fn scanAsciiXmlNameChars(input: []const u8, start: usize) usize {
     var cursor = start;
-    while (cursor < input.len) {
-        const byte = input[cursor];
-        if (byte >= 0x80 or !isAsciiXmlNameChar(byte)) break;
-        cursor += 1;
-    }
+    while (cursor < input.len and ascii_name_char_table[input[cursor]]) : (cursor += 1) {}
     return cursor;
 }
 
@@ -3329,6 +3424,24 @@ const XmlEntityDecoded = struct {
     codepoint: u21,
 };
 
+pub fn parsePredefinedEntity(body: []const u8) ?u21 {
+    if (body.len < 2 or body.len > 4) return null;
+    return switch (body.len) {
+        2 => switch (body[0]) {
+            'l' => if (body[1] == 't') '<' else null,
+            'g' => if (body[1] == 't') '>' else null,
+            else => null,
+        },
+        3 => if (body[0] == 'a' and body[1] == 'm' and body[2] == 'p') '&' else null,
+        4 => switch (body[0]) {
+            'a' => if (body[1] == 'p' and body[2] == 'o' and body[3] == 's') '\'' else null,
+            'q' => if (body[1] == 'u' and body[2] == 'o' and body[3] == 't') '"' else null,
+            else => null,
+        },
+        else => null,
+    };
+}
+
 fn parseXmlEntity(
     input: []const u8,
     start: usize,
@@ -3339,20 +3452,8 @@ fn parseXmlEntity(
     while (cursor < end and input[cursor] != ';') : (cursor += 1) {}
     if (cursor >= end or cursor == start + 1) return error.InvalidEntity;
     const body = input[start + 1 .. cursor];
-    if (std.mem.eql(u8, body, "amp")) {
-        return .{ .next = cursor + 1, .codepoint = '&' };
-    }
-    if (std.mem.eql(u8, body, "lt")) {
-        return .{ .next = cursor + 1, .codepoint = '<' };
-    }
-    if (std.mem.eql(u8, body, "gt")) {
-        return .{ .next = cursor + 1, .codepoint = '>' };
-    }
-    if (std.mem.eql(u8, body, "apos")) {
-        return .{ .next = cursor + 1, .codepoint = '\'' };
-    }
-    if (std.mem.eql(u8, body, "quot")) {
-        return .{ .next = cursor + 1, .codepoint = '"' };
+    if (parsePredefinedEntity(body)) |codepoint| {
+        return .{ .next = cursor + 1, .codepoint = codepoint };
     }
 
     if (body[0] != '#') return error.InvalidEntity;
