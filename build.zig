@@ -84,6 +84,12 @@ pub fn build(b: *std.Build) void {
     fuzz_test_mod.addImport("simd_lib", lib_mod);
     lib_test_mod.addImport("simd_lib", lib_mod);
 
+    const commonmark_test_mod = b.createModule(.{
+        .root_source_file = b.path("test/commonmark_conformance_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    commonmark_test_mod.addImport("simd_lib", lib_mod);
     // We will also create a module for our other entry point, 'main.zig'.
     const exe_mod = b.createModule(.{
         // `root_source_file` is the Zig "entry point" of the module. If a module
@@ -175,6 +181,10 @@ pub fn build(b: *std.Build) void {
         .root_module = corpus_test_mod,
     });
     const run_corpus_tests = b.addRunArtifact(corpus_tests);
+    const commonmark_tests = b.addTest(.{
+        .root_module = commonmark_test_mod,
+    });
+    const run_commonmark_tests = b.addRunArtifact(commonmark_tests);
 
     const bench_exe = b.addExecutable(.{
         .name = "simd-bench",
@@ -187,6 +197,10 @@ pub fn build(b: *std.Build) void {
 
     const corpus_step = b.step("corpus", "Run offline corpus catalogs");
     corpus_step.dependOn(&run_corpus_tests.step);
+    corpus_step.dependOn(&run_commonmark_tests.step);
+
+    const commonmark_step = b.step("commonmark", "Run pinned CommonMark conformance and ownership tests");
+    commonmark_step.dependOn(&run_commonmark_tests.step);
 
     const fuzz_step = b.step("fuzz", "Run deterministic Smith fuzz tests");
     fuzz_step.dependOn(&run_smith_fuzz_tests.step);

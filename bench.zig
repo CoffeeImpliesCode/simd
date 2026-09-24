@@ -10,6 +10,10 @@ const STREAM_CHUNK_LEN: usize = 4096;
 const RESIDENT_PREFIX_EVENT_COUNT: usize = 8;
 const DEFAULT_ITERATIONS: usize = 3;
 const workload_scale: usize = 64;
+const BenchOptions = struct {
+    iterations: usize = DEFAULT_ITERATIONS,
+    stream_chunk_len: usize = STREAM_CHUNK_LEN,
+};
 
 const Format = enum {
     json,
@@ -696,10 +700,10 @@ fn runTapeOnce(
     }
 }
 
-fn feedChunks(indexer: anytype, input: []const u8) !void {
+fn feedChunks(indexer: anytype, input: []const u8, chunk_len: usize) !void {
     var offset: usize = 0;
     while (offset < input.len) {
-        const end = @min(offset + STREAM_CHUNK_LEN, input.len);
+        const end = @min(offset + chunk_len, input.len);
         try indexer.feed(input[offset..end]);
         offset = end;
     }
@@ -710,12 +714,13 @@ fn runStreamOnce(
     allocator: Allocator,
     input: []const u8,
     checksum: *u64,
+    chunk_len: usize,
 ) !void {
     switch (format) {
         .json => {
-            var indexer = try lib.formats.json.initStreamIndexer(allocator, STREAM_CHUNK_LEN);
+            var indexer = try lib.formats.json.initStreamIndexer(allocator, chunk_len);
             errdefer indexer.deinit();
-            try feedChunks(&indexer, input);
+            try feedChunks(&indexer, input, chunk_len);
             try indexer.finish();
             var index = indexer.take();
             indexer.deinit();
@@ -724,9 +729,9 @@ fn runStreamOnce(
             index.deinit(allocator);
         },
         .jsonl => {
-            var indexer = try lib.formats.jsonl.initStreamIndexer(allocator, STREAM_CHUNK_LEN);
+            var indexer = try lib.formats.jsonl.initStreamIndexer(allocator, chunk_len);
             errdefer indexer.deinit();
-            try feedChunks(&indexer, input);
+            try feedChunks(&indexer, input, chunk_len);
             try indexer.finish();
             var index = indexer.take();
             indexer.deinit();
@@ -735,9 +740,9 @@ fn runStreamOnce(
             index.deinit(allocator);
         },
         .jsonc => {
-            var indexer = try lib.formats.jsonc.initStreamIndexer(allocator, STREAM_CHUNK_LEN);
+            var indexer = try lib.formats.jsonc.initStreamIndexer(allocator, chunk_len);
             errdefer indexer.deinit();
-            try feedChunks(&indexer, input);
+            try feedChunks(&indexer, input, chunk_len);
             try indexer.finish();
             var index = indexer.take();
             indexer.deinit();
@@ -746,9 +751,9 @@ fn runStreamOnce(
             index.deinit(allocator);
         },
         .json5 => {
-            var indexer = try lib.formats.json5.initStreamIndexer(allocator, STREAM_CHUNK_LEN);
+            var indexer = try lib.formats.json5.initStreamIndexer(allocator, chunk_len);
             errdefer indexer.deinit();
-            try feedChunks(&indexer, input);
+            try feedChunks(&indexer, input, chunk_len);
             try indexer.finish();
             var index = indexer.take();
             indexer.deinit();
@@ -759,10 +764,10 @@ fn runStreamOnce(
         .markdown => {
             var indexer = try lib.formats.markdown.MarkdownStreamIndexer.init(
                 allocator,
-                STREAM_CHUNK_LEN,
+                chunk_len,
             );
             errdefer indexer.deinit();
-            try feedChunks(&indexer, input);
+            try feedChunks(&indexer, input, chunk_len);
             try indexer.finish();
             var index = indexer.take();
             indexer.deinit();
@@ -771,9 +776,9 @@ fn runStreamOnce(
             index.deinit(allocator);
         },
         .xml => {
-            var indexer = try lib.formats.xml.XmlStreamIndexer.init(allocator, STREAM_CHUNK_LEN);
+            var indexer = try lib.formats.xml.XmlStreamIndexer.init(allocator, chunk_len);
             errdefer indexer.deinit();
-            try feedChunks(&indexer, input);
+            try feedChunks(&indexer, input, chunk_len);
             try indexer.finish();
             var index = indexer.take();
             indexer.deinit();
@@ -792,9 +797,9 @@ fn runStreamOnce(
             index.deinit(allocator);
         },
         .yaml => {
-            var indexer = try lib.formats.yaml.YamlStreamIndexer.init(allocator, STREAM_CHUNK_LEN);
+            var indexer = try lib.formats.yaml.YamlStreamIndexer.init(allocator, chunk_len);
             errdefer indexer.deinit();
-            try feedChunks(&indexer, input);
+            try feedChunks(&indexer, input, chunk_len);
             try indexer.finish();
             var index = indexer.take();
             indexer.deinit();
@@ -959,6 +964,7 @@ fn runStage(
     input: Input,
     stage: Stage,
     iterations: usize,
+    stream_chunk_len: usize,
 ) !Sample {
     switch (stage) {
         .traverse_all, .traverse_prefix8 => {
@@ -977,7 +983,13 @@ fn runStage(
             .index => try runIndexOnce(input.format, counted, input.bytes, &checksum),
             .validate => try runValidateOnce(input.format, counted, input.bytes, &checksum),
             .tape => try runTapeOnce(input.format, counted, input.bytes, &checksum),
-            .stream => try runStreamOnce(input.format, counted, input.bytes, &checksum),
+            .stream => try runStreamOnce(
+                input.format,
+                counted,
+                input.bytes,
+                &checksum,
+                stream_chunk_len,
+            ),
             .traverse_all, .traverse_prefix8 => unreachable,
         }
         std.mem.doNotOptimizeAway(&checksum);
@@ -1345,21 +1357,53 @@ fn buildInputs(allocator: Allocator) ![input_count]Input {
     return inputs;
 }
 
-fn parseIterations(args: []const []const u8) !usize {
-    if (args.len > 2) return error.UnexpectedArgument;
-    if (args.len == 1) return DEFAULT_ITERATIONS;
-    const iterations = std.fmt.parseUnsigned(usize, args[1], 10) catch {
-        return error.InvalidIterationCount;
+fn isSupportedStreamChunkLen(chunk_len: usize) bool {
+    return switch (chunk_len) {
+        64, 256, 1024, 4096, 16384 => true,
+        else => false,
     };
-    if (iterations == 0) return error.InvalidIterationCount;
-    return iterations;
+}
+
+// Sweep invocation: `zig build bench -- --stream-chunk-size 64`.
+fn parseBenchOptions(args: []const []const u8) !BenchOptions {
+    var options: BenchOptions = .{};
+    var iterations_supplied = false;
+    var chunk_len_supplied = false;
+    var argument_index: usize = 1;
+
+    while (argument_index < args.len) : (argument_index += 1) {
+        const argument = args[argument_index];
+        if (std.mem.eql(u8, argument, "--stream-chunk-size")) {
+            if (chunk_len_supplied) return error.UnexpectedArgument;
+            argument_index += 1;
+            if (argument_index >= args.len) return error.InvalidStreamChunkSize;
+            const chunk_len = std.fmt.parseUnsigned(
+                usize,
+                args[argument_index],
+                10,
+            ) catch return error.InvalidStreamChunkSize;
+            if (!isSupportedStreamChunkLen(chunk_len)) {
+                return error.InvalidStreamChunkSize;
+            }
+            options.stream_chunk_len = chunk_len;
+            chunk_len_supplied = true;
+        } else {
+            if (iterations_supplied) return error.UnexpectedArgument;
+            const iterations = std.fmt.parseUnsigned(usize, argument, 10) catch {
+                return error.InvalidIterationCount;
+            };
+            if (iterations == 0) return error.InvalidIterationCount;
+            options.iterations = iterations;
+            iterations_supplied = true;
+        }
+    }
+    return options;
 }
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
-    const iterations = try parseIterations(args);
-
+    const options = try parseBenchOptions(args);
     var stdout_buffer: [8192]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
@@ -1371,7 +1415,11 @@ pub fn main(init: std.process.Init) !void {
         "# vector_len={d}\n",
         .{build_options.vector_len orelse lib.default_vector_len},
     );
-    try stdout.print("# stream_chunk_bytes={d}\n", .{STREAM_CHUNK_LEN});
+    try stdout.print("# stream_chunk_bytes={d}\n", .{options.stream_chunk_len});
+    try stdout.print(
+        "# stream_chunk_invocation=zig build bench -- --stream-chunk-size {d}\n",
+        .{options.stream_chunk_len},
+    );
     try stdout.print("# synthetic_scale={d}\n", .{workload_scale});
     try stdout.print(
         "# consumption=checksum samples first4,last,every64 tokens; raw spans max128 bytes; included in elapsed_ns\n",
@@ -1408,7 +1456,14 @@ pub fn main(init: std.process.Init) !void {
             .{ formatName(input.format), workloadName(input.workload), input.hash },
         );
         for (stages) |stage| {
-            const sample = try runStage(init.io, init.gpa, input, stage, iterations);
+            const sample = try runStage(
+                init.io,
+                init.gpa,
+                input,
+                stage,
+                options.iterations,
+                options.stream_chunk_len,
+            );
             try stdout.print(
                 "{s},{s},{s},{d},{d},{d},{d},{d},{d}\n",
                 .{
@@ -1416,7 +1471,7 @@ pub fn main(init: std.process.Init) !void {
                     workloadName(input.workload),
                     stageName(stage),
                     input.bytes.len,
-                    iterations,
+                    options.iterations,
                     sample.elapsed_ns,
                     sample.checksum,
                     sample.allocation_count,

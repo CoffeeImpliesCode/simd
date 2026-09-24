@@ -292,3 +292,97 @@ python3 results/2026-09-09-seven-format/matrix-driver.py rerun 3 5
 ```
 
 The driver uses the existing `build-current` binaries. Rebuild against a clean, pinned source snapshot first when code changes. Do not overwrite the baseline `full` directory.
+
+## Implemented optimization wave
+
+The isolated workspace is `~/projects/simd-performance`. The original
+dirty checkout was not edited. Public tape ownership, source borrowing, dialect
+rules, and cursor APIs are unchanged.
+
+- Shared readers validate external views once, before allocation or slicing.
+  In-place reader reset removes a confirmed 16,384-byte return-value copy.
+- Strict JSON reserves the exact emitted word count. JSONL retains independently
+  owned record tapes but no longer shrinks each one. JSONC and JSON5 use a proven
+  conservative bound instead of one word per source byte.
+- YAML builds its tape directly from resident events. The public structural
+  index builder is unchanged. Source validation skips printable ASCII blocks;
+  scalar fallback consumes the failed block instead of repeatedly loading
+  overlapping vectors. The previous input-size and error-order limits remain.
+- XML scans ASCII names and ordinary text in bulk, with existing Unicode,
+  entity, and duplicate-attribute checks. Narrow masks are normalized before
+  trailing-zero extraction; the four-byte corpus gate caught this boundary.
+- Markdown uses one trusted scan and a bounded growable tape. The exact-size
+  two-pass experiment was rejected after repeated timing regressions.
+- Existing dialect loops were already specialized; no duplicate lexer was added.
+  `zig build bench -- 5 --stream-chunk-size 1024` selects streaming chunks.
+  Supported sizes are 64, 256, 1024, 4096, and 16384; default remains 4096.
+
+Final internal measurements use seven alternating process pairs, five iterations
+per case, ReleaseFast, vector width 32, and logical CPU 2. All 210 case checksums,
+input byte counts, and iteration counts match within their respective profiles.
+Streaming is compared with streaming; resident full traversal is compared with
+resident full traversal, not with the eight-event prefix.
+
+Dense tape results, including sampled consumption and destruction:
+
+| Format | Baseline requested bytes | Candidate requested bytes | Median candidate/baseline time |
+|---|---:|---:|---:|
+| JSON | 2,735,472 | 2,211,192 | 0.815 |
+| JSONL | 26,931,440 | 18,673,904 | 0.723 |
+| JSONC | 4,585,308 | 2,052,748 | 0.951 |
+| JSON5 | 4,585,320 | 2,052,752 | 0.899 |
+| Markdown | 18,392,272 | 2,129,920 | 0.844 |
+| XML | 1,219,480 | 1,219,480 | 0.627 |
+| YAML | 10,810,318 | 572,680 | 0.550 |
+
+JSONL dense allocation calls fall from 98,314 to 49,162. The focused 512-record
+probe falls from 1,033 to 521 calls for each of the 1-, 5-, and 32-field cases.
+YAML and Markdown trade larger reservations for growth; requested bytes are
+not peak RSS. Markdown fixture storage is unchanged.
+
+Timing remains noisy: the host was not isolated, and background load, SMT sibling
+activity, and temperature were not controlled. XML tape ratios stay below one in
+all seven pairs for all five workloads. YAML dense ratios range from 0.393 to
+0.646. JSONL dense and Markdown dense ranges cross one; their displayed medians
+are not claims of a resolved speedup. No blanket speedup is claimed for JSONC,
+JSON5, Markdown, or Unicode YAML. Keep the memory reductions distinct from timing.
+
+Verification: `zig build` passed. `zig build test corpus` passed 382/382 tests
+at each of vector widths 4, 16, 32, and 64, including fixed-seed fuzzing.
+The final five-size chunk sweep checked 1,050 stage rows against the baseline;
+all checksums match. Missing and unsupported chunk values fail.
+
+Evidence is under
+`~/simd-bench-corpus/results/2026-09-09-priorities-2-5/`:
+`accepted-paired-*.csv`, `accepted-summary.json`, `accepted-chunk-*.csv`,
+`reader-copy-attribution.txt`, and the focused JSONL/XML probe outputs.
+Earlier `initial-paired-*`, `final-paired-*`, and `final-summary.json` describe
+the rejected two-pass Markdown binary. `single-pass-paired-*` precedes the final
+YAML fallback correction. Only the `accepted-*` series describes the final source.
+
+External integration also passed: the declared Nix environment completed the
+full Release build in `build-performance` against the clean parser snapshot.
+All seven CTest targets passed. A 56-invocation baseline/candidate smoke matrix
+covered all seven native adapters, both modes, and both corpus groups. Its 106
+case pairs match source hashes, byte counts, outcomes, checksums, work profiles,
+preparation policies, timed iteration counts, and CPU affinity. See
+`external-checks.json` and `external-*.json`. This is correctness smoke evidence,
+not an external timing ranking or a change to the packet comparator policy.
+
+Focused XML counters over the attribute/text probe decreased from 12.675 to
+3.007 billion user cycles and from 21.642 to 10.606 billion retired instructions.
+The combined probe includes validation and tape consumption; see
+`xml-counters.json` for exact commands.
+
+Seven additional paired YAML validation probes exercised long printable spans.
+Median candidate/baseline user-cycle ratios were 0.770 for ASCII and 0.815 for
+mixed UTF-8; instruction ratios were 0.793 and 0.856. Every pair improved.
+The separate 32-byte-line boundary probe had neutral ASCII timing and about
+0.7% more instructions: it cannot skip a full printable block. These results
+bound the claim to inputs with useful printable spans. Sources and raw counters
+are in `yaml-validation-probe.zig` and `yaml-validation*-counters.json`.
+
+`reproduce-pairs.py` checks archived executable hashes, alternates process order,
+and verifies all 210 cases and 35 input hashes per pair. Its standalone
+`reproduction-check` run passed all seven pairs. `accepted-identity.json` records
+the final executable hashes and measurement limits.

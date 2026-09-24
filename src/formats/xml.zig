@@ -1333,6 +1333,7 @@ pub const XmlError = error{
     InvalidTapeOrder,
     CapacityOverflow,
     CapacityExceeded,
+    OverlappingBuffers,
     DocumentActive,
     DocumentReleased,
     FocusAlreadyClaimed,
@@ -1341,6 +1342,34 @@ pub const XmlError = error{
 
 pub const XmlBuildError = std.mem.Allocator.Error || XmlError;
 pub const XmlValidationError = std.mem.Allocator.Error || XmlError;
+
+/// Caller-owned storage for allocation-free XML value decoding.
+///
+/// `source` must remain alive and unchanged for the event lifetime. `output`
+/// must not overlap `source`; decoding writes only after validation and sizing.
+pub const XmlDecodeOptions = struct {
+    source: []const u8,
+    output: []u8,
+};
+
+/// Borrowed XML declaration pseudo-attribute values.
+pub const XmlDeclarationInfo = struct {
+    version: []const u8,
+    encoding: ?[]const u8,
+    standalone: ?[]const u8,
+};
+
+/// A lexical QName split into borrowed NCName slices.
+///
+/// This type does not resolve namespace prefixes.
+pub const XmlQName = struct {
+    prefix: ?[]const u8,
+    local_name: []const u8,
+
+    pub fn split(raw_name: []const u8) XmlError!XmlQName {
+        return splitXmlQName(raw_name);
+    }
+};
 
 pub const XmlTapeKind = enum(u8) {
     xml_declaration,
@@ -1408,11 +1437,33 @@ pub const XmlAttributeEvent = struct {
     name: []const u8,
     value: []const u8,
     offset: u32,
+
+    pub fn decodedLength(self: XmlAttributeEvent, source: []const u8) XmlError!usize {
+        return decodeXmlAttributeEvent(self, source, null);
+    }
+
+    pub fn decodeInto(
+        self: XmlAttributeEvent,
+        options: XmlDecodeOptions,
+    ) XmlError!usize {
+        return decodeXmlAttributeEvent(self, options.source, options.output);
+    }
 };
 
 pub const XmlTextEvent = struct {
     raw: []const u8,
     offset: u32,
+
+    pub fn decodedLength(self: XmlTextEvent, source: []const u8) XmlError!usize {
+        return decodeXmlTextEvent(self, source, null);
+    }
+
+    pub fn decodeInto(
+        self: XmlTextEvent,
+        options: XmlDecodeOptions,
+    ) XmlError!usize {
+        return decodeXmlTextEvent(self, options.source, options.output);
+    }
 };
 
 pub const XmlCommentEvent = struct {
@@ -1425,6 +1476,17 @@ pub const XmlCdataEvent = struct {
     raw: []const u8,
     content: []const u8,
     offset: u32,
+
+    pub fn decodedLength(self: XmlCdataEvent, source: []const u8) XmlError!usize {
+        return decodeXmlCdataEvent(self, source, null);
+    }
+
+    pub fn decodeInto(
+        self: XmlCdataEvent,
+        options: XmlDecodeOptions,
+    ) XmlError!usize {
+        return decodeXmlCdataEvent(self, options.source, options.output);
+    }
 };
 
 pub const XmlProcessingInstructionEvent = struct {
@@ -1434,8 +1496,20 @@ pub const XmlProcessingInstructionEvent = struct {
     offset: u32,
 };
 
+pub const XmlDeclarationEvent = struct {
+    raw: []const u8,
+    offset: u32,
+
+    pub fn info(
+        self: XmlDeclarationEvent,
+        source: []const u8,
+    ) XmlError!XmlDeclarationInfo {
+        return declarationInfoForEvent(self, source);
+    }
+};
+
 pub const XmlEvent = union(enum) {
-    xml_declaration: struct { raw: []const u8, offset: u32 },
+    xml_declaration: XmlDeclarationEvent,
     element_start: XmlElementEvent,
     element_end: struct { raw: []const u8, name: []const u8, offset: u32 },
     self_closing_element: XmlElementEvent,
@@ -1456,6 +1530,33 @@ pub const XmlEvent = union(enum) {
             .cdata => |event| event.raw,
             .comment => |event| event.raw,
             .processing_instruction => |event| event.raw,
+        };
+    }
+    pub fn decodedLength(self: XmlEvent, source: []const u8) XmlError!usize {
+        return switch (self) {
+            .attribute => |event| event.decodedLength(source),
+            .text => |event| event.decodedLength(source),
+            .cdata => |event| event.decodedLength(source),
+            else => error.InvalidTapeOrder,
+        };
+    }
+
+    pub fn decodeInto(self: XmlEvent, options: XmlDecodeOptions) XmlError!usize {
+        return switch (self) {
+            .attribute => |event| event.decodeInto(options),
+            .text => |event| event.decodeInto(options),
+            .cdata => |event| event.decodeInto(options),
+            else => error.InvalidTapeOrder,
+        };
+    }
+
+    pub fn declarationInfo(
+        self: XmlEvent,
+        source: []const u8,
+    ) XmlError!XmlDeclarationInfo {
+        return switch (self) {
+            .xml_declaration => |event| event.info(source),
+            else => error.InvalidTapeOrder,
         };
     }
 };
@@ -1499,6 +1600,21 @@ pub const XmlDocument = struct {
             return error.InvalidTapeOrder;
         }
         return input[source_offset .. source_offset + source_length];
+    }
+
+    pub fn declarationInfo(
+        self: *const XmlDocument,
+        input: []const u8,
+    ) XmlError!?XmlDeclarationInfo {
+        try ensureXmlDocumentSource(self, input);
+        var tape_index: usize = 0;
+        while (tape_index < self.tape.len) : (tape_index += 1) {
+            const token = try xmlTapeToken(self, input, tape_index);
+            if (token.kind == .xml_declaration) {
+                return try parseDeclarationInfo(token.raw);
+            }
+        }
+        return null;
     }
 
     pub fn root(self: *const XmlDocument, input: []const u8) XmlError!XmlTapeCursor {
@@ -1641,6 +1757,42 @@ pub const XmlTapeCursor = struct {
         return try xmlTapeToken(self.document, self.input, self.position);
     }
 
+    pub fn currentAttribute(self: *const @This()) XmlError!XmlAttributeEvent {
+        const token = try self.currentTokenOfKind(.attribute);
+        return makeXmlAttributeEvent(token.raw, token.offset);
+    }
+
+    pub fn currentText(self: *const @This()) XmlError!XmlTextEvent {
+        const token = try self.currentTokenOfKind(.text);
+        return .{
+            .raw = token.raw,
+            .offset = token.offset,
+        };
+    }
+
+    pub fn currentCdata(self: *const @This()) XmlError!XmlCdataEvent {
+        const token = try self.currentTokenOfKind(.cdata);
+        if (token.raw.len < "<![CDATA[]]>".len) return error.InvalidTapeOrder;
+        const content_start = "<![CDATA[".len;
+        const content_end = token.raw.len - 3;
+        if (!startsWithAt(token.raw, 0, "<![CDATA[")) return error.InvalidTapeOrder;
+        if (!std.mem.eql(u8, token.raw[content_end..], "]]>")) {
+            return error.InvalidTapeOrder;
+        }
+        return .{
+            .raw = token.raw,
+            .content = token.raw[content_start..content_end],
+            .offset = token.offset,
+        };
+    }
+
+    fn currentTokenOfKind(self: *const @This(), kind: XmlTapeKind) XmlError!XmlToken {
+        try self.ensureSource();
+        const token = try self.peek() orelse return error.TapeOutOfBounds;
+        if (token.kind != kind) return error.InvalidTapeOrder;
+        return token;
+    }
+
     pub fn advance(self: *@This()) XmlError!?XmlToken {
         const token = try self.peek() orelse return null;
         self.position += 1;
@@ -1728,7 +1880,7 @@ fn validateXmlTape(tape: []const XmlTapeWord, input: []const u8) XmlError!void {
         .output = &output,
         .stack = stack[0..],
     };
-    parser.run() catch |err| {
+    parser.runChecked() catch |err| {
         if (err == error.OutOfMemory) return error.InvalidTapeOrder;
         return @errorCast(err);
     };
@@ -1869,6 +2021,86 @@ const XmlTapeOutput = struct {
     }
 };
 
+const XmlSourceProof = struct {
+    char_proven: bool = true,
+};
+
+fn findFirstInvalidXmlChar(input: []const u8, limit: usize) ?usize {
+    const vector_len = simd.default_vector_len;
+    const Mask = simd.Mask(vector_len);
+    const MaskStorage = if (vector_len <= 8)
+        u8
+    else if (vector_len <= 16)
+        u16
+    else if (vector_len <= 32)
+        u32
+    else if (vector_len <= 64)
+        u64
+    else
+        @Int(.unsigned, (vector_len + 7) / 8 * 8);
+    const logical_mask: MaskStorage = @intCast(std.math.maxInt(Mask));
+    var cursor: usize = 0;
+
+    const Vec = simd.Vec(vector_len, u8);
+    const splat_20: Vec = @splat(0x20);
+    const splat_tab: Vec = @splat(0x09);
+    const splat_lf: Vec = @splat(0x0A);
+    const splat_cr: Vec = @splat(0x0D);
+    const splat_ef: Vec = @splat(0xEF);
+
+    while (limit - cursor >= vector_len) : (cursor += vector_len) {
+        const block: Vec = input[cursor..][0..vector_len].*;
+        const is_ctrl = block < splat_20;
+        const is_tab = block == splat_tab;
+        const is_lf = block == splat_lf;
+        const is_cr = block == splat_cr;
+        const is_ws = is_tab | is_lf | is_cr;
+        const invalid_ctrl = is_ctrl & ~is_ws;
+        const ctrl_mask_raw: Mask = @bitCast(invalid_ctrl);
+        const ctrl_mask = @as(MaskStorage, @intCast(ctrl_mask_raw)) & logical_mask;
+        const ef_eq = block == splat_ef;
+        const ef_mask_raw: Mask = @bitCast(ef_eq);
+        const ef_mask = @as(MaskStorage, @intCast(ef_mask_raw)) & logical_mask;
+
+        if ((ctrl_mask | ef_mask) != 0) {
+            var earliest: ?usize = null;
+            if (ctrl_mask != 0) {
+                earliest = cursor + @as(usize, @intCast(@ctz(ctrl_mask)));
+            }
+            if (ef_mask != 0) {
+                var remaining_ef = ef_mask;
+                while (remaining_ef != 0) {
+                    const bit: usize = @intCast(@ctz(remaining_ef));
+                    const idx = cursor + bit;
+                    if (idx + 2 < input.len and input[idx + 1] == 0xBF and
+                        (input[idx + 2] == 0xBE or input[idx + 2] == 0xBF))
+                    {
+                        if (earliest == null or idx < earliest.?) earliest = idx;
+                        break;
+                    }
+                    remaining_ef &= remaining_ef - 1;
+                }
+            }
+            if (earliest) |pos| {
+                if (pos < limit) return pos;
+            }
+        }
+    }
+
+    while (cursor < limit) : (cursor += 1) {
+        const byte = input[cursor];
+        if (byte < 0x20 and byte != 0x09 and byte != 0x0A and byte != 0x0D) {
+            return cursor;
+        }
+        if (byte == 0xEF and cursor + 2 < input.len and input[cursor + 1] == 0xBF and
+            (input[cursor + 2] == 0xBE or input[cursor + 2] == 0xBF))
+        {
+            return cursor;
+        }
+    }
+    return null;
+}
+
 const XmlParser = struct {
     input: []const u8,
     output: ?*XmlTapeOutput,
@@ -1887,42 +2119,66 @@ const XmlParser = struct {
         self.validateSource();
         if (startsWithAt(self.input, 0, "\xEF\xBB\xBF")) self.position = 3;
 
-        self.runGrammar() catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            const grammar_error: XmlError = @errorCast(err);
-            if (self.source_error) |source_err| {
-                if (self.source_failure_offset <= self.failure_offset) {
-                    self.failure_offset = self.source_failure_offset;
-                    return source_err;
-                }
-            }
-            return grammar_error;
-        };
+        if (self.source_error == null) {
+            var proof = XmlSourceProof{};
+            self.runGrammarWithProof(&proof) catch |err| return self.handleGrammarError(err);
+        } else {
+            self.runGrammar() catch |err| return self.handleGrammarError(err);
+        }
         if (self.source_error) |err| {
             return self.fail(err, self.source_failure_offset);
         }
     }
 
+    fn runChecked(self: *XmlParser) XmlParseError!void {
+        self.validateSource();
+        if (startsWithAt(self.input, 0, "\xEF\xBB\xBF")) self.position = 3;
+
+        self.runGrammar() catch |err| return self.handleGrammarError(err);
+        if (self.source_error) |err| {
+            return self.fail(err, self.source_failure_offset);
+        }
+    }
+
+    fn handleGrammarError(self: *XmlParser, err: XmlParseError) XmlParseError {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        const grammar_error: XmlError = @errorCast(err);
+        if (self.source_error) |source_err| {
+            if (self.source_failure_offset <= self.failure_offset) {
+                self.failure_offset = self.source_failure_offset;
+                return source_err;
+            }
+        }
+        return grammar_error;
+    }
+
     fn runGrammar(self: *XmlParser) XmlParseError!void {
+        return self.runGrammarWithProof(null);
+    }
+
+    fn runGrammarWithProof(
+        self: *XmlParser,
+        proof: ?*const XmlSourceProof,
+    ) XmlParseError!void {
         while (self.position < self.input.len) {
             if (self.input[self.position] != '<') {
-                try self.parseText();
+                try self.parseTextWithProof(proof);
                 self.declaration_allowed = false;
                 continue;
             }
 
             if (startsWithAt(self.input, self.position, "<!--")) {
-                try self.parseComment();
+                try self.parseCommentWithProof(proof);
                 self.declaration_allowed = false;
                 continue;
             }
             if (startsWithAt(self.input, self.position, "<![CDATA[")) {
-                try self.parseCdata();
+                try self.parseCdataWithProof(proof);
                 self.declaration_allowed = false;
                 continue;
             }
             if (startsWithAt(self.input, self.position, "<?")) {
-                try self.parseProcessingInstruction();
+                try self.parseProcessingInstructionWithProof(proof);
                 self.declaration_allowed = false;
                 continue;
             }
@@ -1934,7 +2190,7 @@ const XmlParser = struct {
             if (startsWithAt(self.input, self.position, "<!")) {
                 return self.fail(error.UnsupportedDeclaration, self.position);
             }
-            try self.parseOpeningElement();
+            try self.parseOpeningElementWithProof(proof);
             self.declaration_allowed = false;
         }
 
@@ -1953,35 +2209,31 @@ const XmlParser = struct {
             ),
         };
 
-        var source_index: usize = 0;
-        while (source_index < self.input.len) {
-            if (invalid_utf8_offset) |offset| {
-                if (source_index >= offset) {
-                    self.source_error = error.InvalidUtf8;
-                    self.source_failure_offset = offset;
-                    return;
-                }
-            }
-            const decoded = decodeXml(self.input, source_index) orelse {
-                self.source_error = error.InvalidUtf8;
-                self.source_failure_offset = source_index;
-                return;
-            };
-            if (!isXmlCharacter(decoded.codepoint)) {
-                self.source_error = error.InvalidCharacter;
-                self.source_failure_offset = source_index;
-                return;
-            }
-            source_index += decoded.length;
+        const utf8_limit = invalid_utf8_offset orelse self.input.len;
+        if (findFirstInvalidXmlChar(self.input, utf8_limit)) |invalid_char_offset| {
+            self.source_error = error.InvalidCharacter;
+            self.source_failure_offset = invalid_char_offset;
+            return;
+        }
+
+        if (invalid_utf8_offset) |offset| {
+            self.source_error = error.InvalidUtf8;
+            self.source_failure_offset = offset;
+            return;
         }
     }
 
     fn parseText(self: *XmlParser) XmlParseError!void {
+        return self.parseTextWithProof(null);
+    }
+
+    fn parseTextWithProof(
+        self: *XmlParser,
+        proof: ?*const XmlSourceProof,
+    ) XmlParseError!void {
         const start = self.position;
-        while (self.position < self.input.len and self.input[self.position] != '<') {
-            self.position += 1;
-        }
-        try self.validateData(start, self.position, true, true, false);
+        self.position = findXmlTextEnd(self.input, start);
+        try self.validateDataWithProof(start, self.position, true, true, false, proof);
         if (self.stack_top == 0) {
             if (!isXmlWhitespaceOnly(self.input[start..self.position])) {
                 return self.fail(error.RootNotSingular, start);
@@ -2001,14 +2253,26 @@ const XmlParser = struct {
     ) XmlParseError!void {
         var cursor = start;
         while (cursor < end) {
+            const ascii_end = skipXmlAsciiData(
+                self.input,
+                cursor,
+                end,
+                entities,
+                forbid_cdata_end,
+                forbid_less_than,
+            );
+            if (ascii_end != cursor) {
+                cursor = ascii_end;
+                if (cursor >= end) break;
+            }
             if (forbid_less_than and self.input[cursor] == '<') {
                 return self.fail(error.InvalidAttribute, cursor);
             }
             if (self.input[cursor] == '&' and entities) {
-                cursor = parseXmlEntity(self.input, cursor, end) catch |err| {
+                cursor = (parseXmlEntity(self.input, cursor, end) catch |err| {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
                     return self.fail(@errorCast(err), cursor);
-                };
+                }).next;
                 continue;
             }
             if (self.input[cursor] == '&' and !entities) {
@@ -2032,13 +2296,85 @@ const XmlParser = struct {
         }
     }
 
+    fn validateDataWithProof(
+        self: *XmlParser,
+        start: usize,
+        end: usize,
+        entities: bool,
+        forbid_cdata_end: bool,
+        forbid_less_than: bool,
+        proof: ?*const XmlSourceProof,
+    ) XmlParseError!void {
+        if (proof) |source_proof| {
+            return self.validateDataAfterSourceProof(
+                start,
+                end,
+                entities,
+                forbid_cdata_end,
+                forbid_less_than,
+                source_proof,
+            );
+        }
+        return self.validateData(start, end, entities, forbid_cdata_end, forbid_less_than);
+    }
+
+    // Source proof covers UTF-8 and XML Char validation. Only context bytes
+    // require a second pass here.
+    fn validateDataAfterSourceProof(
+        self: *XmlParser,
+        start: usize,
+        end: usize,
+        entities: bool,
+        forbid_cdata_end: bool,
+        forbid_less_than: bool,
+        proof: *const XmlSourceProof,
+    ) XmlParseError!void {
+        _ = proof;
+        var cursor = start;
+        while (cursor < end) {
+            const ascii_end = skipXmlProvenData(
+                self.input,
+                cursor,
+                end,
+                entities,
+                forbid_cdata_end,
+                forbid_less_than,
+            );
+            if (ascii_end != cursor) {
+                cursor = ascii_end;
+                if (cursor >= end) break;
+            }
+            if (forbid_less_than and self.input[cursor] == '<') {
+                return self.fail(error.InvalidAttribute, cursor);
+            }
+            if (entities and self.input[cursor] == '&') {
+                cursor = (parseXmlEntity(self.input, cursor, end) catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    return self.fail(@errorCast(err), cursor);
+                }).next;
+                continue;
+            }
+            if (forbid_cdata_end and startsWithAt(self.input, cursor, "]]>")) {
+                return self.fail(error.InvalidCharacter, cursor);
+            }
+            cursor += 1;
+        }
+    }
+
     fn parseComment(self: *XmlParser) XmlParseError!void {
+        return self.parseCommentWithProof(null);
+    }
+
+    fn parseCommentWithProof(
+        self: *XmlParser,
+        proof: ?*const XmlSourceProof,
+    ) XmlParseError!void {
         const start = self.position;
         var index = start + 4;
         while (index + 2 < self.input.len) : (index += 1) {
             if (self.input[index] == '-' and self.input[index + 1] == '-') {
                 if (self.input[index + 2] == '>') {
-                    try self.validateData(start + 4, index, false, false, false);
+                    try self.validateDataWithProof(start + 4, index, false, false, false, proof);
                     try self.emit(.comment, start, index + 3);
                     self.position = index + 3;
                     return;
@@ -2050,18 +2386,32 @@ const XmlParser = struct {
     }
 
     fn parseCdata(self: *XmlParser) XmlParseError!void {
+        return self.parseCdataWithProof(null);
+    }
+
+    fn parseCdataWithProof(
+        self: *XmlParser,
+        proof: ?*const XmlSourceProof,
+    ) XmlParseError!void {
         const start = self.position;
         if (self.stack_top == 0) return self.fail(error.RootNotSingular, start);
         const content_start = start + "<![CDATA[".len;
         const close = std.mem.indexOfPos(u8, self.input, content_start, "]]>") orelse {
             return self.fail(error.UnterminatedCdata, start);
         };
-        try self.validateData(content_start, close, false, false, false);
+        try self.validateDataWithProof(content_start, close, false, false, false, proof);
         try self.emit(.cdata, start, close + 3);
         self.position = close + 3;
     }
 
     fn parseProcessingInstruction(self: *XmlParser) XmlParseError!void {
+        return self.parseProcessingInstructionWithProof(null);
+    }
+
+    fn parseProcessingInstructionWithProof(
+        self: *XmlParser,
+        proof: ?*const XmlSourceProof,
+    ) XmlParseError!void {
         const start = self.position;
         const target_start = start + 2;
         const target_end = self.parseName(target_start) orelse {
@@ -2078,7 +2428,7 @@ const XmlParser = struct {
             {
                 return self.fail(error.InvalidDeclaration, start);
             }
-            try self.parseDeclarationAttributes(target_end, close);
+            try self.parseDeclarationAttributesWithProof(target_end, close, proof);
             self.declaration_seen = true;
             try self.emit(.xml_declaration, start, close + 2);
         } else {
@@ -2088,7 +2438,7 @@ const XmlParser = struct {
             if (target_end < close and !isXmlWhitespace(self.input[target_end])) {
                 return self.fail(error.UnexpectedToken, target_end);
             }
-            try self.validateData(target_end, close, false, false, false);
+            try self.validateDataWithProof(target_end, close, false, false, false, proof);
             try self.emit(.processing_instruction, start, close + 2);
         }
         self.position = close + 2;
@@ -2099,10 +2449,20 @@ const XmlParser = struct {
         attributes_start: usize,
         close: usize,
     ) XmlParseError!void {
+        return self.parseDeclarationAttributesWithProof(attributes_start, close, null);
+    }
+
+    fn parseDeclarationAttributesWithProof(
+        self: *XmlParser,
+        attributes_start: usize,
+        close: usize,
+        proof: ?*const XmlSourceProof,
+    ) XmlParseError!void {
         var cursor = attributes_start;
         var version_seen = false;
         var pseudo_attribute_seen = false;
         var declaration_order: u8 = 0;
+        var name_filter = XmlAttributeNameFilter{};
         while (cursor < close) {
             const separator_start = cursor;
             cursor = skipXmlWhitespace(self.input, cursor);
@@ -2115,7 +2475,9 @@ const XmlParser = struct {
                 return self.fail(error.InvalidDeclaration, cursor);
             };
             const name = self.input[name_start..name_end];
-            if (hasPreviousXmlAttribute(self.input, attributes_start, name_start, name)) {
+            if (name_filter.maybeSeenAndInsert(name) and
+                hasPreviousXmlAttribute(self.input, attributes_start, name_start, name))
+            {
                 return self.fail(error.InvalidDeclaration, name_start);
             }
             cursor = skipXmlWhitespace(self.input, name_end);
@@ -2131,7 +2493,7 @@ const XmlParser = struct {
             cursor += 1;
             const value_start = cursor;
             while (cursor < close and self.input[cursor] != quote) : (cursor += 1) {}
-            try self.validateData(value_start, cursor, false, false, false);
+            try self.validateDataWithProof(value_start, cursor, false, false, false, proof);
             if (cursor == close) return self.fail(error.InvalidDeclaration, value_start - 1);
             const value = self.input[value_start..cursor];
             if (std.mem.eql(u8, name, "version")) {
@@ -2164,6 +2526,13 @@ const XmlParser = struct {
     }
 
     fn parseOpeningElement(self: *XmlParser) XmlParseError!void {
+        return self.parseOpeningElementWithProof(null);
+    }
+
+    fn parseOpeningElementWithProof(
+        self: *XmlParser,
+        proof: ?*const XmlSourceProof,
+    ) XmlParseError!void {
         const start = self.position;
         const name_start = start + 1;
         const name_end = self.parseName(name_start) orelse {
@@ -2183,6 +2552,7 @@ const XmlParser = struct {
         var cursor = name_end;
         var self_closing = false;
         var attribute_seen = false;
+        var name_filter = XmlAttributeNameFilter{};
         while (true) {
             const separator_start = cursor;
             cursor = skipXmlWhitespace(self.input, cursor);
@@ -2210,12 +2580,9 @@ const XmlParser = struct {
                 return self.fail(error.InvalidAttribute, cursor);
             };
             const attribute_name = self.input[attribute_start..attribute_end];
-            if (hasPreviousXmlAttribute(
-                self.input,
-                name_end,
-                attribute_start,
-                attribute_name,
-            )) {
+            if (name_filter.maybeSeenAndInsert(attribute_name) and
+                hasPreviousXmlAttribute(self.input, name_end, attribute_start, attribute_name))
+            {
                 return self.fail(error.DuplicateAttribute, attribute_start);
             }
             cursor = skipXmlWhitespace(self.input, attribute_end);
@@ -2232,7 +2599,7 @@ const XmlParser = struct {
             const value_start = cursor - 1;
             while (cursor < self.input.len and self.input[cursor] != quote) : (cursor += 1) {}
             if (cursor >= self.input.len) return self.fail(error.InvalidAttribute, value_start);
-            try self.validateData(value_start + 1, cursor, true, false, true);
+            try self.validateDataWithProof(value_start + 1, cursor, true, false, true, proof);
             cursor += 1;
             try self.emit(.attribute, attribute_start, cursor);
             attribute_seen = true;
@@ -2815,12 +3182,140 @@ pub fn initStreamIndexer(
 ) XmlStreamIndexer.InitError!XmlStreamIndexer {
     return XmlStreamIndexer.init(allocator, chunk_len);
 }
+// Text candidate: find the next markup delimiter without decoding ordinary bytes.
+fn findXmlTextEnd(input: []const u8, start: usize) usize {
+    const vector_len = simd.default_vector_len;
+    const Mask = simd.Mask(vector_len);
+    const MaskStorage = if (vector_len <= 8)
+        u8
+    else if (vector_len <= 16)
+        u16
+    else if (vector_len <= 32)
+        u32
+    else if (vector_len <= 64)
+        u64
+    else
+        @Int(.unsigned, (vector_len + 7) / 8 * 8);
+    const logical_mask: MaskStorage = @intCast(std.math.maxInt(Mask));
+    var cursor = start;
+    while (input.len - cursor >= vector_len) {
+        const block: simd.Vec(vector_len, u8) = input[cursor..][0..vector_len].*;
+        const less_than: Mask = simd.matchByte(vector_len, block, '<');
+        // Non-byte-aligned masks have spare storage bits; clear them before `@ctz`.
+        const less_than_storage =
+            @as(MaskStorage, @intCast(less_than)) & logical_mask;
+        if (less_than_storage != 0) {
+            return cursor + @as(usize, @intCast(@ctz(less_than_storage)));
+        }
+        cursor += vector_len;
+    }
+    while (cursor < input.len and input[cursor] != '<') : (cursor += 1) {}
+    return cursor;
+}
+
+// Text candidate: stop before bytes that require entity, delimiter, or UTF-8 checks.
+fn skipXmlAsciiData(
+    input: []const u8,
+    start: usize,
+    end: usize,
+    entities: bool,
+    forbid_cdata_end: bool,
+    forbid_less_than: bool,
+) usize {
+    var cursor = start;
+    while (cursor < end) {
+        const byte = input[cursor];
+        if (byte >= 0x20 and byte <= 0x7E) {
+            if (entities and byte == '&') break;
+            if (forbid_cdata_end and byte == ']') break;
+            if (forbid_less_than and byte == '<') break;
+            cursor += 1;
+            continue;
+        }
+        if (byte == '\t' or byte == '\n' or byte == '\r') {
+            cursor += 1;
+            continue;
+        }
+        break;
+    }
+    return cursor;
+}
+
+fn skipXmlProvenData(
+    input: []const u8,
+    start: usize,
+    end: usize,
+    entities: bool,
+    forbid_cdata_end: bool,
+    forbid_less_than: bool,
+) usize {
+    if (!entities and !forbid_cdata_end and !forbid_less_than) return end;
+    const vector_len = simd.default_vector_len;
+    const Mask = simd.Mask(vector_len);
+    const MaskStorage = if (vector_len <= 8)
+        u8
+    else if (vector_len <= 16)
+        u16
+    else if (vector_len <= 32)
+        u32
+    else if (vector_len <= 64)
+        u64
+    else
+        @Int(.unsigned, (vector_len + 7) / 8 * 8);
+    const logical_mask: MaskStorage = @intCast(std.math.maxInt(Mask));
+
+    var cursor = start;
+    while (end - cursor >= vector_len) {
+        const block: simd.Vec(vector_len, u8) = input[cursor..][0..vector_len].*;
+        var mask: Mask = 0;
+        if (entities) mask |= simd.matchByte(vector_len, block, '&');
+        if (forbid_cdata_end) mask |= simd.matchByte(vector_len, block, ']');
+        if (forbid_less_than) mask |= simd.matchByte(vector_len, block, '<');
+        const storage = @as(MaskStorage, @intCast(mask)) & logical_mask;
+        if (storage != 0) {
+            return cursor + @as(usize, @intCast(@ctz(storage)));
+        }
+        cursor += vector_len;
+    }
+    while (cursor < end) {
+        const byte = input[cursor];
+        if ((entities and byte == '&') or
+            (forbid_cdata_end and byte == ']') or
+            (forbid_less_than and byte == '<'))
+        {
+            break;
+        }
+        cursor += 1;
+    }
+    return cursor;
+}
+
+fn xmlUtf8SequenceLength(first: u8) ?usize {
+    return switch (first) {
+        0xC2...0xDF => 2,
+        0xE0...0xEF => 3,
+        0xF0...0xF4 => 4,
+        else => null,
+    };
+}
+// Name candidate: classify ASCII bytes directly and retain checked Unicode fallback.
 fn parseXmlName(input: []const u8, start: usize) ?usize {
     if (start >= input.len) return null;
-    const first = decodeXml(input, start) orelse return null;
-    if (!isXmlNameStart(first.codepoint)) return null;
-    var cursor = start + first.length;
+
+    var cursor = start;
+    const first_byte = input[cursor];
+    if (first_byte < 0x80) {
+        if (!isAsciiXmlNameStart(first_byte)) return null;
+        cursor += 1;
+    } else {
+        const decoded = decodeXml(input, cursor) orelse return null;
+        if (!isXmlNameStart(decoded.codepoint)) return null;
+        cursor += decoded.length;
+    }
+
     while (cursor < input.len) {
+        cursor = scanAsciiXmlNameChars(input, cursor);
+        if (cursor >= input.len or input[cursor] < 0x80) break;
         const decoded = decodeXml(input, cursor) orelse return cursor;
         if (!isXmlNameChar(decoded.codepoint)) break;
         cursor += decoded.length;
@@ -2828,6 +3323,74 @@ fn parseXmlName(input: []const u8, start: usize) ?usize {
     return cursor;
 }
 
+const ascii_name_start_table: [256]bool = blk: {
+    var table = [_]bool{false} ** 256;
+    for (0..256) |i| {
+        const b: u8 = @intCast(i);
+        if (b < 0x80 and isAsciiXmlNameStart(b)) {
+            table[i] = true;
+        }
+    }
+    break :blk table;
+};
+
+const ascii_name_char_table: [256]bool = blk: {
+    var table = [_]bool{false} ** 256;
+    for (0..256) |i| {
+        const b: u8 = @intCast(i);
+        if (b < 0x80 and isAsciiXmlNameChar(b)) {
+            table[i] = true;
+        }
+    }
+    break :blk table;
+};
+
+fn scanAsciiXmlNameChars(input: []const u8, start: usize) usize {
+    var cursor = start;
+    while (cursor < input.len and ascii_name_char_table[input[cursor]]) : (cursor += 1) {}
+    return cursor;
+}
+
+fn isAsciiXmlNameStart(byte: u8) bool {
+    return byte == ':' or byte == '_' or
+        (byte >= 'A' and byte <= 'Z') or
+        (byte >= 'a' and byte <= 'z');
+}
+
+fn isAsciiXmlNameChar(byte: u8) bool {
+    return isAsciiXmlNameStart(byte) or byte == '-' or byte == '.' or
+        (byte >= '0' and byte <= '9');
+}
+
+// Positive Bloom hits always fall back to exact name equality.
+const XmlAttributeNameFilter = struct {
+    bits: [128]u8 = [_]u8{0} ** 128,
+
+    fn maybeSeenAndInsert(self: *@This(), name: []const u8) bool {
+        const hash = hashXmlAttributeName(name);
+        const first_bit: usize = @intCast(hash & 0x3FF);
+        const second_bit: usize = @intCast((hash >> 10) & 0x3FF);
+        const first_byte = first_bit >> 3;
+        const second_byte = second_bit >> 3;
+        const first_mask: u8 = @as(u8, 1) << @as(u3, @intCast(first_bit & 7));
+        const second_mask: u8 = @as(u8, 1) << @as(u3, @intCast(second_bit & 7));
+        const maybe_seen = (self.bits[first_byte] & first_mask) != 0 and
+            (self.bits[second_byte] & second_mask) != 0;
+        self.bits[first_byte] |= first_mask;
+        self.bits[second_byte] |= second_mask;
+        return maybe_seen;
+    }
+};
+
+fn hashXmlAttributeName(name: []const u8) u64 {
+    var hash: u64 = 0xCBF29CE484222325;
+    for (name) |byte| {
+        hash = (hash ^ @as(u64, byte)) *% 0x100000001B3;
+    }
+    return hash;
+}
+
+// Attribute candidate: retain exact name equality while accelerating bounded value skips.
 fn hasPreviousXmlAttribute(
     input: []const u8,
     attributes_start: usize,
@@ -2848,24 +3411,53 @@ fn hasPreviousXmlAttribute(
         if (cursor >= current_start or (input[cursor] != '\'' and input[cursor] != '"')) return false;
         const quote = input[cursor];
         cursor += 1;
-        while (cursor < current_start and input[cursor] != quote) : (cursor += 1) {}
-        if (cursor >= current_start) return false;
-        cursor += 1;
+        const quote_end = std.mem.indexOfScalar(
+            u8,
+            input[cursor..current_start],
+            quote,
+        ) orelse return false;
+        cursor += quote_end + 1;
     }
     return false;
 }
 
-fn parseXmlEntity(input: []const u8, start: usize, end: usize) XmlParseError!usize {
+const XmlEntityDecoded = struct {
+    next: usize,
+    codepoint: u21,
+};
+
+pub fn parsePredefinedEntity(body: []const u8) ?u21 {
+    if (body.len < 2 or body.len > 4) return null;
+    return switch (body.len) {
+        2 => switch (body[0]) {
+            'l' => if (body[1] == 't') '<' else null,
+            'g' => if (body[1] == 't') '>' else null,
+            else => null,
+        },
+        3 => if (body[0] == 'a' and body[1] == 'm' and body[2] == 'p') '&' else null,
+        4 => switch (body[0]) {
+            'a' => if (body[1] == 'p' and body[2] == 'o' and body[3] == 's') '\'' else null,
+            'q' => if (body[1] == 'u' and body[2] == 'o' and body[3] == 't') '"' else null,
+            else => null,
+        },
+        else => null,
+    };
+}
+
+fn parseXmlEntity(
+    input: []const u8,
+    start: usize,
+    end: usize,
+) error{InvalidEntity}!XmlEntityDecoded {
+    if (start >= end or input[start] != '&') return error.InvalidEntity;
     var cursor = start + 1;
     while (cursor < end and input[cursor] != ';') : (cursor += 1) {}
     if (cursor >= end or cursor == start + 1) return error.InvalidEntity;
     const body = input[start + 1 .. cursor];
-    if (std.mem.eql(u8, body, "amp") or std.mem.eql(u8, body, "lt") or
-        std.mem.eql(u8, body, "gt") or std.mem.eql(u8, body, "apos") or
-        std.mem.eql(u8, body, "quot"))
-    {
-        return cursor + 1;
+    if (parsePredefinedEntity(body)) |codepoint| {
+        return .{ .next = cursor + 1, .codepoint = codepoint };
     }
+
     if (body[0] != '#') return error.InvalidEntity;
     var digit_start: usize = start + 2;
     var base: u32 = 10;
@@ -2877,13 +3469,18 @@ fn parseXmlEntity(input: []const u8, start: usize, end: usize) XmlParseError!usi
     var codepoint: u32 = 0;
     while (digit_start < cursor) : (digit_start += 1) {
         const digit = xmlDigit(input[digit_start], base) orelse return error.InvalidEntity;
-        if (codepoint > (std.math.maxInt(u32) - digit) / base) return error.InvalidEntity;
+        if (codepoint > (std.math.maxInt(u32) - digit) / base) {
+            return error.InvalidEntity;
+        }
         codepoint = codepoint * base + digit;
     }
     if (codepoint > std.math.maxInt(u21) or !isXmlCharacter(@intCast(codepoint))) {
         return error.InvalidEntity;
     }
-    return cursor + 1;
+    return .{
+        .next = cursor + 1,
+        .codepoint = @intCast(codepoint),
+    };
 }
 
 fn xmlDigit(byte: u8, base: u32) ?u32 {
@@ -2999,6 +3596,425 @@ fn isXmlNameChar(codepoint: u21) bool {
         (codepoint >= 0x203F and codepoint <= 0x2040);
 }
 
+const XmlValueKind = enum {
+    text,
+    attribute,
+    cdata,
+};
+
+const XmlRawAttribute = struct {
+    name_end: usize,
+    value_start: usize,
+    value_end: usize,
+};
+
+fn ensureXmlDocumentSource(
+    document: *const XmlDocument,
+    input: []const u8,
+) XmlError!void {
+    const source = document.source orelse return error.SourceMismatch;
+    if (source.ptr != input.ptr or source.len != input.len) return error.SourceMismatch;
+}
+
+fn ensureXmlEventRaw(
+    source: []const u8,
+    offset: u32,
+    raw: []const u8,
+) XmlError![]const u8 {
+    const source_offset: usize = @intCast(offset);
+    if (source_offset > source.len) return error.SourceOutOfBounds;
+    if (raw.len > source.len - source_offset) return error.SourceOutOfBounds;
+    const expected = source[source_offset .. source_offset + raw.len];
+    if (raw.ptr != expected.ptr) return error.SourceMismatch;
+    return expected;
+}
+
+fn slicesOverlap(source: []const u8, output: []u8) bool {
+    if (source.len == 0 or output.len == 0) return false;
+    const source_start = @intFromPtr(source.ptr);
+    const output_start = @intFromPtr(output.ptr);
+    const source_end = std.math.add(usize, source_start, source.len) catch return true;
+    const output_end = std.math.add(usize, output_start, output.len) catch return true;
+    return source_start < output_end and output_start < source_end;
+}
+
+fn slicesSame(left: []const u8, right: []const u8) bool {
+    return left.len == right.len and @intFromPtr(left.ptr) == @intFromPtr(right.ptr);
+}
+
+fn validateXmlRawData(
+    raw: []const u8,
+    entities: bool,
+    forbid_cdata_end: bool,
+    forbid_less_than: bool,
+) XmlError!void {
+    if (raw.len == 0) return;
+    var stack: [1]XmlFrame = undefined;
+    var parser = XmlParser{
+        .input = raw,
+        .output = null,
+        .stack = stack[0..],
+    };
+    parser.validateData(0, raw.len, entities, forbid_cdata_end, forbid_less_than) catch |err| {
+        if (err == error.OutOfMemory) return error.InvalidTapeOrder;
+        return @errorCast(err);
+    };
+}
+
+fn parseXmlAttributeRaw(raw: []const u8) XmlError!XmlRawAttribute {
+    if (raw.len == 0) return error.InvalidAttribute;
+    try validateXmlRawData(raw, false, false, false);
+    const name_end = parseXmlName(raw, 0) orelse return error.InvalidAttribute;
+    var cursor = skipXmlWhitespace(raw, name_end);
+    if (cursor >= raw.len or raw[cursor] != '=') return error.InvalidAttribute;
+    cursor += 1;
+    cursor = skipXmlWhitespace(raw, cursor);
+    if (cursor >= raw.len or (raw[cursor] != '\'' and raw[cursor] != '"')) {
+        return error.InvalidAttribute;
+    }
+    const quote = raw[cursor];
+    cursor += 1;
+    const value_start = cursor;
+    while (cursor < raw.len and raw[cursor] != quote) : (cursor += 1) {}
+    if (cursor >= raw.len or cursor + 1 != raw.len) return error.InvalidAttribute;
+    try validateXmlRawData(raw[value_start..cursor], true, false, true);
+    return .{
+        .name_end = name_end,
+        .value_start = value_start,
+        .value_end = cursor,
+    };
+}
+
+fn makeXmlAttributeEvent(raw: []const u8, offset: u32) XmlError!XmlAttributeEvent {
+    const parsed = try parseXmlAttributeRaw(raw);
+    return .{
+        .raw = raw,
+        .name = raw[0..parsed.name_end],
+        .value = raw[parsed.value_start..parsed.value_end],
+        .offset = offset,
+    };
+}
+
+fn validateXmlTextEvent(event: XmlTextEvent, source: []const u8) XmlError![]const u8 {
+    const raw = try ensureXmlEventRaw(source, event.offset, event.raw);
+    if (raw.len == 0) return error.InvalidTapeOrder;
+    validateXmlRawData(raw, true, true, true) catch |err| {
+        if (err == error.InvalidAttribute) return error.InvalidTapeOrder;
+        return err;
+    };
+    return raw;
+}
+
+fn validateXmlAttributeEvent(
+    event: XmlAttributeEvent,
+    source: []const u8,
+) XmlError![]const u8 {
+    const raw = try ensureXmlEventRaw(source, event.offset, event.raw);
+    const parsed = try parseXmlAttributeRaw(raw);
+    const expected_name = raw[0..parsed.name_end];
+    const expected_value = raw[parsed.value_start..parsed.value_end];
+    if (!slicesSame(event.name, expected_name)) return error.SourceMismatch;
+    if (!slicesSame(event.value, expected_value)) return error.SourceMismatch;
+    return expected_value;
+}
+
+fn validateXmlCdataEvent(event: XmlCdataEvent, source: []const u8) XmlError![]const u8 {
+    const raw = try ensureXmlEventRaw(source, event.offset, event.raw);
+    if (raw.len < "<![CDATA[]]>".len) return error.InvalidTapeOrder;
+    if (!startsWithAt(raw, 0, "<![CDATA[")) return error.InvalidTapeOrder;
+    const content_start = "<![CDATA[".len;
+    const content_end = raw.len - 3;
+    if (!std.mem.eql(u8, raw[content_end..], "]]>")) return error.InvalidTapeOrder;
+    const expected_content = raw[content_start..content_end];
+    if (!slicesSame(event.content, expected_content)) return error.SourceMismatch;
+    try validateXmlRawData(expected_content, false, true, false);
+    return expected_content;
+}
+
+fn encodedXmlLength(codepoint: u21) usize {
+    if (codepoint <= 0x7F) return 1;
+    if (codepoint <= 0x7FF) return 2;
+    if (codepoint <= 0xFFFF) return 3;
+    return 4;
+}
+
+fn encodeXmlCodepoint(codepoint: u21, output: []u8) usize {
+    if (codepoint <= 0x7F) {
+        output[0] = @intCast(codepoint);
+        return 1;
+    }
+    if (codepoint <= 0x7FF) {
+        output[0] = @intCast(0xC0 | (codepoint >> 6));
+        output[1] = @intCast(0x80 | (codepoint & 0x3F));
+        return 2;
+    }
+    if (codepoint <= 0xFFFF) {
+        output[0] = @intCast(0xE0 | (codepoint >> 12));
+        output[1] = @intCast(0x80 | ((codepoint >> 6) & 0x3F));
+        output[2] = @intCast(0x80 | (codepoint & 0x3F));
+        return 3;
+    }
+    output[0] = @intCast(0xF0 | (codepoint >> 18));
+    output[1] = @intCast(0x80 | ((codepoint >> 12) & 0x3F));
+    output[2] = @intCast(0x80 | ((codepoint >> 6) & 0x3F));
+    output[3] = @intCast(0x80 | (codepoint & 0x3F));
+    return 4;
+}
+
+fn decodeXmlValue(
+    raw: []const u8,
+    kind: XmlValueKind,
+    output: ?[]u8,
+) XmlError!usize {
+    var cursor: usize = 0;
+    var output_length: usize = 0;
+    while (cursor < raw.len) {
+        var codepoint: u21 = undefined;
+        var consumed: usize = 0;
+        var referenced = false;
+
+        if (kind != .cdata and raw[cursor] == '&') {
+            const entity = try parseXmlEntity(raw, cursor, raw.len);
+            codepoint = entity.codepoint;
+            consumed = entity.next - cursor;
+            referenced = true;
+        } else {
+            const decoded = decodeXml(raw, cursor) orelse return error.InvalidUtf8;
+            codepoint = decoded.codepoint;
+            consumed = decoded.length;
+        }
+        if (!referenced and !isXmlCharacter(codepoint)) return error.InvalidCharacter;
+
+        var normalized_codepoint = codepoint;
+        if (!referenced and codepoint == '\r') {
+            if (cursor + 1 < raw.len and raw[cursor + 1] == '\n') consumed += 1;
+            normalized_codepoint = if (kind == .attribute) ' ' else '\n';
+        } else if (!referenced and kind == .attribute and
+            (codepoint == '\t' or codepoint == '\n'))
+        {
+            normalized_codepoint = ' ';
+        }
+
+        const encoded_length = encodedXmlLength(normalized_codepoint);
+        const next_output_length = std.math.add(
+            usize,
+            output_length,
+            encoded_length,
+        ) catch return error.CapacityOverflow;
+        if (output) |destination| {
+            if (next_output_length > destination.len) return error.CapacityExceeded;
+            _ = encodeXmlCodepoint(
+                normalized_codepoint,
+                destination[output_length..next_output_length],
+            );
+        }
+        output_length = next_output_length;
+        cursor += consumed;
+    }
+    return output_length;
+}
+
+fn decodeXmlAttributeEvent(
+    event: XmlAttributeEvent,
+    source: []const u8,
+    output: ?[]u8,
+) XmlError!usize {
+    const raw_value = try validateXmlAttributeEvent(event, source);
+    const required = try decodeXmlValue(raw_value, .attribute, null);
+    if (output) |destination| {
+        if (slicesOverlap(source, destination)) return error.OverlappingBuffers;
+        if (destination.len < required) return error.CapacityExceeded;
+        return decodeXmlValue(raw_value, .attribute, destination);
+    }
+    return required;
+}
+
+fn decodeXmlTextEvent(
+    event: XmlTextEvent,
+    source: []const u8,
+    output: ?[]u8,
+) XmlError!usize {
+    const raw = try validateXmlTextEvent(event, source);
+    const required = try decodeXmlValue(raw, .text, null);
+    if (output) |destination| {
+        if (slicesOverlap(source, destination)) return error.OverlappingBuffers;
+        if (destination.len < required) return error.CapacityExceeded;
+        return decodeXmlValue(raw, .text, destination);
+    }
+    return required;
+}
+
+fn decodeXmlCdataEvent(
+    event: XmlCdataEvent,
+    source: []const u8,
+    output: ?[]u8,
+) XmlError!usize {
+    const content = try validateXmlCdataEvent(event, source);
+    const required = try decodeXmlValue(content, .cdata, null);
+    if (output) |destination| {
+        if (slicesOverlap(source, destination)) return error.OverlappingBuffers;
+        if (destination.len < required) return error.CapacityExceeded;
+        return decodeXmlValue(content, .cdata, destination);
+    }
+    return required;
+}
+
+fn declarationInfoForEvent(
+    event: XmlDeclarationEvent,
+    source: []const u8,
+) XmlError!XmlDeclarationInfo {
+    const raw = try ensureXmlEventRaw(source, event.offset, event.raw);
+    if (raw.len == 0) return error.InvalidDeclaration;
+    return parseDeclarationInfo(raw);
+}
+
+pub fn parseDeclarationInfo(raw: []const u8) XmlError!XmlDeclarationInfo {
+    if (raw.len < "<?xml?>".len) return error.InvalidDeclaration;
+    try validateXmlRawData(raw, false, false, false);
+    if (!startsWithAt(raw, 0, "<?xml")) return error.InvalidDeclaration;
+    if (raw.len < 2 or !std.mem.eql(u8, raw[raw.len - 2 ..], "?>")) {
+        return error.InvalidDeclaration;
+    }
+
+    const close = raw.len - 2;
+    if (close <= "<?xml".len or !isXmlWhitespace(raw["<?xml".len])) {
+        return error.InvalidDeclaration;
+    }
+
+    var cursor: usize = "<?xml".len;
+    var declaration_order: u8 = 0;
+    var version: ?[]const u8 = null;
+    var encoding: ?[]const u8 = null;
+    var standalone: ?[]const u8 = null;
+    var pseudo_attribute_seen = false;
+
+    while (cursor < close) {
+        const separator_start = cursor;
+        cursor = skipXmlWhitespace(raw, cursor);
+        if (cursor == close) break;
+        if (pseudo_attribute_seen and cursor == separator_start) {
+            return error.InvalidDeclaration;
+        }
+        const name_start = cursor;
+        const name_end = parseXmlName(raw, name_start) orelse {
+            return error.InvalidDeclaration;
+        };
+        const name = raw[name_start..name_end];
+        cursor = skipXmlWhitespace(raw, name_end);
+        if (cursor >= close or raw[cursor] != '=') return error.InvalidDeclaration;
+        cursor += 1;
+        cursor = skipXmlWhitespace(raw, cursor);
+        if (cursor >= close or (raw[cursor] != '\'' and raw[cursor] != '"')) {
+            return error.InvalidDeclaration;
+        }
+        const quote = raw[cursor];
+        cursor += 1;
+        const value_start = cursor;
+        while (cursor < close and raw[cursor] != quote) : (cursor += 1) {}
+        if (cursor >= close) return error.InvalidDeclaration;
+        const value = raw[value_start..cursor];
+        try validateXmlRawData(value, false, false, false);
+
+        if (std.mem.eql(u8, name, "version")) {
+            if (declaration_order != 0 or version != null or !std.mem.eql(u8, value, "1.0")) {
+                return error.InvalidDeclaration;
+            }
+            version = value;
+            declaration_order = 1;
+        } else if (std.mem.eql(u8, name, "encoding")) {
+            if (version == null or declaration_order > 1 or !isXmlEncodingName(value) or
+                !std.ascii.eqlIgnoreCase(value, "UTF-8"))
+            {
+                return error.InvalidDeclaration;
+            }
+            encoding = value;
+            declaration_order = 2;
+        } else if (std.mem.eql(u8, name, "standalone")) {
+            if (version == null or declaration_order > 2 or
+                (!std.mem.eql(u8, value, "yes") and !std.mem.eql(u8, value, "no")))
+            {
+                return error.InvalidDeclaration;
+            }
+            standalone = value;
+            declaration_order = 3;
+        } else {
+            return error.InvalidDeclaration;
+        }
+        pseudo_attribute_seen = true;
+        cursor += 1;
+    }
+
+    return .{
+        .version = version orelse return error.InvalidDeclaration,
+        .encoding = encoding,
+        .standalone = standalone,
+    };
+}
+
+fn isXmlEncodingName(value: []const u8) bool {
+    if (value.len == 0) return false;
+    const first = value[0];
+    if (!((first >= 'A' and first <= 'Z') or (first >= 'a' and first <= 'z'))) {
+        return false;
+    }
+    for (value[1..]) |byte| {
+        if ((byte >= 'A' and byte <= 'Z') or (byte >= 'a' and byte <= 'z') or
+            (byte >= '0' and byte <= '9') or byte == '.' or byte == '_' or byte == '-')
+        {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+fn splitXmlQName(raw_name: []const u8) XmlError!XmlQName {
+    if (raw_name.len == 0) return error.InvalidName;
+    var colon_index: ?usize = null;
+    for (raw_name, 0..) |byte, index| {
+        if (byte != ':') continue;
+        if (colon_index != null) return error.InvalidName;
+        colon_index = index;
+    }
+
+    if (colon_index) |index| {
+        if (index == 0 or index + 1 == raw_name.len) return error.InvalidName;
+        const prefix = raw_name[0..index];
+        const local_name = raw_name[index + 1 ..];
+        try validateXmlNcName(prefix);
+        try validateXmlNcName(local_name);
+        return .{ .prefix = prefix, .local_name = local_name };
+    }
+
+    try validateXmlNcName(raw_name);
+    return .{ .prefix = null, .local_name = raw_name };
+}
+
+fn validateXmlNcName(raw_name: []const u8) XmlError!void {
+    if (raw_name.len == 0) return error.InvalidName;
+    var cursor: usize = 0;
+    const first = decodeXml(raw_name, cursor) orelse return error.InvalidUtf8;
+    if (!isXmlCharacter(first.codepoint) or !isXmlNcNameStart(first.codepoint)) {
+        return error.InvalidName;
+    }
+    cursor += first.length;
+    while (cursor < raw_name.len) {
+        const decoded = decodeXml(raw_name, cursor) orelse return error.InvalidUtf8;
+        if (!isXmlCharacter(decoded.codepoint) or !isXmlNcNameChar(decoded.codepoint)) {
+            return error.InvalidName;
+        }
+        cursor += decoded.length;
+    }
+}
+
+fn isXmlNcNameStart(codepoint: u21) bool {
+    return codepoint != ':' and isXmlNameStart(codepoint);
+}
+
+fn isXmlNcNameChar(codepoint: u21) bool {
+    return codepoint != ':' and isXmlNameChar(codepoint);
+}
+
 fn expectXmlDiagnostic(expected: XmlError, input: []const u8) !XmlDiagnostic {
     const result = try validateXml(input);
     const diagnostic = result orelse return error.ExpectedXmlDiagnostic;
@@ -3109,6 +4125,11 @@ test "validateXml reports matching and root errors at the first invalid byte" {
     try testing.expectEqual(@as(usize, 0), unclosed.byte_offset);
 }
 
+test "XML fast paths preserve Unicode name and text boundaries" {
+    const input = "<\xC3\xA9 attr\xC3\xA9=\"v\">\xC3\xA9&amp;ok</\xC3\xA9>";
+    try testing.expectEqual(@as(?XmlDiagnostic, null), try validateXml(input));
+}
+
 test "validateXml rejects malformed attributes names entities and XML characters" {
     const duplicate = try expectXmlDiagnostic(error.DuplicateAttribute, "<a x='1' x=\"2\"/>");
     try testing.expectEqual(@as(usize, 9), duplicate.byte_offset);
@@ -3134,6 +4155,8 @@ test "validateXml rejects malformed attributes names entities and XML characters
     const invalid_utf8 = [_]u8{ '<', 'a', '>', 0xc0, 0xaf, '<', '/', 'a', '>' };
     const utf8 = try expectXmlDiagnostic(error.InvalidUtf8, &invalid_utf8);
     try testing.expectEqual(@as(usize, 3), utf8.byte_offset);
+    const cdata_end = try expectXmlDiagnostic(error.InvalidCharacter, "<a>text]]>tail</a>");
+    try testing.expectEqual(@as(usize, 7), cdata_end.byte_offset);
 }
 
 test "validateXml preserves the earliest lexical or grammar diagnostic" {
