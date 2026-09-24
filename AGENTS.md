@@ -15,7 +15,7 @@ Zig 0.16.0 static library for SIMD byte operations, UTF-8 checks, structural ind
 
 ## Work locally
 
-`build.zig.zon` pins Zig 0.16.0 with no external packages. There is no repository-local Nix environment; declare one before adding system dependencies instead of installing them imperatively. From the repository root:
+`build.zig.zon` pins Zig 0.16.0 with no external packages. `devenv.nix` provides that toolchain and direnv loads it through `.envrc`, so add system dependencies there instead of installing them imperatively. From the repository root:
 
 ```sh
 zig build

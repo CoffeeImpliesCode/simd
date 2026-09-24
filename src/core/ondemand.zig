@@ -115,7 +115,7 @@ pub const Parser = struct {
         input: []const u8,
         token_count: usize,
     ) Error!Document {
-        return self.completeOwnedDocument(input, token_count, .checked, .json);
+        return self.completeOwnedDocument(input, token_count, .json);
     }
 
     /// Completes a JSON-family document using the requested dialect.
@@ -125,31 +125,19 @@ pub const Parser = struct {
         token_count: usize,
         dialect: stage2.Dialect,
     ) Error!Document {
-        return self.completeOwnedDocument(input, token_count, .checked, dialect);
-    }
-
-    /// Completes indexes emitted by a parser-owned generated indexer.
-    ///
-    /// Public callers must use `completeDocument`, which validates indexes.
-    pub fn completeGeneratedDocument(
-        self: *Parser,
-        input: []const u8,
-        token_count: usize,
-    ) Error!Document {
-        return self.completeOwnedDocument(input, token_count, .generated, .json);
+        return self.completeOwnedDocument(input, token_count, dialect);
     }
 
     fn completeOwnedDocument(
         self: *Parser,
         input: []const u8,
         token_count: usize,
-        mode: CompletionMode,
         dialect: stage2.Dialect,
     ) Error!Document {
         if (self.document_active) return error.DocumentActive;
         if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
         try self.ensureCapacity(input.len, token_count);
-        return self.finishOwnedDocument(input, token_count, mode, dialect);
+        return self.finishOwnedDocument(input, token_count, dialect);
     }
 
     pub fn initDocument(
@@ -176,7 +164,7 @@ pub const Parser = struct {
             self.indexes[0..source_count],
             structural_index.indexes[0..source_count],
         );
-        return self.finishOwnedDocument(input, structural_index.count, .checked, .json);
+        return self.finishOwnedDocument(input, structural_index.count, .json);
     }
 
     pub fn iterate(
@@ -187,16 +175,10 @@ pub const Parser = struct {
         return self.initDocument(input, structural_index);
     }
 
-    const CompletionMode = enum {
-        checked,
-        generated,
-    };
-
     fn finishOwnedDocument(
         self: *Parser,
         input: []const u8,
         token_count: usize,
-        mode: CompletionMode,
         dialect: stage2.Dialect,
     ) Error!Document {
         if (token_count > input.len) return error.InvalidStructuralIndex;
@@ -215,9 +197,7 @@ pub const Parser = struct {
             sentinel,
             0,
         };
-        if (mode == .checked) {
-            try validateIndexes(input, self.indexes, token_count);
-        }
+        try validateIndexes(input, self.indexes, token_count);
 
         const view = try stage2.IndexView.init(input, self.indexes[0..token_count], 0);
         try self.token_reader.reset(input, view, dialect);

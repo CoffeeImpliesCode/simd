@@ -838,7 +838,6 @@ fn scanMarkdownLineContent(
     }
 }
 
-
 pub const MarkdownError = error{
     InvalidIndexCount,
     InvalidTokenIndex,
@@ -1233,7 +1232,6 @@ fn markdownCandidateMask(
 fn markdownValidMask(comptime VLEN: usize, valid_length: usize) simd.Mask(VLEN) {
     return simd.validMask(VLEN, valid_length);
 }
-
 
 fn processMarkdownLineMarker(
     input: []const u8,

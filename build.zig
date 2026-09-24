@@ -68,6 +68,19 @@ pub fn build(b: *std.Build) void {
     });
     bench_mod.addOptions("build_options", build_options);
 
+    const kernel_bench_mod = b.createModule(.{
+        .root_source_file = b.path("kernel_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    kernel_bench_mod.addOptions("build_options", build_options);
+    const string_bench_mod = b.createModule(.{
+        .root_source_file = b.path("string_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    string_bench_mod.addOptions("build_options", build_options);
+
     const fuzz_test_mod = b.createModule(.{
         .root_source_file = b.path("test/fuzz_test.zig"),
         .target = target,
@@ -90,6 +103,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     commonmark_test_mod.addImport("simd_lib", lib_mod);
+
     // We will also create a module for our other entry point, 'main.zig'.
     const exe_mod = b.createModule(.{
         // `root_source_file` is the Zig "entry point" of the module. If a module
@@ -195,6 +209,24 @@ pub fn build(b: *std.Build) void {
         bench_cmd.addArgs(args);
     }
 
+    const kernel_bench_exe = b.addExecutable(.{
+        .name = "simd-kernel-bench",
+        .root_module = kernel_bench_mod,
+    });
+    const run_kernel_bench = b.addRunArtifact(kernel_bench_exe);
+    if (b.args) |args| {
+        run_kernel_bench.addArgs(args);
+    }
+
+    const string_bench_exe = b.addExecutable(.{
+        .name = "simd-string-bench",
+        .root_module = string_bench_mod,
+    });
+    const run_string_bench = b.addRunArtifact(string_bench_exe);
+    if (b.args) |args| {
+        run_string_bench.addArgs(args);
+    }
+
     const corpus_step = b.step("corpus", "Run offline corpus catalogs");
     corpus_step.dependOn(&run_corpus_tests.step);
     corpus_step.dependOn(&run_commonmark_tests.step);
@@ -207,6 +239,12 @@ pub fn build(b: *std.Build) void {
 
     const bench_step = b.step("bench", "Run deterministic parser benchmarks");
     bench_step.dependOn(&bench_cmd.step);
+
+    const bench_kernel_step = b.step("bench-kernel", "Run SIMD kernel A/B benchmarks");
+    bench_kernel_step.dependOn(&run_kernel_bench.step);
+
+    const bench_string_step = b.step("bench-string", "Run JSON string token benchmarks");
+    bench_string_step.dependOn(&run_string_bench.step);
 
     // Similar to creating the run step earlier, this exposes a `test` step to
     // the `zig build --help` menu, providing a way for the user to request
