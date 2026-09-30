@@ -1,5 +1,160 @@
 const std = @import("std");
 
+/// SIMD widths exercised by `zig build check`.
+///
+/// Every width gets its own `build_options` module and its own library module,
+/// so a matrix column never observes the default-width artifacts. The list is
+/// a verification matrix, not a whitelist: `-Dvector_len` stays unrestricted
+/// above 4 and can select any width outside this list.
+const check_vector_lens = [_]usize{ 4, 5, 7, 12, 16, 24, 32, 64 };
+
+/// Test-runner seed pinned for gate runs.
+///
+/// `std.Build.addRunArtifact` already appends `--seed=0x<graph seed>` for test
+/// binaries; appending a second `--seed=` wins the test runner's last-one-wins
+/// argument parse. The deterministic Smith seeds in `test/fuzz_test.zig` are
+/// literals and never read `std.testing.random_seed`, so this pins run order
+/// and implicit randomness without touching them.
+const check_test_seed: u32 = 0x9e37_79b9;
+
+/// Root-relative Zig sources covered by the format check. Listing them
+/// explicitly keeps the gate out of `.zig-cache`, `zig-out`, and `.devenv`.
+const fmt_paths = [_][]const u8{
+    "build.zig",
+    "build.zig.zon",
+    "src",
+    "test",
+    "scripts",
+    "library_test.zig",
+    "bench.zig",
+    "kernel_bench.zig",
+    "string_bench.zig",
+};
+
+/// One test entry point of this repository.
+const TestRoot = struct {
+    /// Label used for the artifact and run step names.
+    name: []const u8,
+    /// Root source file of the test binary.
+    path: []const u8,
+    /// False for roots that reach `src/` by relative path instead of by import.
+    imports_lib: bool,
+};
+
+/// Every existing test root, including the ones the default-width build wires
+/// up by hand. The matrix runs all of them at all of `check_vector_lens`.
+const test_roots = [_]TestRoot{
+    .{ .name = "root", .path = "test/root_test.zig", .imports_lib = true },
+    .{ .name = "library", .path = "library_test.zig", .imports_lib = false },
+    .{ .name = "main", .path = "src/main.zig", .imports_lib = true },
+    .{ .name = "fuzz", .path = "test/fuzz_test.zig", .imports_lib = true },
+    .{ .name = "corpus", .path = "test/corpus_test.zig", .imports_lib = true },
+    .{ .name = "commonmark", .path = "test/commonmark_conformance_test.zig", .imports_lib = true },
+};
+
+/// Builds one test binary plus its run step for a single width.
+///
+/// `options` and `lib_module` must both carry the same `vector_len`; the test
+/// root binds to `options` directly and through `lib_module` so the library and
+/// the test observe one width.
+fn addTestRoot(
+    b: *std.Build,
+    artifact_name: []const u8,
+    root: TestRoot,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    options: *std.Build.Step.Options,
+    lib_module: *std.Build.Module,
+    seed: u32,
+) *std.Build.Step.Run {
+    const module = b.createModule(.{
+        .root_source_file = b.path(root.path),
+        .target = target,
+        .optimize = optimize,
+    });
+    module.addOptions("build_options", options);
+    if (root.imports_lib) module.addImport("simd_lib", lib_module);
+
+    const test_compile = b.addTest(.{
+        .name = artifact_name,
+        .root_module = module,
+    });
+    const run = b.addRunArtifact(test_compile);
+    run.addArg(b.fmt("--seed=0x{x}", .{seed}));
+    return run;
+}
+
+/// Adds every `test_roots` x `check_vector_lens` cell to `check_step`.
+///
+/// The default-width artifacts stand in for their own column: when
+/// `-Dvector_len` names a matrix width, that column reuses them instead of
+/// compiling the same width twice.
+fn addWidthMatrix(
+    b: *std.Build,
+    check_step: *std.Build.Step,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    selected_vector_len: ?usize,
+) void {
+    for (check_vector_lens) |width| {
+        if (selected_vector_len) |selected| {
+            if (selected == width) continue;
+        }
+
+        const options = b.addOptions();
+        options.addOption(?usize, "vector_len", width);
+
+        const lib_module = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        lib_module.addOptions("build_options", options);
+
+        for (test_roots) |root| {
+            const run = addTestRoot(
+                b,
+                b.fmt("{s}-w{d}", .{ root.name, width }),
+                root,
+                target,
+                optimize,
+                options,
+                lib_module,
+                check_test_seed,
+            );
+            check_step.dependOn(&run.step);
+        }
+    }
+}
+
+/// Builds the `benchmark_options` module that `scripts/benchmark.zig` imports.
+///
+/// Every value is read from the configuration this build actually selected
+/// rather than from anything an archive carries, so a recorded run names the
+/// toolchain and binary shape that produced it. `bench_target` and `bench_cpu`
+/// are complete specifiers: they stay meaningful when `-Dtarget` and the CPU
+/// were left at their native defaults, where a bare query would only say
+/// `native` and a native CPU would leave the feature set unstated.
+fn addBenchmarkOptions(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    vector_len: ?usize,
+) *std.Build.Step.Options {
+    const query = std.Target.Query.fromTarget(&target.result);
+    const options = b.addOptions();
+    options.addOption([]const u8, "zig_exe", b.graph.zig_exe);
+    options.addOption([]const u8, "bench_target", query.zigTriple(b.allocator) catch @panic("OOM"));
+    options.addOption(
+        []const u8,
+        "bench_cpu",
+        std.Target.Query.serializeCpuAlloc(query, b.allocator) catch @panic("OOM"),
+    );
+    options.addOption([]const u8, "bench_optimize", @tagName(optimize));
+    options.addOption(?usize, "bench_vector_len", vector_len);
+    return options;
+}
+
 // Although this function looks imperative, note that its job is to
 // declaratively construct a build graph that will be executed by an external
 // runner.
@@ -200,6 +355,16 @@ pub fn build(b: *std.Build) void {
     });
     const run_commonmark_tests = b.addRunArtifact(commonmark_tests);
 
+    // Pin the runner seed on the default-width binaries too, so `zig build test`
+    // and the native column of `zig build check` agree run for run.
+    const default_test_seed = b.fmt("--seed=0x{x}", .{check_test_seed});
+    run_library_unit_tests.addArg(default_test_seed);
+    run_lib_unit_tests.addArg(default_test_seed);
+    run_exe_unit_tests.addArg(default_test_seed);
+    run_smith_fuzz_tests.addArg(default_test_seed);
+    run_corpus_tests.addArg(default_test_seed);
+    run_commonmark_tests.addArg(default_test_seed);
+
     const bench_exe = b.addExecutable(.{
         .name = "simd-bench",
         .root_module = bench_mod,
@@ -227,6 +392,40 @@ pub fn build(b: *std.Build) void {
         run_string_bench.addArgs(args);
     }
 
+    // The benchmark runner drives `simd-bench`, so it executes on the host even
+    // under a cross `-Dtarget`, while the executable it launches keeps the
+    // selected optimize, target, and `-Dvector_len`. Wiring the graph below
+    // records nothing: only running `benchmark` does, so `zig build` and
+    // `zig build check` stay free of archive writes.
+    const benchmark_options = addBenchmarkOptions(b, target, optimize, vector_len);
+    const bench_script_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/benchmark.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    bench_script_mod.addOptions("benchmark_options", benchmark_options);
+
+    const bench_runner_exe = b.addExecutable(.{
+        .name = "simd-benchmark",
+        .root_module = bench_script_mod,
+    });
+
+    // argv: runner, the bench executable this build produced, the repository
+    // root, then the operation and its arguments exactly as typed after `--`.
+    const bench_runner = b.addRunArtifact(bench_runner_exe);
+    bench_runner.addArtifactArg(bench_exe);
+    bench_runner.addDirectoryArg(b.path("."));
+    if (b.args) |args| {
+        bench_runner.addArgs(args);
+    }
+
+    const bench_script_tests = b.addTest(.{
+        .name = "benchmark-script",
+        .root_module = bench_script_mod,
+    });
+    const run_bench_script_tests = b.addRunArtifact(bench_script_tests);
+    run_bench_script_tests.addArg(default_test_seed);
+
     const corpus_step = b.step("corpus", "Run offline corpus catalogs");
     corpus_step.dependOn(&run_corpus_tests.step);
     corpus_step.dependOn(&run_commonmark_tests.step);
@@ -246,6 +445,18 @@ pub fn build(b: *std.Build) void {
     const bench_string_step = b.step("bench-string", "Run JSON string token benchmarks");
     bench_string_step.dependOn(&run_string_bench.step);
 
+    const benchmark_step = b.step(
+        "benchmark",
+        "Record, verify, or reproduce native benchmark archives",
+    );
+    benchmark_step.dependOn(&bench_runner.step);
+
+    const benchmark_test_step = b.step(
+        "benchmark-test",
+        "Run benchmark script behavior tests",
+    );
+    benchmark_test_step.dependOn(&run_bench_script_tests.step);
+
     // Similar to creating the run step earlier, this exposes a `test` step to
     // the `zig build --help` menu, providing a way for the user to request
     // running the unit tests.
@@ -261,4 +472,49 @@ pub fn build(b: *std.Build) void {
     });
     const docs_step = b.step("docs", "Generate documentation");
     docs_step.dependOn(&install_docs.step);
+
+    // ------------------------------------------------------------------------
+    // `zig build check`: the durable full verification gate.
+    // ------------------------------------------------------------------------
+    // Everything below is reachable only through `check`, so `test`, `fuzz`,
+    // `corpus`, `commonmark`, `bench*`, `run`, and `docs` depend on nothing
+    // here. Their dependency shape is unchanged; the pinned `check_test_seed`
+    // above is the one documented deviation from their historical behavior,
+    // because it fixes run order instead of re-deriving it from the graph
+    // seed.
+
+    // `zig fmt --check` over the Zig sources this repository owns. Hidden
+    // directories are listed out by name so the shared `.zig-cache` symlink is
+    // never walked.
+    const fmt_check = b.addFmt(.{
+        .paths = &fmt_paths,
+        .check = true,
+    });
+
+    // Actually run the installed visualizer, not just compile it. Capturing
+    // stdout keeps the ANSI dump out of the build log while still failing on a
+    // crash, a nonzero exit, or an empty visualization.
+    const visualizer_smoke = b.addRunArtifact(exe);
+    visualizer_smoke.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    visualizer_smoke.addCheck(.{ .expect_stdout_match = "SIMD Vector Visualizer" });
+
+    const check_step = b.step(
+        "check",
+        "Full verification gate: format, install build, native tests, " ++
+            "width matrix, offline corpora, benchmark script tests, " ++
+            "visualizer smoke",
+    );
+    check_step.dependOn(b.getInstallStep());
+    check_step.dependOn(&fmt_check.step);
+    check_step.dependOn(&run_library_unit_tests.step);
+    check_step.dependOn(&run_lib_unit_tests.step);
+    check_step.dependOn(&run_exe_unit_tests.step);
+    check_step.dependOn(&run_smith_fuzz_tests.step);
+    check_step.dependOn(&run_corpus_tests.step);
+    check_step.dependOn(&run_commonmark_tests.step);
+    // The benchmark script is host-only and width-independent: one invocation
+    // covers its behavior, so it is not swept across `check_vector_lens`.
+    check_step.dependOn(&run_bench_script_tests.step);
+    check_step.dependOn(&visualizer_smoke.step);
+    addWidthMatrix(b, check_step, target, optimize, vector_len);
 }
