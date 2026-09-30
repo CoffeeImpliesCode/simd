@@ -544,16 +544,24 @@ fn scanMarkdownLineFused(
 
     while (chunk_offset + VLEN <= input.len) : (chunk_offset += VLEN) {
         const vector: simd.Vec(VLEN, u8) = input[chunk_offset..][0..VLEN].*;
-        const newline_mask = simd.matchAny2(VLEN, vector, '\r', '\n');
+        // Zero tests and bit scans below share an explicitly bounded
+        // storage-width representation.
+        const newline_mask: simd.MaskStorage(VLEN) = simd.exactMask(
+            simd.Mask(VLEN),
+            simd.matchAny2(VLEN, vector, '\r', '\n'),
+        );
         if (newline_mask != 0) {
             const relative_line_end = @as(usize, @intCast(@ctz(newline_mask)));
             line_end = chunk_offset + relative_line_end;
-            const valid_candidate_mask = markdownInlineCandidateMask(VLEN, vector) &
-                simd.validMask(VLEN, relative_line_end);
+            const valid_candidate_mask: simd.MaskStorage(VLEN) = simd.exactMask(
+                simd.Mask(VLEN),
+                markdownInlineCandidateMask(VLEN, vector) &
+                    simd.validMask(VLEN, relative_line_end),
+            );
             if (valid_candidate_mask != 0) {
                 if (candidate_count + VLEN <= max_buffered_candidates) {
                     candidate_count += simd.extractBitIndexes(
-                        simd.Mask(VLEN),
+                        @TypeOf(valid_candidate_mask),
                         valid_candidate_mask,
                         chunk_offset,
                         candidate_offsets[candidate_count..],
@@ -564,11 +572,14 @@ fn scanMarkdownLineFused(
             }
             break;
         }
-        const candidate_mask = markdownInlineCandidateMask(VLEN, vector);
+        const candidate_mask: simd.MaskStorage(VLEN) = simd.exactMask(
+            simd.Mask(VLEN),
+            markdownInlineCandidateMask(VLEN, vector),
+        );
         if (candidate_mask != 0) {
             if (candidate_count + VLEN <= max_buffered_candidates) {
                 candidate_count += simd.extractBitIndexes(
-                    simd.Mask(VLEN),
+                    @TypeOf(candidate_mask),
                     candidate_mask,
                     chunk_offset,
                     candidate_offsets[candidate_count..],
@@ -624,7 +635,10 @@ fn findMarkdownLineEnd(
     var chunk_offset = start;
     while (chunk_offset + VLEN <= input.len) : (chunk_offset += VLEN) {
         const vector: simd.Vec(VLEN, u8) = input[chunk_offset..][0..VLEN].*;
-        const newline_mask = simd.matchAny2(VLEN, vector, '\r', '\n');
+        const newline_mask: simd.MaskStorage(VLEN) = simd.exactMask(
+            simd.Mask(VLEN),
+            simd.matchAny2(VLEN, vector, '\r', '\n'),
+        );
         if (newline_mask != 0) {
             return chunk_offset + @as(usize, @intCast(@ctz(newline_mask)));
         }
@@ -763,11 +777,14 @@ fn scanMarkdownLineContent(
     var skipped_until = line_start;
     while (chunk_offset + VLEN <= line_end) : (chunk_offset += VLEN) {
         const vector: simd.Vec(VLEN, u8) = input[chunk_offset..][0..VLEN].*;
-        const candidate_mask = markdownInlineCandidateMask(VLEN, vector);
+        const candidate_mask: simd.MaskStorage(VLEN) = simd.exactMask(
+            simd.Mask(VLEN),
+            markdownInlineCandidateMask(VLEN, vector),
+        );
         if (candidate_mask == 0) continue;
         var candidate_indexes: [VLEN]u32 = undefined;
         const candidate_count = simd.extractBitIndexes(
-            simd.Mask(VLEN),
+            @TypeOf(candidate_mask),
             candidate_mask,
             chunk_offset,
             &candidate_indexes,
@@ -1215,22 +1232,6 @@ fn markdownInlineCandidateMask(
     const inline_chars = simd.matchAny4(VLEN, vector, '`', '[', ']', '(');
     const paren_close = simd.matchByte(VLEN, vector, ')');
     return inline_chars | paren_close;
-}
-
-fn markdownCandidateMask(
-    comptime VLEN: usize,
-    vector: simd.Vec(VLEN, u8),
-) simd.Mask(VLEN) {
-    const line_and_blocks = simd.matchAny4(VLEN, vector, '#', '>', '-', '*');
-    const lists_and_inline = simd.matchAny4(VLEN, vector, '+', '`', '[', ']');
-    const links_and_fences = simd.matchAny4(VLEN, vector, '(', ')', '~', '\n');
-    const thematic_underscores = simd.matchByte(VLEN, vector, '_');
-    const digits = simd.matchRange(VLEN, vector, '0', '9');
-    return line_and_blocks | lists_and_inline | links_and_fences | thematic_underscores | digits;
-}
-
-fn markdownValidMask(comptime VLEN: usize, valid_length: usize) simd.Mask(VLEN) {
-    return simd.validMask(VLEN, valid_length);
 }
 
 fn processMarkdownLineMarker(
@@ -2009,6 +2010,66 @@ test "Markdown scanning preserves CRLF at SIMD edges" {
         const third_start = second_start + 7;
         input[third_start] = '#';
         try expectMatchesScalarOracleAtWidth(vlen, input[0 .. third_start + 1]);
+    }
+}
+
+fn expectMarkdownLineTerminatorsAtWidth(comptime VLEN: usize) !void {
+    // A block that holds no terminator must extend the current line instead of
+    // ending it, so every terminator position inside, on, and just past a block
+    // boundary has to resolve to the same line split as the scalar oracle.
+    const terminators = [_][]const u8{ "\n", "\r", "\r\n" };
+    for (terminators) |terminator| {
+        for ([_]usize{ VLEN - 1, VLEN, VLEN + 1, 2 * VLEN }) |terminator_offset| {
+            var input: [3 * VLEN + 8]u8 = @splat('x');
+            input[0] = '#';
+            @memcpy(input[terminator_offset..][0..terminator.len], terminator);
+
+            const next_line = terminator_offset + terminator.len;
+            input[next_line] = '#';
+            input[next_line + 1] = ' ';
+            input[next_line + 3] = '[';
+            input[next_line + 4] = ']';
+            input[next_line + 5] = '\n';
+
+            try expectMatchesScalarOracleAtWidth(VLEN, input[0 .. next_line + 6]);
+        }
+    }
+}
+
+test "Markdown line scanning stays exact at narrow and unaligned widths" {
+    const prefix = ("abcdefghijklmnopqrstuvwxyz" ** 12) ++ "\r\n";
+    const input = prefix ++
+        "# heading\r\n" ++
+        "- item [link](target)\n" ++
+        "> quote\n" ++
+        "`ab`\n";
+    const expected_indexes = [_]u32{
+        prefix.len,      prefix.len + 11, prefix.len + 18,
+        prefix.len + 23, prefix.len + 24, prefix.len + 31,
+        prefix.len + 33, prefix.len + 41, prefix.len + 44,
+    };
+    const expected_kinds = [_]MarkdownTokenKind{
+        .heading,
+        .list_item,
+        .link_open,
+        .link_close,
+        .link_open,
+        .link_close,
+        .blockquote,
+        .inline_code,
+        .inline_code,
+    };
+
+    inline for ([_]usize{ 4, 5, 6, 7, 9, 12, 17, 20, 24, 48, 65, 72 }) |vlen| {
+        var index = try indexMarkdownImpl(vlen, testing.allocator, input);
+        defer index.deinit(testing.allocator);
+
+        try expectIndexInvariants(input, &index);
+        try testing.expectEqual(expected_indexes.len, index.count);
+        try testing.expectEqualSlices(u32, &expected_indexes, index.indexes[0..index.count]);
+        try testing.expectEqualSlices(MarkdownTokenKind, &expected_kinds, index.kinds[0..index.count]);
+
+        try expectMarkdownLineTerminatorsAtWidth(vlen);
     }
 }
 

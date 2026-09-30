@@ -1,5 +1,6 @@
 const std = @import("std");
 const simd = @import("simd_lib");
+const core = @import("simd_lib").simd;
 const testing = std.testing;
 
 const assert = std.debug.assert;
@@ -65,7 +66,9 @@ pub fn main(init: std.process.Init) !void {
         const string_mask = inside_without_closing | unescaped_quotes;
         const top_bit: BitMask = @as(BitMask, 1) <<
             @as(std.math.Log2Int(BitMask), @intCast(VLEN - 1));
-        starts_in_string = (inside_without_closing & top_bit) != 0;
+        // Read the carry lane through the normalized storage-width mask.
+        starts_in_string =
+            core.exactMask(BitMask, inside_without_closing & top_bit) != 0;
 
         const digits = simd.matchRange(VLEN, bytes, '0', '9');
         const periods = simd.matchByte(VLEN, bytes, '.');

@@ -490,8 +490,21 @@ fn scalarMask(
     return result;
 }
 
+// Compare the same explicitly normalized storage-width representation used by
+// mask consumers; logical-width comparisons retain Zig's integer semantics.
+fn expectStorageMaskEqual(
+    comptime width: usize,
+    expected: lib.Mask(width),
+    actual: lib.Mask(width),
+) !void {
+    try testing.expectEqual(
+        lib.simd.exactMask(lib.Mask(width), expected),
+        lib.simd.exactMask(lib.Mask(width), actual),
+    );
+}
+
 pub fn expectSimdMatchWindows(input: []const u8) !void {
-    inline for (vector_widths) |width| {
+    inline for ([_]usize{ 4, 5, 7, 12, 16, 20, 24, 32, 48, 64, 65, 72 }) |width| {
         var iterator = lib.windows(u8, width, input, 0);
         var offset: usize = 0;
         var window_count: usize = 0;
@@ -499,19 +512,23 @@ pub fn expectSimdMatchWindows(input: []const u8) !void {
         while (iterator.next()) |vector| {
             window_count += 1;
             try testing.expect(window_count <= max_windows);
-            try testing.expectEqual(
+            try expectStorageMaskEqual(
+                width,
                 scalarMaskByte(width, input, offset, 'a'),
                 lib.matchByte(width, vector, 'a'),
             );
-            try testing.expectEqual(
+            try expectStorageMaskEqual(
+                width,
                 scalarMaskAny2(width, input, offset, '\\', '"'),
                 lib.matchAny2(width, vector, '\\', '"'),
             );
-            try testing.expectEqual(
+            try expectStorageMaskEqual(
+                width,
                 scalarMaskAny4(width, input, offset, '{', '}', '[', ']'),
                 lib.matchAny4(width, vector, '{', '}', '[', ']'),
             );
-            try testing.expectEqual(
+            try expectStorageMaskEqual(
+                width,
                 scalarMaskRange(width, input, offset, 0x20, 0x7f),
                 lib.matchRange(width, vector, 0x20, 0x7f),
             );

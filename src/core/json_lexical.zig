@@ -152,7 +152,7 @@ fn processStrictBlock(
         state.ends_in_backslash,
     ).odd_length_ends & valid;
     if (state.ends_in_backslash) {
-        if ((backslashes & @as(Mask, 1)) == 0) {
+        if (simd.exactMask(Mask, backslashes & @as(Mask, 1)) == 0) {
             if (state.backslash_run_odd) {
                 odd_backslash_ends |= 1;
             } else {
@@ -191,7 +191,8 @@ fn processStrictBlock(
 
     const last_bit: Mask = @as(Mask, 1) <<
         @as(Shift, @intCast(valid_count - 1));
-    state.in_string = (inside_without_closing & last_bit) != 0;
+    // Widen the logical lane probe to a bounded storage-width value.
+    state.in_string = simd.exactMask(Mask, inside_without_closing & last_bit) != 0;
     state.quote_delimiter = if (state.in_string) '"' else 0;
     state.ends_in_backslash = bytes[valid_count - 1] == '\\';
     state.backslash_run_odd = simd.trailingRunOdd(
@@ -200,7 +201,7 @@ fn processStrictBlock(
         valid_count,
         state.backslash_run_odd,
     );
-    state.in_atom = (atom_active & last_bit) != 0;
+    state.in_atom = simd.exactMask(Mask, atom_active & last_bit) != 0;
 }
 
 fn processDialectBlock(
@@ -223,7 +224,7 @@ fn processDialectBlock(
         state.ends_in_backslash,
     ).odd_length_ends & valid;
     if (state.ends_in_backslash) {
-        if ((backslashes & @as(Mask, 1)) == 0) {
+        if (simd.exactMask(Mask, backslashes & @as(Mask, 1)) == 0) {
             if (state.backslash_run_odd) {
                 odd_backslash_ends |= 1;
             } else {
@@ -392,7 +393,8 @@ fn processDialectByte(
             unescaped_single_quotes
         else
             unescaped_double_quotes;
-        if ((quote_mask & bit) != 0) {
+        // Widen the logical lane probe to a bounded storage-width value.
+        if (simd.exactMask(simd.Mask(VLEN), quote_mask & bit) != 0) {
             state.in_string = false;
             state.quote_delimiter = 0;
             state.in_atom = false;
@@ -442,8 +444,10 @@ fn processDialectByte(
 
     const bit = @as(simd.Mask(VLEN), 1) <<
         @as(std.math.Log2Int(simd.Mask(VLEN)), @intCast(local_offset));
-    const is_quote = (unescaped_double_quotes & bit) != 0 or
-        (mode == .json5 and (unescaped_single_quotes & bit) != 0);
+    const is_quote =
+        simd.exactMask(simd.Mask(VLEN), unescaped_double_quotes & bit) != 0 or
+        (mode == .json5 and
+            simd.exactMask(simd.Mask(VLEN), unescaped_single_quotes & bit) != 0);
     if (is_quote) {
         state.in_string = true;
         state.quote_delimiter = byte;
@@ -647,17 +651,12 @@ fn nextSetBit(
 ) ?usize {
     if (start >= valid_count) return null;
     const Shift = std.math.Log2Int(T);
-    const remaining = mask & (@as(T, std.math.maxInt(T)) << @as(Shift, @intCast(start)));
+    const windowed = mask & (@as(T, std.math.maxInt(T)) << @as(Shift, @intCast(start)));
+    // Scan one normalized storage-width value after rejecting the zero mask.
+    const remaining = simd.exactMask(T, windowed);
     if (remaining == 0) return null;
     const offset: usize = @intCast(@ctz(remaining));
     return if (offset < valid_count) offset else null;
-}
-
-fn shiftLeftMask(comptime T: type, mask: T, amount: usize) T {
-    const bits = @typeInfo(T).int.bits;
-    if (amount >= bits) return 0;
-    const Shift = std.math.Log2Int(T);
-    return mask << @as(Shift, @intCast(amount));
 }
 
 fn leadingRunEndMask(
@@ -668,7 +667,9 @@ fn leadingRunEndMask(
     const Mask = simd.Mask(VLEN);
     const Shift = std.math.Log2Int(Mask);
     const valid = simd.validMask(VLEN, valid_count);
-    const non_backslashes = ~backslashes | ~valid;
+    // Complement at the logical width, then normalize the union for the
+    // storage-width zero test and bit scan.
+    const non_backslashes = simd.exactMask(Mask, ~backslashes | ~valid);
     if (non_backslashes == 0) return 0;
     const run_length: usize = @intCast(@ctz(non_backslashes));
     if (run_length >= valid_count) return 0;

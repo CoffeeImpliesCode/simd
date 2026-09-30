@@ -22,6 +22,11 @@ pub fn Vec(comptime len: usize, comptime T: type) type {
     return @Vector(len, T);
 }
 
+/// An unsigned mask with exactly `bit_count` lanes.
+///
+/// Values retain Zig's logical-bit integer semantics. Their object storage may
+/// occupy more bits; `MaskStorage` and `exactMask` provide an explicit wider
+/// representation for consumers that perform storage-width scans.
 pub fn Mask(comptime bit_count: usize) type {
     comptime assert(bit_count > 0);
     return @Int(.unsigned, bit_count);
@@ -133,9 +138,13 @@ pub fn computeBackslashRuns(
 ) BackslashResult(T) {
     comptime validateMaskType(T);
 
+    // The run arithmetic stays at the logical width, where the carry out of a
+    // run and the alternating complement name the lanes they describe. The
+    // three lane tests are reads, so they run on the storage-width value.
     const b = backslash_mask;
+    const exact = exactMask(T, b);
     const one: T = 1;
-    if (b == 0) {
+    if (exact == 0) {
         return .{
             .odd_length_ends = if (prev_ends_in_backslash) one else 0,
             .ends_in_backslash = false,
@@ -154,7 +163,7 @@ pub fn computeBackslashRuns(
     const odd_bits: T = ~even_bits;
     const prev_start: T = @intFromBool(prev_ends_in_backslash);
     const starts = (b & ~((b << 1) | prev_start)) |
-        (if (prev_ends_in_backslash and (b & 1) != 0) one else 0);
+        (if (prev_ends_in_backslash and (exact & 1) != 0) one else 0);
 
     const even_starts = starts & even_bits;
     const odd_starts = starts & odd_bits;
@@ -164,12 +173,39 @@ pub fn computeBackslashRuns(
 
     const odd_length_ends =
         (even_carries & odd_bits) | (odd_carries & even_bits);
-    const top_bit = one << (@typeInfo(T).int.bits - 1);
+    const top_bit: @TypeOf(exact) = @intCast(one << (@typeInfo(T).int.bits - 1));
 
     return .{
         .odd_length_ends = odd_length_ends,
-        .ends_in_backslash = (b & top_bit) != 0,
+        .ends_in_backslash = (exact & top_bit) != 0,
     };
+}
+
+/// The integer type that actually stores `Mask(bits)`.
+///
+/// Storage size is target-dependent: `Mask(24)` occupies 32 bits, `Mask(48)`
+/// occupies 64, and `Mask(257)` can occupy 384. Derive the width from `@sizeOf`,
+/// not byte alignment or a fixed power-of-two rule.
+pub fn MaskStorage(comptime bits: usize) type {
+    comptime assert(bits > 0);
+    const Result = Mask(bits);
+    if (@bitSizeOf(Result) == @sizeOf(Result) * 8) return Result;
+    return @Int(.unsigned, @sizeOf(Result) * 8);
+}
+
+/// Widens `mask` to its storage type and explicitly bounds the logical lanes.
+///
+/// Logical-width comparisons and bit scans remain valid Zig operations. This
+/// helper gives storage-width consumers one normalized representation; values
+/// already at that width pass through unchanged.
+pub fn exactMask(comptime T: type, mask: T) MaskStorage(@typeInfo(T).int.bits) {
+    comptime validateMaskType(T);
+
+    const Storage = MaskStorage(@typeInfo(T).int.bits);
+    if (Storage == T) return mask;
+
+    const logical_bits: Storage = @intCast(std.math.maxInt(T));
+    return @as(Storage, @intCast(mask)) & logical_bits;
 }
 
 pub fn matchByte(comptime len: usize, v: Vec(len, u8), target: u8) Mask(len) {
@@ -223,13 +259,6 @@ pub fn matchJsonWhitespace(comptime len: usize, v: Vec(len, u8)) Mask(len) {
             @as(Vec(len, u8), @splat(1)));
     const control_whitespace = folded_distance <= @as(Vec(len, u8), @splat(0x04));
     const whitespace = control_whitespace | (v == @as(Vec(len, u8), @splat(0x20)));
-    if (comptime len % 8 != 0) {
-        var result: Mask(len) = 0;
-        inline for (0..len) |lane| {
-            result |= @as(Mask(len), @intFromBool(whitespace[lane])) << lane;
-        }
-        return result;
-    }
     return @bitCast(whitespace);
 }
 
@@ -243,15 +272,22 @@ pub fn trailingRunOdd(
     assert(valid_count <= bits);
     if (valid_count == 0) return false;
 
-    const valid = validMask(bits, valid_count);
-    const masked = mask & valid;
-    const non_matching = (~masked) & valid;
+    // Complement at the storage width, then restrict the result to valid
+    // logical lanes before scanning it.
+    const exact = exactMask(Mask(bits), mask);
+    const valid_exact = exactMask(Mask(bits), validMask(bits, valid_count));
+    const non_matching = ~exact & valid_exact;
     if (non_matching == 0) {
         return (valid_count % 2 == 0) == previous_odd;
     }
 
-    const Shift = std.math.Log2Int(Mask(bits));
-    const alignment: Shift = @intCast(bits - valid_count);
+    // Align the top valid lane with the top storage bit, so the leading-zero
+    // count names the trailing non-matching run at the width it is read from.
+    // A logical-width alignment read through a widened `@clz` would add the
+    // spare bits to the count and flip the parity at every odd spare width.
+    const Storage = MaskStorage(bits);
+    const Shift = std.math.Log2Int(Storage);
+    const alignment: Shift = @intCast(@bitSizeOf(Storage) - valid_count);
     const trailing_count: usize = @intCast(@clz(non_matching << alignment));
     return trailing_count % 2 != 0;
 }
@@ -264,20 +300,8 @@ pub fn extractBitIndexes(
 ) usize {
     comptime validateMaskType(T);
 
-    const bit_count: usize = @typeInfo(T).int.bits;
-    // Widen before ctz because non-byte-aligned integers carry spare storage bits.
-    const Storage = if (bit_count <= 8)
-        u8
-    else if (bit_count <= 16)
-        u16
-    else if (bit_count <= 32)
-        u32
-    else if (bit_count <= 64)
-        u64
-    else
-        @Int(.unsigned, (bit_count + 7) / 8 * 8);
-    const logical_bits: Storage = @intCast(std.math.maxInt(T));
-    var mask: Storage = @as(Storage, @intCast(bitmask)) & logical_bits;
+    // Use one explicitly bounded storage-width representation for every scan.
+    var mask = exactMask(T, bitmask);
     var written: usize = 0;
     inline for (0..8) |_| {
         if (mask != 0 and written < out_indexes.len) {
@@ -304,19 +328,23 @@ pub fn extractBitIndexesChecked(
 ) error{ CapacityExceeded, InputTooLarge }!usize {
     comptime validateMaskType(T);
 
-    const required_count: usize = @intCast(@popCount(bitmask));
+    // Count and scan the same normalized storage-width value.
+    const exact = exactMask(T, bitmask);
+    const required_count: usize = @intCast(@popCount(exact));
     if (out_indexes.len < required_count) return error.CapacityExceeded;
     if (required_count == 0) return 0;
 
-    const bit_count: usize = @typeInfo(T).int.bits;
-    const leading_zero_count: usize = @intCast(@clz(bitmask));
-    const highest_bit: usize = bit_count - leading_zero_count - 1;
+    // `exact` is zero-extended into its storage width, so counting from the
+    // storage width and counting from the logical width name the same bit.
+    const storage_bits: usize = @bitSizeOf(@TypeOf(exact));
+    const leading_zero_count: usize = @intCast(@clz(exact));
+    const highest_bit: usize = storage_bits - leading_zero_count - 1;
     const highest_offset = std.math.add(usize, base_offset, highest_bit) catch {
         return error.InputTooLarge;
     };
     if (highest_offset > std.math.maxInt(u32)) return error.InputTooLarge;
 
-    var mask = bitmask;
+    var mask = exact;
     var written: usize = 0;
     while (mask != 0) {
         const bit_pos: usize = @intCast(@ctz(mask));
@@ -483,14 +511,20 @@ fn utf8BlockIsValid(
     const lead_3 = matchRange(len, bytes, 0xe0, 0xef);
     const lead_4 = matchRange(len, bytes, 0xf0, 0xf4);
     const valid_byte = ascii | continuation | lead_2 | lead_3 | lead_4;
-    if (~valid_byte != 0) return false;
+    // Complement only the logical lanes, then use the normalized representation.
+    if (exactMask(Mask(len), ~valid_byte) != 0) return false;
 
     const expected_continuation =
         ((lead_2 | lead_3 | lead_4) << 1) |
         ((lead_3 | lead_4) << 2) |
         (lead_4 << 3) |
         utf8ContinuationMask(len, state.continuation_count);
-    if (continuation != expected_continuation) return false;
+    // Compare both masks in the same explicit storage-width representation.
+    if (exactMask(Mask(len), continuation) !=
+        exactMask(Mask(len), expected_continuation))
+    {
+        return false;
+    }
     if (state.constrained_header != 0 and
         !utf8ConstrainedContinuationValid(state.constrained_header, bytes[0]))
     {
@@ -505,7 +539,7 @@ fn utf8BlockIsValid(
         matchRange(len, bytes, 0x80, 0x8f);
     const bad_f4 = (matchByte(len, bytes, 0xf4) << 1) &
         matchRange(len, bytes, 0x90, 0xbf);
-    if ((bad_e0 | bad_ed | bad_f0 | bad_f4) != 0) return false;
+    if (exactMask(Mask(len), bad_e0 | bad_ed | bad_f0 | bad_f4) != 0) return false;
 
     const bytes_array: [len]u8 = @bitCast(bytes);
     var trailing_index: usize = len;
@@ -772,6 +806,32 @@ test "UTF-8 SIMD widths match the scalar classifier" {
     }
 }
 
+test "UTF-8 stays exact at padded and over-wide mask storage" {
+    // Cover byte-aligned widths with larger storage and widths above a register.
+    const emoji = [_]u8{ 0xf0, 0x90, 0x8d, 0x88 };
+    inline for ([_]usize{ 24, 48, 65, 100 }) |width| {
+        var input: [width * 3 + 8]u8 = undefined;
+        inline for ([_]usize{ 1, 2, 3, 4 }) |lanes_in_first_block| {
+            const start = width - lanes_in_first_block;
+            @memset(input[0..], 'x');
+            @memcpy(input[start..][0..emoji.len], &emoji);
+            try testing.expectEqual(
+                Utf8Result.valid,
+                validateUtf8WithWidth(width, &input),
+            );
+
+            // Replacing the sequence's last byte with a plain ASCII byte has to
+            // surface as the scalar classifier's own failure class and offset.
+            var truncated = input;
+            truncated[start + emoji.len - 1] = 'x';
+            try testing.expectEqual(
+                validateUtf8Scalar(&truncated),
+                validateUtf8WithWidth(width, &truncated),
+            );
+        }
+    }
+}
+
 test "UTF-8 carries valid and invalid sequences across SIMD blocks" {
     const valid_sequences = [_][]const u8{
         &[_]u8{ 0xc2, 0xa2 },
@@ -949,7 +1009,7 @@ fn scalarBackslashRunParity(
     const Shift = std.math.Log2Int(T);
     const one: T = 1;
     var odd_length_ends: T =
-        if (prev_ends_in_backslash and backslash_mask == 0) one else 0;
+        if (prev_ends_in_backslash and exactMask(T, backslash_mask) == 0) one else 0;
     var run_length: usize = 0;
     var bit_index: usize = 0;
     while (bit_index < bit_count) : (bit_index += 1) {
@@ -1058,6 +1118,17 @@ test "computeBackslashRuns handles u64 escaped-run parity" {
     try expectBackslashRunParity(u64);
 }
 
+test "computeBackslashRuns stays exact at padded and over-wide storage" {
+    // Cover empty, first-lane and last-lane masks across target-derived storage
+    // widths, including an exact-storage control at 128 bits.
+    inline for (.{
+        Mask(24),  Mask(48),  Mask(65),  Mask(100),
+        Mask(128), Mask(129), Mask(257),
+    }) |T| {
+        try expectBackslashRunParity(T);
+    }
+}
+
 fn expectExhaustiveBackslashRunParity(comptime T: type) !void {
     const bit_count: usize = @typeInfo(T).int.bits;
     comptime assert(bit_count < @bitSizeOf(usize));
@@ -1139,7 +1210,7 @@ fn expectMatchedByteIndexExtraction(comptime len: usize) !void {
 }
 
 test "comparison masks extract only matching vector lanes" {
-    inline for (.{ 4, 5, 7, 16, 32, 64 }) |len| {
+    inline for (.{ 4, 5, 7, 16, 24, 32, 48, 64, 65 }) |len| {
         try expectMatchedByteIndexExtraction(len);
     }
 }
@@ -1183,7 +1254,8 @@ fn expectJsonWhitespaceForWidth(comptime len: usize) !void {
         }
 
         const vector: Vec(len, u8) = bytes;
-        const actual = matchJsonWhitespace(len, vector);
+        // Compare the matcher and scalar oracle in the same representation.
+        const actual = exactMask(Mask(len), matchJsonWhitespace(len, vector));
         var expected: Mask(len) = 0;
         for (bytes, 0..) |byte, lane| {
             if (scalarJsonWhitespace(byte)) {
@@ -1191,12 +1263,12 @@ fn expectJsonWhitespaceForWidth(comptime len: usize) !void {
                     @as(std.math.Log2Int(Mask(len)), @intCast(lane));
             }
         }
-        try testing.expectEqual(expected, actual);
+        try testing.expectEqual(exactMask(Mask(len), expected), actual);
     }
 }
 
 test "matchJsonWhitespace agrees with scalar classification for every byte" {
-    inline for (.{ 4, 5, 7, 16, 32, 64 }) |len| {
+    inline for (.{ 4, 5, 7, 16, 24, 32, 48, 64, 129, 257 }) |len| {
         try expectJsonWhitespaceForWidth(len);
     }
 }
@@ -1308,6 +1380,18 @@ test "trailingRunOdd agrees with scalar carry for wide masks" {
     }
 }
 
+test "trailingRunOdd agrees with scalar carry at padded and over-wide storage" {
+    // Alignment and leading-zero count must use the same width to preserve
+    // trailing-run parity. Storage need not be a power of two: 257 logical
+    // bits can occupy 384 storage bits.
+    inline for (.{
+        Mask(24),  Mask(48),  Mask(65),  Mask(100),
+        Mask(128), Mask(129), Mask(257),
+    }) |T| {
+        try expectTrailingRunOddWide(T);
+    }
+}
+
 fn expectCheckedBitIndexExtraction(comptime T: type) !void {
     const bits: usize = @typeInfo(T).int.bits;
     const Shift = std.math.Log2Int(T);
@@ -1376,6 +1460,13 @@ fn expectCheckedBitIndexExtraction(comptime T: type) !void {
 
 test "extractBitIndexesChecked emits complete output at all supported widths" {
     inline for (.{ u4, u5, u7, u16, u32, u64 }) |T| {
+        try expectCheckedBitIndexExtraction(T);
+    }
+}
+
+test "extractBitIndexes handles mask widths above 64 bits" {
+    inline for (.{ u65, u72, u100, u128 }) |T| {
+        try expectBitIndexExtraction(T);
         try expectCheckedBitIndexExtraction(T);
     }
 }

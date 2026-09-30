@@ -104,3 +104,27 @@ test "Style default check" {
     const styled: Style = .{ .italic = true };
     try testing.expect(!styled.isDefault());
 }
+
+test "highlightMulti styles the lanes a mask names" {
+    // Exercise a logical width narrower than its target storage while styling
+    // exactly the lanes selected by the matcher.
+    const VLEN = 24;
+    var bytes: simd.Vec(VLEN, u8) = @splat('a');
+    bytes[0] = 'b';
+    bytes[7] = 'b';
+    bytes[VLEN - 1] = 'b';
+    const layers = [_]HighlightLayer(VLEN){.{
+        .mask = simd.matchByte(VLEN, bytes, 'b'),
+        .style = .{ .bold = true },
+        .name = "b",
+    }};
+    var output: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer output.deinit();
+
+    try highlightMulti(VLEN, bytes, &layers, "b", &output.writer);
+
+    // Exactly the three named lanes are styled: one style sequence and one
+    // reset each.
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, output.written(), "\x1b[1m"));
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, output.written(), "\x1b[0m"));
+}

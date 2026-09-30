@@ -19,11 +19,18 @@ pub fn failureOffsetImpl(
     var index: usize = 0;
     if (std.mem.startsWith(u8, input, "\xef\xbb\xbf")) index = 3;
 
-    const printable_mask = std.math.maxInt(simd.Mask(VLEN));
+    const printable_mask = simd.exactMask(
+        simd.Mask(VLEN),
+        std.math.maxInt(simd.Mask(VLEN)),
+    );
     while (index < input.len) {
         while (input.len - index >= VLEN) {
             const bytes: simd.Vec(VLEN, u8) = input[index..][0..VLEN].*;
-            if (simd.matchRange(VLEN, bytes, 0x20, 0x7e) != printable_mask) break;
+            const printable = simd.exactMask(
+                simd.Mask(VLEN),
+                simd.matchRange(VLEN, bytes, 0x20, 0x7e),
+            );
+            if (printable != printable_mask) break;
             index += VLEN;
         }
         if (index >= input.len) break;

@@ -1352,6 +1352,7 @@ fn skipStringBody(
 ) usize {
     std.debug.assert(start <= input.len);
     const VLEN = simd.default_vector_len;
+    const Mask = simd.Mask(VLEN);
     var index = start;
     while (input.len - index >= VLEN) {
         const block: simd.Vec(VLEN, u8) = input[index..][0..VLEN].*;
@@ -1359,9 +1360,16 @@ fn skipStringBody(
             simd.matchAny2(VLEN, block, '\n', '\r')
         else
             simd.matchRange(VLEN, block, 0, 0x1f);
-        const special = simd.matchAny2(VLEN, block, quote, '\\') | forbidden;
-        const advance: usize = @intCast(@ctz(special));
-        if (advance < VLEN) return index + advance;
+        // Normalize the special lanes before scanning. A zero storage mask
+        // has no matching lane: its trailing-zero count would be the storage
+        // width, not necessarily VLEN, so advance exactly one block instead.
+        const special: simd.MaskStorage(VLEN) = simd.exactMask(
+            Mask,
+            simd.matchAny2(VLEN, block, quote, '\\') | forbidden,
+        );
+        if (special != 0) {
+            return index + @as(usize, @intCast(@ctz(special)));
+        }
         index += VLEN;
     }
     return index;
@@ -2753,6 +2761,28 @@ test "buildTape accepts escaped and raw UTF-8 strings" {
     try testing.expectEqual(@as(u24, 6), document.tape[2].payload);
     try testing.expectEqual(@as(u24, 12), document.tape[3].payload);
     try testing.expectEqual(@as(u24, 6), document.tape[4].payload);
+}
+
+test "buildTape validates string bodies that span blocks without escapes" {
+    // Every scanned block holds no quote, backslash, or control byte, so the
+    // mask that reports the first special byte stays empty on each pass.
+    const body_length = 2 * simd.default_vector_len + 1;
+    var input: [body_length + 4]u8 = @splat('x');
+    input[0] = '[';
+    input[1] = '"';
+    input[input.len - 2] = '"';
+    input[input.len - 1] = ']';
+
+    var structural_index = try indexForTest(testing.allocator, &input);
+    defer structural_index.deinit(testing.allocator);
+
+    var document = try buildTape(testing.allocator, &input, &structural_index, .json);
+    defer document.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 3), document.tape.len);
+    try testing.expectEqual(@as(u24, 1), document.tape[0].payload);
+    try testing.expectEqual(@as(u24, @intCast(body_length)), document.tape[1].payload);
+    try testing.expectEqual(@as(u32, 1), document.tape[1].offset);
 }
 
 test "JSON5 accepts Unicode and escaped IdentifierName keys" {
