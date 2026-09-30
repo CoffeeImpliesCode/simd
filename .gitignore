@@ -1,4 +1,7 @@
-.zig-cache/
+# `.zig-cache` is a symlink to a shared cache outside this work tree, so the
+# pattern must not carry a trailing slash: a trailing slash matches a directory
+# only, and would not match the symlink.
+.zig-cache
 zig-out/
 codedb.snapshot
 
