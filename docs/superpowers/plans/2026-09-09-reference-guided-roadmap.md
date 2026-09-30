@@ -1,5 +1,52 @@
 # Reference-guided parser roadmap
 
+## Document status
+
+The plan is retained as written, and the implementation record at the end is
+the shipped summary. Both are historical: the packet, workspace, and snapshot
+paths they cite are not present in this checkout.
+
+- The `~/...` packet, workspace, and snapshot paths are historical
+  records. They have not been relocated, and no substitute location is claimed
+  for them.
+- The `MEASURED` and `SOURCE FACT` labels below describe that run on that host.
+  They are not current-machine results and support no new performance ranking.
+- A pass count such as `482/482` and a native width of 32 on an AVX2 host
+  describe that host. This checkout's own observation, recorded on 2026-10-01 on
+  an AVX-512 host, is `zig build check -j2 --summary all` passing 128 of 128
+  build steps and 4445 of 4445 tests, with a native width of 64; see `AGENTS.md`.
+- The external C++ reference adapters live outside this repository. No command
+  here recreates their results; `zig build bench` measures this parser only,
+  over 7 formats x 5 workloads x 6 stages, with Markdown rows limited to a
+  marker-kind projection, YAML rows limited to `yaml-basic-1.2.2`, and a
+  resident `traverse_prefix8` stage that is neither full validation nor full
+  traversal. It has no `formats.commonmark` or `yaml-extended-e2b-1.2.2` row.
+- The packet was searched for and not found. Local filesystem and archive
+  searches found no packet source or result history; the authenticated
+  owner-repository listing exposed only the private `CoffeeImpliesCode/simd`;
+  the authenticated `simd-bench-corpus` API returned 404; the recorded packet
+  commits are absent; and no SSH recovery host is configured.
+- The approved response is a NEW LOCAL BASELINE, not recovery of the packet.
+  `scripts/benchmark.zig` records this repository's own parser measurements
+  through a shared `record`, `verify`, and `reproduce` CLI, documented in the
+  [parser performance plan](2026-09-09-parser-performance.md). That baseline
+  is a fresh record: it restores no packet result, makes nothing below
+  reproducible again, and claims no ranking.
+- That baseline is the 2026-10-01 recording from source identity
+  `fcdb7c0e7c8719fb9fd22385aecee9d3998d36317a40950e36fa55c108fb9c49`:
+  `zig-out/bench-evidence/acceptance-closed-20261001` (ReleaseFast,
+  `-Dvector_len=32`, 3 samples, 3 iterations, 4096-byte chunks),
+  `acceptance-closed-reproduce-20261001` recorded from it with every input and
+  case identical, and `acceptance-closed-chunk256-20261001` at 256-byte chunks
+  with 1 sample. Each verifies over 35 inputs and 210 cases. It is a new
+  record, not a recovered packet result, and it ranks nothing.
+- The `033b3923` family (`baseline-final-20261001`,
+  `reproduce-final-20261001`, `chunk256-final-20261001`) and the earlier
+  `76f4b3b4` family (`baseline-20261001`, `reproduce-20261001`,
+  `chunk256-20261001`) are immutable historical recordings: their captured
+  sources have since been edited, so neither is the current source
+  reproduction baseline, and none is overwritten or deleted.
+
 ## Scope and decision
 
 This document combines the independently reviewed reference studies for strict JSON, JSONL, JSONC,
@@ -70,7 +117,9 @@ Format studies:
 - [XML](2026-09-09-reference-xml.md)
 - [YAML](2026-09-09-reference-yaml.md)
 
-Shared evidence:
+Shared evidence (historical paths on the original host, not present in this
+checkout; the names are kept for traceability and are not claims that these
+files can be opened here):
 
 - Benchmark contract:
   `~/simd-bench-corpus/docs/superpowers/specs/2026-09-09-seven-format-profiles.md`
@@ -555,6 +604,11 @@ arithmetic, and reports transcode-plus-parse separately. It must never change th
 
 ## Global experiment and acceptance protocol
 
+This protocol was written for the original comparison packet and is retained as
+the standard under which those results were accepted. The packet is
+unavailable, so item 1 now names a baseline that no longer exists, and no
+comparison in it can be re-run from this checkout.
+
 1. Keep the current packet as the baseline until source or build content changes. Then regenerate
    source provenance and all affected comparisons.
 2. Run seven alternating candidate/baseline process pairs on the same logical CPU for a source stage.
@@ -593,9 +647,12 @@ arithmetic, and reports transcode-plus-parse separately. It must never change th
 
 ## Implementation record
 
-The implementation workspace is `~/projects/simd-performance`, based
-on `1dc602534a8419056a476af2d71b1be67d015995`. The original dirty parser checkout
-was not changed. Benchmark integration lives in `~/simd-bench-corpus`.
+The historical implementation workspace was `~/projects/simd-performance`,
+based on `1dc602534a8419056a476af2d71b1be67d015995`; it is not present in this
+checkout. The original dirty parser checkout was not changed. Benchmark
+integration lived in `~/simd-bench-corpus`, also absent here. The
+shipped contracts below are current and verifiable in this repository; the
+paths and counts around them are not.
 
 ### Shipped contracts
 
@@ -603,15 +660,23 @@ was not changed. Benchmark integration lives in `~/simd-bench-corpus`.
   views. The APIs do not introduce implicit allocation or change number grammar.
 - JSONL provides a reusable record-tape parser with explicit document leases,
   record-local offsets, and record/global diagnostics. The checked public index
-  path remains. Validation-only, reusable record-tape, and libc-allocation
-  benchmark selectors have separate work or allocator contracts; the default
-  allocator and retained-batch ownership are unchanged.
+  path remains. This repository's benchmark measures a fixed domain of 7
+  formats x 5 workloads x 6 stages and prints one row per case. Its CLI accepts
+  two arguments: `--stream-chunk-size`, which only the `stream` stage consumes,
+  restricted to 64, 256, 1024, 4096, or 16384 bytes and defaulting to 4096; and
+  one positional iteration count, a nonzero decimal defaulting to 3. Every row
+  records `checksum`, `allocation_count`, and `allocated_bytes` from a counting
+  allocator over the process allocator. The validation-only, reusable
+  record-tape, and libc-allocation selector vocabulary belongs to the
+  comparison packet, which is unavailable and not present in this checkout;
+  `bench.zig` parses no such option, and the default allocator and
+  retained-batch ownership are unchanged.
 - XML provides checked decoded-value access, declaration information, and lexical
   QName splitting. Source overlap and malformed raw boundaries are rejected.
   QName splitting does not resolve namespaces. No transcoder, DTD processing,
   external entity loading, or unchecked public reader was added.
-- `yaml-basic-1.2.2` remains restricted. The opt-in `yaml-extended-e2b` profile
-  adds literal/folded blocks, multiline quoted scalars, and compact sequence
+- `yaml-basic-1.2.2` remains restricted. The opt-in `yaml-extended-e2b-1.2.2`
+  profile adds literal/folded blocks, multiline quoted scalars, and compact
   mappings with owned cooked values. Source characters, collection depth,
   scalar source bytes, physical scalar lines, cooked bytes, and tape words have
   checked limits. Root scalars and explicit document-end markers work. Aliases,
@@ -620,7 +685,8 @@ was not changed. Benchmark integration lives in `~/simd-bench-corpus`.
 - `formats.commonmark` is separate from the marker-only Markdown module.
   `parseCommonMark` owns flat semantic nodes and normalized text while borrowing
   source bytes. `renderCommonMarkHtml` has a safe default and an explicit
-  conformance mode. Safe rendering filters autolinks as well as ordinary links
+  conformance mode: `HtmlRenderMode.safe` and `HtmlRenderMode.conformance`.
+  Safe rendering filters autolinks as well as ordinary links
   and images, including schemes with decoded URL controls. Rendering checks root
   ancestry and bounds sibling traversal. Destruction is iterative.
 
@@ -648,13 +714,17 @@ The private dialect capacity calculation reports arithmetic overflow instead of
 silently changing the bound. No quote-count metadata was added to public views.
 Boundary tests defend behavior rather than a particular reservation count.
 
-### Source verification
+### Source verification (historical)
 
-After integration and removal of rejected candidates:
+Recorded on the original host after integration and removal of rejected
+candidates. These are not current-machine results:
 
-- `zig build` passes.
-- `zig build test corpus commonmark` passes **482/482 tests** at native width and
-  explicit widths **4, 16, and 64**. Native width on this AVX2 host is 32.
+- `zig build` passed.
+- `zig build test corpus commonmark` passed **482/482 tests** at native width and
+  explicit widths **4, 16, and 64**. Native width on that AVX2 host was 32.
+  Do not restate the count or the native width as a result for this checkout,
+  and do not present the current width gate as `4, 16, 64`:
+  `zig build check` sweeps `[4, 5, 7, 12, 16, 24, 32, 64]`.
 - The CommonMark conformance test compares exact HTML for **all 652 pinned
   CommonMark 0.31.2 examples**. No example is skipped.
 - The YAML scalar differential matches libyaml on **273/273 cases**, including
@@ -664,7 +734,7 @@ After integration and removal of rejected candidates:
 - `zig fmt --check src test build.zig` and the actual `zig build run` visualizer
   smoke command pass.
 
-Raw evidence is retained locally under
+Historical raw evidence, not present in this checkout, was retained under
 `~/simd-bench-corpus/results/2026-09-09-reference-analysis/`:
 `final-native-verification.json`, `final-candidate-decisions.json`,
 `yaml-scalar-differential-final.json`, `yaml-final-source-correctness.jsonl`,

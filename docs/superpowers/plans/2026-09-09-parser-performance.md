@@ -8,6 +8,57 @@
 
 **Tech Stack:** Zig 0.16.0, C++23/GCC 15.3.0 reference adapters, pinned Nix dependencies, Linux perf, Jujutsu.
 
+## Document status
+
+This file is a historical record. Every measurement, count, and path below was
+captured on a different host and is preserved verbatim for its provenance.
+Nothing here is a current-machine result and nothing here may be restated as
+one.
+
+- The `~/...` packet, snapshot, and workspace paths are not present in
+  this checkout. They are retained because their provenance and measured
+  values are the evidence for the completed work. They have not been relocated,
+  and no substitute location is claimed for them.
+- A pass count such as `382/382` describes that run. This checkout's own
+  observation, recorded on 2026-10-01 on an AVX-512 host, is `zig build check
+  -j2 --summary all` passing 128 of 128 build steps and 4445 of 4445 tests, with
+  a native width of 64; see `AGENTS.md`.
+- This repository is the Zig parser only. The comparison packet and its C++
+  reference adapters live outside it, so no command in this repository
+  recreates their results.
+- The packet was searched for and not found. Local filesystem and archive
+  searches found no packet source or result history; the authenticated
+  owner-repository listing exposed only the private `CoffeeImpliesCode/simd`;
+  the authenticated `simd-bench-corpus` API returned 404; the recorded packet
+  commits are absent; and no SSH recovery host is configured.
+- The approved response is a NEW LOCAL BASELINE, not recovery of the original
+  external packet. `scripts/benchmark.zig` records this repository's own
+  parser measurements; see **The record, verify, reproduce CLI**. No new
+  performance ranking and no recovered packet result is claimed.
+- That baseline was recorded on 2026-10-01 from source identity
+  `033b3923543f486a32d0fb00f6492e7c9911d977a6417b4d01b1092c7d740a3c` as
+  `zig-out/bench-evidence/baseline-final-20261001` (ReleaseFast,
+  `-Dvector_len=32`, 3 samples, 3 iterations, 4096-byte chunks), verified over
+  35 inputs and 210 cases, and reproduced into `reproduce-final-20261001` with
+  all 35 inputs and 210 cases identical; `chunk256-final-20261001` records the
+  same work at 256-byte chunks with 1 sample and also verifies. Acceptance work
+  then edited the sources those archives captured, so that family is a
+  historical observation and is not the current source reproduction baseline.
+- The current source reproduction baseline is the later 2026-10-01 recording
+  from source identity
+  `fcdb7c0e7c8719fb9fd22385aecee9d3998d36317a40950e36fa55c108fb9c49` in the
+  same directory: `acceptance-closed-20261001` (ReleaseFast,
+  `-Dvector_len=32`, 3 samples, 3 iterations, 4096-byte chunks),
+  `acceptance-closed-reproduce-20261001` recorded from it with every input and
+  case identical, and `acceptance-closed-chunk256-20261001` at 256-byte chunks
+  with 1 sample. Each verifies over 35 inputs and 210 cases of the unchanged
+  legacy domain, which has no CommonMark and no extended-YAML row.
+- The still earlier `baseline-20261001`, `reproduce-20261001`, and
+  `chunk256-20261001` from source identity
+  `76f4b3b414f208a7934aca1720f325c80b7bbf0450f1713722c7ef2bfe0a8a8d` are
+  historical observations as well. No archive family is overwritten or
+  deleted, and `AGENTS.md` records the full evidence.
+
 ## Global constraints
 
 - Preserve the four-byte minimum vector width and scalar differential checks.
@@ -272,7 +323,10 @@ Recommended order: measurement policy, duplicate index validation, JSONL ownersh
 
 ## Evidence and reproduction
 
-All paths below are under `~/simd-bench-corpus/results/2026-09-09-seven-format/`:
+All paths below are under `~/simd-bench-corpus/results/2026-09-09-seven-format/`.
+They are a historical record from the original host and are not present in this
+checkout. The list names them so the evidence stays traceable; it does not
+claim they can be opened here:
 
 - `full/index.json`: exact commands, start times, selectors, report paths, and exit codes for 240 runs.
 - `full/*.json`: full timing, checksum, dependency, compiler, source, CPU, and corpus provenance.
@@ -293,9 +347,109 @@ python3 results/2026-09-09-seven-format/matrix-driver.py rerun 3 5
 
 The driver uses the existing `build-current` binaries. Rebuild against a clean, pinned source snapshot first when code changes. Do not overwrite the baseline `full` directory.
 
+## Local reproduction contract
+
+The comparison packet is not part of this repository, so no command here
+recreates the external C++ reference results recorded above. `zig build bench`
+in this repository measures this parser only, under a fixed contract that any
+new local recording must preserve:
+
+- 7 formats (JSON, JSONL, JSONC, JSON5, Markdown, XML, YAML) times 5 workloads
+  times 6 stages is 210 stage rows over 35 input hashes.
+- Markdown rows are a marker-kind projection, not a CommonMark parse. There is
+  no `formats.commonmark` benchmark row.
+- YAML rows are the `yaml-basic-1.2.2` profile. There is no
+  `yaml-extended-e2b-1.2.2` benchmark row.
+- The resident `traverse_prefix8` stage consumes eight events or EOF. It is
+  neither full validation nor full traversal.
+- The internal `tape` stage includes construction, sampled checksum
+  consumption, and destruction. It is not pure construction time.
+
+These limits are why a local run may not be reported as a recreated
+comparison, and why no ranking of the semantic CommonMark parser or the
+extended YAML profile may be derived from this harness. A new local recording
+adds rows; it does not restore the packet. Record a recovery status only where
+an owner has supplied the evidence for it.
+
+### The record, verify, reproduce CLI
+
+The owner approved a new local baseline. `scripts/benchmark.zig` records it.
+The runner receives `[runner, bench_executable_path, repository_root_path,
+operation, operation_args...]`:
+
+```sh
+zig build benchmark -Doptimize=ReleaseFast -Dvector_len=32 -- record OUT_DIR [--samples N] [--iterations N] [--stream-chunk-size N]
+zig build benchmark -Doptimize=ReleaseFast -Dvector_len=32 -- verify ARCHIVE_DIR
+zig build benchmark -Doptimize=ReleaseFast -Dvector_len=32 -- reproduce OLD_ARCHIVE_DIR NEW_ARCHIVE_DIR
+```
+
+Defaults are 3 samples, 3 iterations, and a 4096-byte stream chunk. Samples
+and iterations are decimal integers from 1 to 32; stream chunk size is one of
+64, 256, 1024, 4096, or 16384. A flag may appear once. An unknown flag, a
+missing value, an out-of-range value, or an extra positional prints usage on
+stdout and exits 1.
+
+`zig build benchmark-test` runs the script's behavior tests, and `zig build
+check` includes them.
+
+**Immutable archive.** `record` creates `OUT_DIR` with an exclusive mkdir and
+creates every archive file exclusively, so a recording is immutable evidence:
+an existing output directory or file is a failure, never a truncation, and an
+earlier recording cannot be silently replaced. A failed run still writes
+`manifest.json` with `"status":"failed"` and a `reason` naming the failure
+before exiting 1, so a partial run is never published as complete. A successful
+run records `"status":"complete"`, and `verify` reports a failed archive as
+failed rather than as incomplete evidence. An archive holds `manifest.json`,
+`bench/simd-bench`, `samples/sample-NN.stdout` and `samples/sample-NN.stderr` per
+sample, and `sources/<repo-relative path>` for the captured sources.
+
+**Manifest.** `manifest.json` records the schema and version, the status and its
+reason, the unix timestamp, the effective options, the work shape
+(`expected_inputs` 35, `expected_cases` 210), the compiler
+basename, version, and executable SHA-256, the build's target, cpu, optimize,
+and vector length, the
+archived binary and every captured source and payload file with sizes and
+SHA-256 values, the recorded environment, the verbatim benchmark headers, and
+the per-input identity and byte count. Identity is a repository-relative source
+path plus a content hash, never an absolute workstation path, so it survives a
+move to another machine. The manifest records the Zig basename, version, and
+executable SHA-256 rather than a Zig path. Every input records the identity and
+byte count the benchmark reports, whether it came from a fixture or a generated
+workload.
+
+Execution identity is the benchmark executable the current build provides, read
+from the `benchmark_options` module (`zig_exe`, `bench_target`, `bench_cpu`,
+`bench_optimize`, `bench_vector_len`). An archived manifest may describe an
+executable, but it may not select one: reproduction runs the build-provided
+executable and never an arbitrary path named by archived or otherwise
+untrusted data.
+
+**Verification and reproduction.** `verify ARCHIVE_DIR` re-checks one archive.
+`reproduce OLD NEW` verifies the old archive offline, preflights the current
+source path set and hashes, the benchmark executable hash, the Zig version,
+basename and executable SHA-256, the build configuration, and the CPU identity.
+It records a new archive
+with the old archive's options, and compares the two case by case on
+`input_hash`, `input_bytes`, `checksum`, `allocation_count`, and
+`allocated_bytes`, plus the headers and input identities. Any mismatch exits 1.
+Reproduction is an exact-match claim over identity and results.
+
+**What is not claimed.** The retained per-case `elapsed_ns` timing arrays are
+never part of the reproduction comparison, never ranked, and never printed as a
+ranking; `verify` re-derives each of them from the archive's own captured
+stdout, so a recorded timing the capture does not contain fails verification
+with `ManifestIncomplete`. A sample entry carries no timing of its own: the
+retired per-sample `elapsed_ns` key is no longer written, an older archive that
+still carries it still verifies because the manifest decoder ignores members it
+does not read, and `schema_version` stays 1. Timings in a recording are
+observations from the machine that produced
+them. They are not compared against another library and are not a winner. Exact
+match is the reproducibility claim; timing is not.
+
 ## Implemented optimization wave
 
-The isolated workspace is `~/projects/simd-performance`. The original
+The isolated workspace for that wave was `~/projects/simd-performance`,
+which is not present in this checkout. The original
 dirty checkout was not edited. Public tape ownership, source borrowing, dialect
 rules, and cursor APIs are unchanged.
 
@@ -347,12 +501,16 @@ all seven pairs for all five workloads. YAML dense ratios range from 0.393 to
 are not claims of a resolved speedup. No blanket speedup is claimed for JSONC,
 JSON5, Markdown, or Unicode YAML. Keep the memory reductions distinct from timing.
 
-Verification: `zig build` passed. `zig build test corpus` passed 382/382 tests
-at each of vector widths 4, 16, 32, and 64, including fixed-seed fuzzing.
+Historical verification, not a current-machine result: `zig build` passed.
+`zig build test corpus` passed 382/382 tests at each of vector widths 4, 16,
+32, and 64, including fixed-seed fuzzing.
 The final five-size chunk sweep checked 1,050 stage rows against the baseline;
-all checksums match. Missing and unsupported chunk values fail.
+all checksums match. Missing and unsupported chunk values fail. The 382/382
+count and that width set describe that host. Do not restate them as this
+checkout's result, and do not present the current width gate as `[4, 16, 32,
+64]`: `zig build check` sweeps `[4, 5, 7, 12, 16, 24, 32, 64]`.
 
-Evidence is under
+Historical evidence, not present in this checkout, was collected under
 `~/simd-bench-corpus/results/2026-09-09-priorities-2-5/`:
 `accepted-paired-*.csv`, `accepted-summary.json`, `accepted-chunk-*.csv`,
 `reader-copy-attribution.txt`, and the focused JSONL/XML probe outputs.

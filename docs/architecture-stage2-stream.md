@@ -1,26 +1,50 @@
 # simd — Stage 2, On-Demand, and Streaming Architecture
 
 Status: Stage 1 indexing and Stage 2 validation are implemented for JSON,
-JSONL, JSONC, JSON5, Markdown, XML, and YAML. Each format also exposes a
-resident on-demand reader and a chunk-fed `StreamIndexer`.
+JSONL, JSONC, JSON5, Markdown, XML, and YAML. Each of those seven exposes a
+resident on-demand reader and a chunk-fed `StreamIndexer`. A separate semantic
+CommonMark 0.31.2 parser, checked XML value views, allocation-free JSON value
+conversion, a reusable JSONL record-tape parser, and the opt-in
+`yaml-extended-e2b-1.2.2` profile ship alongside them; see **Current
+reference-guided API additions**.
 
 Scope: this document records current contracts and the remaining roadmap.
 Sections marked **Future roadmap** are designs, not current APIs. Sections
 marked **Historical design record** describe the plan used for completed work.
 
+Verification counts and benchmark paths quoted anywhere under `docs/` are
+historical records captured on a different host. A pass count such as
+`382/382` or `482/482`, the AVX2-host native width of 32, and any
+`~/...` packet path describe that run, not this machine. They are not
+current verification results and support no new performance ranking.
+
+This checkout was verified on 2026-10-01 on an AVX-512 host, so its native
+width is 64: `zig build check -j2 --summary all` passed 128 of 128 build steps
+and 4445 of 4445 tests, including the `[4, 5, 7, 12, 16, 24, 32, 64]` matrix
+over all six test roots, and the acceptance-closed local archives named below
+were recorded, verified, and reproduced with 35 inputs and 210 cases identical.
+The native column of that run is 350 library, 103 public root, 1 executable, 9
+fuzz, 1 corpus, and 26 CommonMark tests. `AGENTS.md` records that evidence in
+full.
+Rerun `zig build check` for a current count; `AGENTS.md` also records that
+gate's contract. This repository's own performance baseline is the local
+record/verify/reproduce contract recorded under **Local performance baseline**
+below; it is a new baseline, not a recovery of the external packet.
+
 Grounded in: `papers/1902.08318_parsing_gigabytes_of_json_per_second.pdf`,
-`papers/2312.17149_on_demand_json.pdf`,
-`~/projects/github-simdjson-simdjson/doc/ondemand_design.md`, simdjson
-`json_scanner.h` / `json_structural_indexer.h` / tape design, RFC 8259, and the
-current repo (`src/core/stage1.zig`, `src/core/stage2.zig`,
-`src/core/ondemand.zig`, `src/core/stream.zig`, and `src/formats/*`).
+`papers/2312.17149_on_demand_json.pdf`, an out-of-tree copy of simdjson's
+`ondemand_design.md` under `~/projects/github-simdjson-simdjson/doc/` that is
+not checked into this repository, simdjson `json_scanner.h` /
+`json_structural_indexer.h` / tape design, RFC 8259, and the current repo
+(`src/core/stage1.zig`, `src/core/stage2.zig`, `src/core/ondemand.zig`,
+`src/core/stream.zig`, and `src/formats/*`).
 
 ---
 
-## Item 1 — On-Demand Event Interface (implemented for all formats)
+## Item 1 — On-Demand Event Interface (implemented for the seven tape formats)
 
-Each format exposes `initOnDemandDocument(parser, input)`. The document owns
-no complete tape and borrows the caller-owned input slice. `tokenCursor()`
+Each of the seven exposes `initOnDemandDocument(parser, input)`. The document
+owns no complete tape and borrows the caller-owned input slice. `tokenCursor()`
 and `eventReader()` read through parser-owned reusable state under a
 single-focus lease; `EventReader` emits a pull event sequence, but it is not
 a chunk-at-a-time input reader.
@@ -232,8 +256,10 @@ Numbers that a caller does not read are not converted.
 
 ## Item 3 — Vector-Width Dispatch (implemented)
 
-The current indexers select 16-, 32-, or 64-byte vectors at compile time. The
-design and adaptation inventory below are a **Historical design record**.
+The current indexers are generic over every vector width of at least 4 bytes and
+instantiate `simd.default_vector_len` at compile time, so `-Dvector_len`
+selects an explicit width verbatim instead of snapping to 16, 32, or 64. The
+design and adaptation inventory below is a **Historical design record**.
 
 ### Decision: comptime monomorphization, not a runtime vtable
 
@@ -331,7 +357,7 @@ needs no width plumbing.
 | `src/formats/jsonl.zig` | same as json + `matchByte(64,'\n')` | same parametrization |
 | `src/formats/jsonc.zig` | same + per-byte `visible_mask: u64`, `[64]u32`, scalar `trailingParse` | `Mask(VLEN)`, `[VLEN]u32`, `[VLEN]u8` trailingParse param |
 | `src/formats/json5.zig` | same as jsonc + `[64]u8` chunk_bytes | `chunk_bytes[VLEN]` |
-| `src/formats/markdown.zig` | `markdownCandidateMask(Vec(64,u8)) u64`, `markdownValidMask(usize) u64`, `[64]u32`, `extractBitIndexes(u64,…)` | `markdownCandidateMask(comptime VLEN, Vec(VLEN,u8)) Mask(VLEN)`; `*Impl(comptime VLEN)` |
+| `src/formats/markdown.zig` | `markdownCandidateMask(Vec(64,u8)) u64`, `markdownValidMask(usize) u64`, `[64]u32`, `extractBitIndexes(u64,…)` | `markdownInlineCandidateMask(comptime VLEN, Vec(VLEN,u8)) Mask(VLEN)` plus `simd.validMask`; `*Impl(comptime VLEN)` |
 | `src/formats/xml.zig` | `windows(64)`, `matchByte/Any2(64)`, `[64]u32`, `extractBitIndexes` | `indexXmlImpl(comptime VLEN)`; scalar post-filter over `[VLEN]u32` |
 | `src/core/debug.zig` | `highlightMulti(Vec(64,u8), u64)`, `[64]u8`, `u64 bit` | `highlightMulti(comptime VLEN, Vec(VLEN,u8), Mask(VLEN))`; `printAscii` unchanged |
 | `src/main.zig` | `comptime assert(vector_len == 64)`, `@as(u64,1)<<63` | `vector_len = detectVlen()`; literals via `lib.Mask(VLEN)` |
@@ -419,13 +445,13 @@ applies to both values. `TapeCursor.skipValue()` scans and validates each word
 in a forward subtree, so its cost is O(subtree). From a closing word,
 `matchingStart()` uses the stored jump-back index in O(1).
 
-### JSON-family error set (confirmed 12)
+### JSON-family error set (confirmed 13)
 
 ```zig
 pub const Error = error{
     UnexpectedToken, UnclosedObject, UnclosedArray, InvalidNumber, InvalidEscape,
     TrailingComma, DuplicateKey, EmptyDocument, RootNotSingular,
-    DepthExceeded, UnterminatedString, InvalidUtf8,
+    DepthExceeded, UnterminatedString, InvalidUtf8, InvalidStructuralIndex,
 };
 ```
 
@@ -436,6 +462,9 @@ validators. Policy: raw control bytes < 0x20 inside strings → `InvalidEscape`
 (RFC 8259 §7); malformed literals (`tru`, `nulx`) → `UnexpectedToken` with
 context `expected literal true/false/null`; `InvalidNumber` is reserved for
 number grammar.
+
+`InvalidStructuralIndex` covers a supplied index that is out of order, out of
+range, or missing its `(len, len, 0)` sentinels.
 
 ### Future roadmap: optional validation policies
 
@@ -556,19 +585,20 @@ the next separator or matching close token remains future work.
 | JSONL | `jsonl.buildJsonlTape(allocator, input) -> stage2.BuildError!JsonlDocument` | `jsonl.validateJsonl(allocator, input) -> stage2.ValidationError!?JsonlDiagnostic` | `JsonlDocument` owns `JsonlRecord` metadata and one `stage2.Document` tape per record | Strict JSON for each nonblank record. A Stage 1-indexed LF outside strings ends a record. Blank and trailing records are skipped. |
 | Markdown | `markdown.buildMarkdownTape(allocator, input) -> MarkdownBuildError!MarkdownDocument` | `markdown.validateMarkdown(allocator, input) -> MarkdownValidationError!?MarkdownDiagnostic` | Format-local `MarkdownDocument` with `MarkdownTapeWord` | Stage 1 token integrity for the Markdown marker stream. It is not CommonMark validation or a CommonMark AST. Marker spans are bounded by `u24`; source offsets remain `u32`. |
 | XML | `xml.buildXmlTape(allocator, input) -> XmlBuildError!XmlDocument` | `xml.validateXml(input) -> XmlValidationError!?XmlDiagnostic` | Format-local `XmlDocument` with `XmlTapeWord` | The supported XML well-formedness subset covers one root, UTF-8 XML characters, names, attributes, built-in and numeric entities, comments, CDATA, processing instructions, and an XML 1.0 declaration. DTD and DOCTYPE declarations are unsupported. |
-| YAML | `yaml.buildYamlTape(allocator, input) -> YamlBuildError!YamlDocument` | `yaml.validateYaml(allocator, input) -> YamlValidationError!?Failure` | Format-local `YamlDocument` with `YamlTapeWord` | The `yaml-basic-1.2.2` profile: block and flow collections, quoted and plain scalars, document markers, and comments. Anchors, tags, directives, and multiline block scalars are `Unsupported`. |
+| YAML | `yaml.buildYamlTape(allocator, input) -> YamlBuildError!YamlDocument` | `yaml.validateYaml(allocator, input) -> YamlValidationError!?YamlDiagnostic` | Format-local `YamlDocument` with `YamlTapeWord` | The `yaml-basic-1.2.2` profile: block and flow collections, quoted and plain scalars, document markers, and comments. Anchors, tags, directives, and multiline block scalars are `Unsupported`. |
 
 Markdown preserves these Stage 1 token kinds in its local tape: headings,
 code fences, list items, blockquotes, inline code, link open and close
 markers, and thematic breaks. XML accepts an XML declaration only with version
 `1.0`, optional `UTF-8` encoding, and optional `yes` or `no` standalone values.
 
-All six validators fail at the first format error and return `null` for valid
+All seven validators fail at the first format error and return `null` for valid
 input. `stage2.Diagnostic` and `JsonlDiagnostic` use `stage2.Error`.
 `MarkdownDiagnostic` uses `MarkdownError`. `XmlDiagnostic` uses `XmlError`.
-All four diagnostic types contain an error, byte offset, line, column, snippet,
-and snippet start. `JsonlDiagnostic` adds the record index and record source
-bounds. Its byte, line, column, and snippet coordinates refer to the complete
+`YamlDiagnostic` uses `YamlError` and carries a `YamlDiagnosticKind`. All five
+diagnostic types contain an error, byte offset, line, column, snippet, and
+snippet start. `JsonlDiagnostic` adds the record index and record source bounds.
+Its byte, line, column, and snippet coordinates refer to the complete
 JSONL input.
 
 Each builder returns owned tape storage and borrows source bytes from the
@@ -582,12 +612,17 @@ not JSON documents, JSON tape cursors, or JSON DOMs.
 
 ### Implemented per-format baseline
 
-Every format exposes a chunk-fed `StreamIndexer` with the public lifecycle
-`init`, `feed`, `feedFrom`, `finish`, `take`, `reset`, and `deinit`. The JSON
-indexer in `src/core/stream.zig` copies chunks through two fixed padded slots
-and produces a `StructuralIndex`. The remaining formats retain only unfinished
-lexical state plus output offsets; `take` transfers index storage to the
-caller, and stream output matches the one-shot indexer under every partition.
+Each of the seven tape formats exposes a chunk-fed `StreamIndexer` with the
+public lifecycle `init`, `feed`, `feedFrom`, `finish`, `take`, `reset`, and
+`deinit`. The JSON-family indexer in `src/core/stream.zig` backs JSON, JSONL,
+JSONC, and JSON5 through a dialect; it copies chunks through two fixed padded
+slots and produces a `StructuralIndex`. Markdown, XML, and YAML expose
+`initStreamIndexer` over a format-local indexer that retains only the
+unfinished lexical state, any partial line, and output offsets; `take`
+transfers index storage to the caller, and stream output matches the one-shot
+indexer under every partition. `formats.commonmark` and
+`formats.yaml_extended` expose no stream indexer: streaming stays outside the
+semantic CommonMark parser and outside the extended YAML profile.
 
 `feedFrom` is an optional convenience adapter over `feed`:
 
@@ -616,40 +651,73 @@ input that outlives those consumers.
 
 ### General streaming reader boundary
 
-For formats beyond JSON, the remaining goal is to feed arbitrarily large
-documents through a reader, preserve format-specific state across arbitrary
-boundaries, and match one-shot Stage 1 output for every supported format.
+The goal this item once recorded as remaining for formats beyond JSON — feed
+arbitrarily large documents through a reader, preserve format-specific state
+across arbitrary boundaries, and match one-shot Stage 1 output for every
+supported format — is delivered for all seven tape formats. JSON, JSONL, JSONC,
+and JSON5 reach it through `initStreamIndexer` in `src/formats/json.zig`,
+`src/formats/jsonl.zig`, `src/formats/jsonc.zig`, and `src/formats/json5.zig`;
+each returns the one JSON-family `core.stream.StreamIndexer` from
+`src/core/stream.zig` under a different `stream.Options`. Markdown, XML, and
+YAML reach it through `initStreamIndexer` in `src/formats/markdown.zig`,
+`src/formats/xml.zig`, and `src/formats/yaml.zig`; those return
+`MarkdownStreamIndexer`, `XmlStreamIndexer`, and `YamlStreamIndexer`. All seven
+expose `init`, `feed`, `feedFrom`, `finish`, `take`, `reset`, and `deinit`.
+`take` returns `stage1.StructuralIndex` for the JSON family and the
+format-local structural index for the other three. The lifetime boundary is
+unchanged: each `feed` call borrows its input only until that call returns, so
+Stage 2 and On-Demand still require caller-owned complete input that outlives
+those consumers.
+
+The only shared carry type is `core.stream.CarryState`, an alias for the JSON
+lexical scan state `json_lexical.State` in `src/core/json_lexical.zig`. It
+carries JSON-family state only. Markdown, XML, and YAML each keep their own
+bounded state instead: the unfinished line with its fence and inline-code
+flags, `XmlLexicalState`, and the pending line with the resident engine stacks.
 
 ```zig
-pub const CarryState = struct {
-    // JSON / JSONL / JSONC / JSON5
-    prev_in_string: bool = false,
-    prev_ends_in_backslash: bool = false,
-    prev_backslash_run_odd: bool = false,  // odd run of backslashes = escaped
-    prev_in_atom: bool = false,
-    string_quote: u8 = 0,                  // 0x22 '"' or 0x27 '\''
-    comment_state: CommentState = .none,   // .none | .line | .block | .multiline_string
-    // Markdown
-    prev_was_blank: bool = false,
-    prev_was_fence: bool = false,
-    fence_char: u8 = 0,  fence_len: u8 = 0,
-    in_fenced_code: bool = false,
-    // XML
-    tag_state: TagState = .none,           // .none | .lt_seen | .name_start | .in_name | .in_quote
-    in_comment: bool = false,  in_cdata: bool = false,  in_doctype: bool = false,
-    markup_quote: u8 = 0,
+pub const State = struct {
+    in_string: bool = false,
+    in_atom: bool = false,
+    quote_delimiter: u8 = 0,
+    comment: CommentState = .none,          // .none | .line | .block
+    ends_in_backslash: bool = false,
+    backslash_run_odd: bool = false,
+    pending_slash: bool = false,
+    pending_escape: bool = false,
+    pending_escape_offset: usize = 0,
+    pending_unicode_len: u2 = 0,
+    pending_unicode: [3]u8 = .{ 0, 0, 0 },
+    pending_unicode_offset: usize = 0,
+    block_comment_ends_in_star: bool = false,
+    pending_line_comment_unicode_len: u2 = 0,
+    pending_line_comment_unicode: [2]u8 = .{ 0, 0 },
+    next_offset: usize = 0,
 };
 ```
 
-Rules: every field has a derived "incomplete" meaning — assessors
-(`is_in_string()`, `is_in_comment()`, `is_in_atom()`) return `true` whenever the
-document is mid-construct and would be invalid if the stream ended there; this
-is how `finish()` reports truncation identically to the one-shot path. A chunk
-boundary is only legal where no field needs lookahead; the margin (below) keeps
-the needed bytes resident. `reset()` zeroes wholesale
-(`*std.mem.zeroes(CarryState)`).
+The state holds no input bytes and owns no allocation. Its prefix buffers cover
+at most one UTF-8 sequence or one comment terminator, which is what lets `feed`
+accept a chunk boundary at any byte position. `json_lexical.finish` flushes
+those bounded prefixes, and `stream.StreamIndexer.reset` restores the default
+state by assigning `.{}`. There are no `is_in_string()`, `is_in_comment()`, or
+`is_in_atom()` assessors, and the JSON-family `finish` reports only allocation,
+capacity, and input-size failures: an unterminated construct is not a Stage 1
+index condition, and validating a truncated stream is Stage 2's work.
 
-### Future `StreamIndexer` expansion (Model B: padded double buffer)
+### Historical design record: Model B streaming design (superseded)
+
+The record below, and the four sections that follow it, is the design this item
+was built from. None of it is current API: what ships is the split recorded
+under **Implemented per-format baseline** and **General streaming reader
+boundary**. No name in this record exists in the tree — there is no
+`DocumentStreamIndexer`, no `carve`, no `error.Truncated`, no `MAX_SIMD_WINDOW`,
+`UTF8_MAX_TAIL`, or `XML_LOOKAHEAD`, and no `locs` or `arena` member. The
+shipped equivalents are `core.stream.SAFE_PAD = simd.default_vector_len + 9`,
+the index `stage1.StructuralIndex { indexes: []u32, count: usize }` grown with
+`allocator.realloc`, and a `StreamIndexer` that allocates both padded input
+slots once in `init`, whose real signature is
+`init(allocator, chunk_len, options)`.
 
 ```zig
 pub const StreamIndexer = struct {
@@ -673,12 +741,13 @@ pub const StreamIndexer = struct {
 - `feed` is explicit-allocator only; `buf` allocated once in `init`, reused —
   steady-state `feed` performs zero buffer allocations. Only `index` growth
   allocates.
-- `finish` is idempotent-safe, reports `error.Truncated` iff the last byte
-  leaves any carry flag set, processes the final under-margin tail, finalizes.
+- `finish` is idempotent-safe; the plan was to report `error.Truncated` iff the
+  last byte leaves any carry flag set, then process the final under-margin tail
+  and finalize. The shipped `finish` reports no truncation condition.
 - `reset` re-zeroes `fill`/`carry`, clears `index`, keeps `init` allocations;
   supports `take() + reset()` for multi-document streams.
 
-### Margin math and minimum constants
+### Historical design record: margin math and minimum constants (design)
 
 ```zig
 pub const MAX_SIMD_WINDOW: usize = 64;
@@ -698,20 +767,25 @@ Model B keeps at least `SAFE_PAD` unprocessed bytes in the buffer head between
 final window load is always in-bounds. `carve` is the largest index
 `<= fill - SAFE_PAD` not inside a carry construct, on a codepoint boundary.
 
-### Alternative models (documented, rejected or demoted)
+### Historical design record: alternative streaming models (none adopted)
 
-- **Model A** — simdjson-style document-boundary batches (kept as
-  `DocumentStreamIndexer` facade for JSONL/NDJSON): each document/line is an
-  independent one-shot pass, fresh `StructuralIndex`, caller concatenates. No
-  cross-batch carry (document boundary = natural reset). Cannot split a single
-  value mid-document; per-document `init` cost. Wraps Model B + `finish()/reset()`.
-- **Model C** — JSONL delimiter hold-back on `\n` (rejected): hold back the last
-  complete line, buffer the partial tail. Doubles worst-case memory for a
-  pathological single line; defers all output until a delimiter; strictly worse
-  than Model B's margin. Adopted only as the trivially-reusable special case
-  inside `DocumentStreamIndexer` when a trailing `\n` exists.
+- **Model A** — simdjson-style document-boundary batches: each document or
+  line is an independent one-shot pass, fresh `StructuralIndex`, caller
+  concatenates. No cross-batch carry (document boundary = natural reset). It
+  cannot split a single value mid-document and pays `init` per document. Not
+  adopted and never built: the tree defines no `DocumentStreamIndexer`. JSONL
+  streaming instead reuses the shared JSON-family indexer —
+  `formats.jsonl.initStreamIndexer` selects
+  `stream.Options{ .dialect = .json, .mode = .jsonl }`, whose lexical mode
+  indexes LF record boundaries only outside strings.
+- **Model C** — JSONL delimiter hold-back on `\n`: rejected. Hold back the last
+  complete line and buffer the partial tail; that doubles worst-case memory for
+  a pathological single line, defers all output until a delimiter, and is
+  strictly worse than Model B's margin. Nothing holds a line back: the `jsonl`
+  lexical mode scans an LF as ordinary input and emits its record boundary on
+  the same pass.
 
-### StructuralIndex growth: unmanaged ArrayList(u32)
+### Historical design record: StructuralIndex growth (not adopted)
 
 ```zig
 pub const StructuralIndex = struct {
@@ -728,7 +802,7 @@ by chunk); the arena grows by the same chunk so per-chunk `feed` does one or
 zero allocator calls. The one-shot path becomes Model B with a single `feed`,
 refactored to the same backing stores so streaming and batch never fork.
 
-### Seven chunk-transition invariants
+### Historical design record: seven chunk-transition invariants (design)
 
 1. **Byte identity.** Concatenating every chunk equals the input; no byte
    dropped/duplicated/reordered. Exact `fill`/`carve` bookkeeping.
@@ -741,11 +815,11 @@ refactored to the same backing stores so streaming and batch never fork.
 5. **Lookahead residency.** Every lookahead construct (XML prefix, escape
    parity, comment opener) has its full lookahead resident before `carve`.
 6. **Idempotent boundary.** `buf[0..carve]` then `carve..` yields byte-identical
-   events to a one-shot pass over the same bytes; `finish` never re-emits/drops.
-   Goldens differ byte-for-byte.
-7. **Termination parity.** `feed + finish` on any sequence equals the one-shot
-   indexer on that sequence, including truncation: `error.Truncated` iff `carry`
-   non-empty at end-of-stream.
+   events to a one-shot pass over the same bytes; `finish` never re-emits or
+   drops one.
+7. **Termination parity.** `feed` plus `finish` on any sequence equals the
+   one-shot indexer on that sequence. The shipped form reports no truncation
+   error: `finish` is idempotent and flushes whatever carry remains.
 
 ### `std.Io.Reader` integration boundary
 
@@ -798,32 +872,216 @@ therefore still require independent complete input owned by the caller.
   releasing the iterator, or resetting the parser, invalidates prior records
   and cursors.
   This API is separate from the eager document that owns all record tapes.
-- XML text, CDATA, and attribute events expose checked `decodedLength` and
-  `decodeInto` operations. `XmlDeclarationInfo` borrows declaration values;
-  `XmlQName` splits lexical names without resolving namespaces. The parser
-  remains UTF-8-only: declaration inspection is not a transcoder.
+- XML text, CDATA, and attribute events expose checked
+  `decodedLength(source)`, which takes the source slice and returns the
+  required output length, and `decodeInto(options)`, which takes
+  `XmlDecodeOptions` carrying that source slice and the caller-owned output
+  slice. `XmlDeclarationInfo` borrows declaration values; `XmlQName` splits
+  lexical names without resolving namespaces. The parser remains UTF-8-only:
+  declaration inspection is not a transcoder.
 - `formats.yaml` retains `yaml-basic-1.2.2`. The opt-in
-  `formats.yaml_extended` module implements `yaml-extended-e2b`: literal and
-  folded block scalars, multiline quotes, and compact sequence mappings.
+  `formats.yaml_extended` module implements `yaml-extended-e2b-1.2.2`: literal
+  and folded block scalars, multiline quotes, and compact sequence mappings.
   Its document owns tape, metadata, and cooked bytes and borrows source bytes.
-  `Limits` applies to both basic and extended syntax. Collection depth can be
-  lowered from the shared 1024 limit, not raised. A quoted scalar's opening
-  line counts toward its scalar-line limit; block headers and terminal line
-  sentinels do not. Aliases, anchors, tags, complex keys, directives, multiple
-  documents, schema resolution, and streaming remain outside this profile.
+  `Limits` belongs to `formats.yaml_extended` alone and is the only limits type
+  in the tree. Its `buildYamlTape(allocator, input, limits)` and
+  `validateYaml(allocator, input, limits)` check it on entry through
+  `validateLimits`, and an input the extended profile does not need to parse is
+  routed to `buildBasicDocument` under those same limits. `formats.yaml` has no
+  `Limits` type: its `buildYamlTape(allocator, input)` and
+  `validateYaml(allocator, input)` take no limits argument and enforce the
+  fixed `yaml_max_depth` of 1024 themselves. A limits value can only lower that
+  cap — `validateLimits` rejects a `depth_max` that is zero or above
+  `yaml.yaml_max_depth` — never raise it.
+  A quoted scalar's opening line counts toward its scalar-line limit; block
+  headers and terminal line sentinels do not. Aliases, anchors, tags, complex
+  keys, directives, multiple documents, schema resolution, and streaming remain
+  outside this profile.
 - `formats.commonmark` is a separate CommonMark 0.31.2 semantic parser, not
   an extension of the marker-only `formats.markdown` tape. Its flat document
   owns nodes and semantic text and borrows source bytes. Parsing has explicit
   input, node, text, delimiter, bracket, reference, depth, and work limits.
   More than 64 prefixes on one line returns `NestingTooDeep`. Rendering bounds
-  output bytes and rejects malformed traversal links. Default safe rendering
-  omits raw HTML and filters dangerous URL schemes, including autolinks and
-  schemes containing browser-stripped controls. Conformance rendering is
-  intentionally unsafe; the caller owns the trust or sanitization boundary.
+  output bytes and rejects malformed traversal links. `HtmlRenderMode.safe` is
+  the default: it omits raw HTML and filters dangerous URL schemes, including
+  autolinks and schemes containing browser-stripped controls.
+  `HtmlRenderMode.conformance` is intentionally unsafe; the caller owns the
+  trust or sanitization boundary.
 
 `zig build commonmark` runs all 652 pinned examples without exclusions and
 the ownership, safety, and resource regressions. `zig build corpus` includes
 this suite. The YAML extension regressions run through `zig build test`.
+
+`zig build check` is the width gate and the single acceptance command. It runs
+`zig fmt --check` over the Zig sources this repository owns (`build.zig`,
+`build.zig.zon`, `src`, `test`, `scripts`, `library_test.zig`, `bench.zig`,
+`kernel_bench.zig`, `string_bench.zig`), the full test roots at the native
+width, the offline corpus and CommonMark suites, the `scripts/benchmark.zig`
+behavior tests once on the host, and a visualizer smoke run, then repeats the
+test roots at the explicit widths `[4, 5, 7, 12, 16, 24, 32, 64]`.
+`-Dvector_len` below 4 is rejected by `build.zig`. Every width from 4 upward is
+a supported instantiation. The mask type is `Mask(N) = @Int(.unsigned, N)`,
+not a fixed `u16`, `u32`, or `u64`. That type makes arbitrary widths expressible. The
+matrix is a representative sample that defends the enforced minimum, the
+irregular and narrow widths no native CPU selects, and the native widths. A
+green matrix is evidence for the widths it contains, not a proof about widths
+it omits, and `-Dvector_len` is not restricted to the listed set. `AGENTS.md`
+records the same contract.
+
+## Local performance baseline: record, verify, reproduce
+
+The external comparison packet described throughout `docs/superpowers/plans/`
+is unavailable and was not recovered: filesystem and archive searches found no
+packet source or result history, the authenticated owner-repository listing
+exposed only the private `CoffeeImpliesCode/simd`, the authenticated
+`simd-bench-corpus` API returned 404, the recorded packet commits are absent,
+and no SSH recovery host is configured. The decision is to establish a new
+local baseline, not to recreate that packet or its results.
+
+`scripts/benchmark.zig` provides it. The runner receives
+`[runner, bench_executable_path, repository_root_path, operation, args...]`:
+
+```sh
+zig build benchmark -Doptimize=ReleaseFast -Dvector_len=32 -- record OUT_DIR [--samples N] [--iterations N] [--stream-chunk-size N]
+zig build benchmark -Doptimize=ReleaseFast -Dvector_len=32 -- verify ARCHIVE_DIR
+zig build benchmark -Doptimize=ReleaseFast -Dvector_len=32 -- reproduce OLD_ARCHIVE_DIR NEW_ARCHIVE_DIR
+```
+
+Defaults are 3 samples, 3 iterations, and a 4096-byte stream chunk. Samples
+and iterations are decimal integers from 1 to 32; stream chunk size is one of
+64, 256, 1024, 4096, or 16384. A flag may appear once. An unknown flag, a
+missing value, an out-of-range value, or an extra positional prints usage on
+stdout and exits 1.
+
+`zig build benchmark-test` runs the script's behavior tests, and `zig build
+check` includes them.
+
+The `benchmark` step forwards everything after `--` verbatim, so the argv of
+the `simd-benchmark` runner is the runner executable, then the `simd-bench`
+artifact this build compiled, then the repository root, then the operation and
+its arguments. That executable always carries the selected optimize mode,
+target, and vector width, and the runner itself is built for the host even
+under a cross `-Dtarget`. `zig build` and `zig build check` record nothing and
+touch no archive; only `zig build benchmark` writes one.
+
+**Archive layout and failure semantics.** `record` creates `OUT_DIR` with an
+exclusive mkdir and creates every archive file exclusively, so a recording is
+immutable evidence: an existing output directory or file is a failure, never a
+truncation. A failed run still writes `manifest.json` with
+`"status":"failed"` and a `reason` naming the failure before exiting 1, so a
+partial run is never published as complete. A successful run records
+`"status":"complete"`, and `verify` reports a failed archive as failed rather
+than as incomplete evidence. Every usage, verification, or comparison failure
+exits 1.
+
+An archive holds `manifest.json`, `bench/simd-bench` (the compiled benchmark
+artifact it ran), `samples/sample-NN.stdout` and `samples/sample-NN.stderr` per
+sample, and `sources/<repo-relative path>` for the build files, `src/**/*.zig`,
+the benchmark sources, and the embedded fixtures.
+
+Each `samples[]` entry records its index, both stream sizes and digests, and its
+termination kind and value. It carries no timing of its own: the retired
+per-sample `elapsed_ns` key is no longer written, an archive recorded before
+that removal still verifies because the manifest decoder ignores members it
+does not read, and `schema_version` stays 1. The only timing an archive keeps is
+the per-case `elapsed_ns` array of `cases[]`, one entry per sample.
+
+**Manifest identity.** `manifest.json` declares
+`schema="simd-benchmark-archive"`, `schema_version=1`, its status and reason, the
+unix timestamp, the effective options, the work shape (`expected_inputs` 35,
+`expected_cases` 210), the compiler basename, version, and executable SHA-256,
+the build's target, cpu, optimize, and vector length, the archived binary's size
+and SHA-256, the captured source files with their sizes and SHA-256 values, the
+recorded environment, the verbatim benchmark headers, the per-input identity and
+byte count, and every payload file's size and SHA-256.
+
+Identity is a repository-relative source path plus a content hash, never an
+absolute workstation path, so an archive stays meaningful on a different
+machine. The manifest records the Zig basename, version, and executable SHA-256
+rather than a Zig path. Every input records the identity and byte count the
+benchmark itself reports, whether it came from a fixture or a generated
+workload. Execution identity comes from the benchmark executable the current
+build provides through the `benchmark_options` module (`zig_exe`,
+`bench_target`, `bench_cpu`, `bench_optimize`, `bench_vector_len`), not from an
+executable path named inside an archived manifest.
+
+**Verification and reproduction.** `verify ARCHIVE_DIR` re-checks one archive.
+`reproduce OLD NEW` verifies the old archive offline, preflights the current
+source path set and hashes, the current benchmark executable hash, the Zig
+version, basename, and executable SHA-256, the build configuration, and the CPU
+affinity, online CPU count, and CPU model. It then records a new directory with the old archive's
+options and compares the two. The comparison is per case on `input_hash`,
+`input_bytes`, `checksum`, `allocation_count`, and `allocated_bytes`, plus the
+headers and input identities. Any mismatch exits 1. The retained per-case
+`elapsed_ns` timing arrays are never part of that comparison, never ranked, and
+never printed as a ranking; `verify` re-derives each of them from the archive's
+own captured stdout, so a recorded timing the capture does not contain fails
+verification with `ManifestIncomplete`.
+
+**Work domain.** The contract is the existing `bench.zig` one, unchanged:
+7 formats (JSON, JSONL, JSONC, JSON5, Markdown, XML, YAML) x 5 workloads x 6
+stages is 210 cases over 35 input hashes, drawn from pinned embedded fixtures
+and deterministic generated workloads. Markdown rows are a marker-kind
+projection, YAML rows are the `yaml-basic-1.2.2` profile, and the resident
+`traverse_prefix8` stage consumes eight events or EOF. There is no
+`formats.commonmark` or `yaml-extended-e2b-1.2.2` row.
+
+**Claim boundary.** Exact match is the reproducibility claim. A recording's
+timings are observations from the machine that produced it, not a ranking:
+this harness measures this parser against itself, never against another
+library, so no winner, cross-library comparison, or restored packet result may
+be derived from it.
+
+**Observed recordings.** The current source reproduction baseline was recorded
+and verified on 2026-10-01 from source identity
+`fcdb7c0e7c8719fb9fd22385aecee9d3998d36317a40950e36fa55c108fb9c49`:
+`acceptance-closed-20261001` was recorded with `-Doptimize=ReleaseFast
+-Dvector_len=32` at 3 samples, 3 iterations, and 4096-byte chunks and verified
+from its own bytes over 35 inputs and 210 cases;
+`acceptance-closed-reproduce-20261001` was recorded from it by `reproduce`,
+independently verified, and reported all 35 inputs and 210 cases identical; and
+`acceptance-closed-chunk256-20261001` was recorded at 256-byte chunks with 1
+sample and 3 iterations and independently verified over the same 35 inputs and
+210 cases.
+
+Two earlier families remain immutable historical evidence. From source identity
+`033b3923543f486a32d0fb00f6492e7c9911d977a6417b4d01b1092c7d740a3c`,
+`baseline-final-20261001` at 3 samples, 3 iterations, and 4096-byte chunks,
+`reproduce-final-20261001` at 3 samples with every input and case identical,
+and `chunk256-final-20261001` at 1 sample and 256-byte chunks each verified
+over 35 inputs and 210 cases. From source identity
+`76f4b3b414f208a7934aca1720f325c80b7bbf0450f1713722c7ef2bfe0a8a8d`,
+`baseline-20261001`, `reproduce-20261001`, and `chunk256-20261001` were
+recorded earlier the same day. Acceptance-closure work then edited the
+sources those archives captured, so neither family is the current source
+reproduction baseline and reproducing one from the present tree is refused
+with `IdentityMismatch`. None is overwritten or deleted. The `033b3923`
+manifests record `zig` 0.16.0, compiler executable SHA-256
+`2317bbb91798556d9d0f38aabdac23db83f0979b25f767259ae474546724087c` over
+172,641,672 bytes, target `x86_64-linux` with glibc 2.39, CPU
+`icelake_server`, ReleaseFast, and vector length 32. Each `samples[]` entry
+carries no timing; the only retained timing is each `cases[]` entry's actual
+per-sample array, an observation that is excluded from the reproduction
+comparison and is never a ranking.
+
+The archives live under the ignored `zig-out/bench-evidence/` and are
+named in `AGENTS.md`; no gate writes them. Editing any captured source changes
+the identity, so reproducing an archive from a different tree is refused.
+
+Observed failure paths, exercised on copies with the originals untouched:
+reusing an existing output directory fails with `PathAlreadyExists` without
+truncating it; a changed raw capture byte fails verification with
+`HashMismatch`; a manifest timing changed from 11470 to 11471 fails with
+`ManifestIncomplete`; reproducing the `76f4b3b4`-era archive from the current
+tree fails with `IdentityMismatch` before any directory is created;
+`--samples 0`, `--stream-chunk-size 7`, and an unknown flag each exit 1. The
+last control is a deliberately corrupted copy rather than a healthy archive: a
+fresh exclusive copy of `acceptance-closed-chunk256-20261001` whose
+`manifest.json` `status` member was changed to `failed` printed
+`simd-benchmark verify: ManifestFailedStatus` and exited 1. That is evidence
+about the corrupted copy and about the verifier's status check in
+`scripts/benchmark.zig`; it is not a statement about a recorded archive, and
+the recorded archive itself verifies from its own bytes.
 
 ## Future roadmap
 
