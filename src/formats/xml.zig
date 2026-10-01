@@ -1294,13 +1294,18 @@ test "indexXml preserves invariants for adversarial bytes and tails" {
 }
 
 test "indexXml rejects inputs whose indexes cannot fit u32" {
-    const oversized_len = @as(usize, std.math.maxInt(u32)) + 1;
-    const oversized_input: []const u8 =
-        @as([*]const u8, @ptrFromInt(1))[0..oversized_len];
-    try testing.expectError(
-        error.InputTooLarge,
-        indexXml(testing.allocator, oversized_input),
-    );
+    // Only expressible where usize is wider than u32. A 32-bit target cannot
+    // name a slice longer than u32 max at all, so the oversized input is
+    // unrepresentable there rather than rejected.
+    if (@bitSizeOf(usize) > @bitSizeOf(u32)) {
+        const oversized_len = @as(usize, std.math.maxInt(u32)) + 1;
+        const oversized_input: []const u8 =
+            @as([*]const u8, @ptrFromInt(1))[0..oversized_len];
+        try testing.expectError(
+            error.InputTooLarge,
+            indexXml(testing.allocator, oversized_input),
+        );
+    }
 }
 
 pub const xml_max_depth: usize = 1024;

@@ -104,6 +104,12 @@ test "StructuralIndex rejects unrepresentable capacity and input" {
         StructuralIndex.init(testing.allocator, std.math.maxInt(usize)),
     );
 
+    var idx = try StructuralIndex.init(testing.allocator, 1);
+    defer idx.deinit(testing.allocator);
+
+    // Only expressible where usize is wider than u32. On a 32-bit target the
+    // oversized length itself does not fit the pointer width, so there is no
+    // input to reject: the expression below would not compile there.
     if (@bitSizeOf(usize) > @bitSizeOf(u32)) {
         try testing.expectError(
             error.InputTooLarge,
@@ -112,12 +118,9 @@ test "StructuralIndex rejects unrepresentable capacity and input" {
                 @as(usize, std.math.maxInt(u32)) + 1,
             ),
         );
+        try testing.expectError(
+            error.InputTooLarge,
+            idx.finish(@as(usize, std.math.maxInt(u32)) + 1),
+        );
     }
-
-    var idx = try StructuralIndex.init(testing.allocator, 1);
-    defer idx.deinit(testing.allocator);
-    try testing.expectError(
-        error.InputTooLarge,
-        idx.finish(@as(usize, std.math.maxInt(u32)) + 1),
-    );
 }
