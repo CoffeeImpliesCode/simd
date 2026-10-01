@@ -10,3 +10,9 @@ codedb.snapshot
 
 # direnv
 .direnv
+
+# Jujutsu working copy state, including the colocated repository store.
+.jj/
+
+# Local pack-up notes; never published.
+LOCAL_PACKUP_TODO.md
