@@ -1,10 +1,10 @@
-# SIMD priorities 1–4: handoff after acceptance closure (2026-10-01)
+# SIMD priorities 1–4: handoff after the phase 3–4 closure (2026-10-01)
 
 ## Current status and user instructions
 
 Repository: `~/simd`.
 All observations below were collected on 2026-10-01; this handoff was last
-updated the same day, after the acceptance-closure verification pass.
+updated the same day, after the phase 3 and phase 4 closure pass.
 
 Original objective: **“radically orchestrate: handle priorities 1 - 4.”**
 The user then said **“always orchestrate.”** Substantial implementation
@@ -17,16 +17,22 @@ supersedes that halt. The resume/unblock/no-commit-unless-asked instructions
 that this file used to carry are retired. The interpreted phases are:
 
 1. Acceptance closure — **closed**; see “Acceptance closure, 2026-10-01”.
-2. Focused Jujutsu commits of the accepted change set — **pending, next**.
-3. Separate CommonMark and extended-YAML semantic measurements — **pending**.
+2. Focused Jujutsu commits of the accepted change set — **closed**; see
+   “Phase 2 — focused Jujutsu commits (done)”.
+3. Separate CommonMark and extended-YAML semantic measurements —
+   **implemented and verified**; see “Phases 3 and 4 closure, 2026-10-01”.
 4. Selecting/documenting the next consumer-driven API and source-ownership
-   track — **pending**.
+   track — **closed as a design record**. The record selects a contract and
+   implements none of it. Also in that section.
 
-Do not read this file as a claim that phases 2–4 are done. Closing acceptance
-closes only the original priorities 1–4 implementation and its verification.
+All four phases of `orchestrate: do 1 - 4` are therefore accounted for.
+Phase 4 is closed as a *proposal*: the recorded-borrow contract it selects is
+not in the code, and no clause of it may be called shipped because a document
+argues for it.
 
-No push is authorized. Commits are authorized for phase 2 only and must be
-focused. Never fabricate a commit ID, description, or result.
+No push is authorized. Focused commits were authorized for each phase that
+reached a green gate, and must stay focused. Never fabricate a commit ID,
+description, or result.
 
 No commit was made by this workflow while it was paused. The starting review
 fixed point was `9d883d0be2133e09884a6f1d1743fc305149913f`; VCS state was not
@@ -39,10 +45,191 @@ session’s `agent://…` reports and `local://simd-priorities-acceptance.md` ar
 Their essential facts are preserved inline in this file; do not imply they were
 recovered.
 
-## Acceptance closure, 2026-10-01 (current)
+## Phases 3 and 4 closure, 2026-10-01 (current)
 
-This section is the current status. The older observation sections below it are
-historical context and are labelled where their numbers were superseded.
+This section is the current status. The acceptance-closure section below it
+records the state at the end of phase 1 and is kept as history: where its
+gate counts and archive identities were superseded, this section wins and
+those numbers were not deleted.
+
+### Gate (actual current run)
+
+```sh
+zig build check -j2 --summary all
+```
+
+**PASS: 135/135 build steps, 4512/4512 tests.** The acceptance-closure pass
+reported 128/128 and 4445/4445 earlier the same day. Both are real runs;
+4512 is the current one. The difference is added coverage, not a regression:
+the six test roots, all nine of their columns, and the 35 host-only legacy
+benchmark-script tests are unchanged in number, and the 67 additional tests
+are the two new host-only roots below.
+
+New in the gate:
+
+- `semantic-benchmark`: the host-only behavior-test root of the semantic
+  measurement (`scripts/semantic_benchmark_test.zig`). It exercises the stdout
+  protocol and the declared work domain, never a parser, so it runs once on
+  the host and is never swept across the width matrix.
+- `semantic-benchmark-script`: the same `scripts/benchmark.zig` source
+  compiled again with `semantic_mode` true, running the semantic half of that
+  file’s own behavior tests — same host target, same pinned seed, one
+  invocation, never swept.
+- `simd-semantic-bench` and `simd-semantic-benchmark`: the semantic
+  measurement executable and the semantic archive runner. The gate depends on
+  their compile steps only (`build.zig:667-678`); no gate step runs them, so
+  recording is still an explicit act.
+
+Still in the gate and unchanged: the six-root matrix at widths
+`[4, 5, 7, 12, 16, 24, 32, 64]` plus the native width-64 column, the offline
+corpora, the pinned CommonMark conformance suite, `zig fmt --check` over the
+owned sources, the 35 benchmark-script tests, and the visualizer smoke.
+
+### Semantic measurement surface (implemented)
+
+Semantic measurement is a second domain, not an extension of the legacy
+benchmark, and the legacy domain is untouched by it.
+
+```sh
+zig build bench-semantic -- [ITERATIONS]
+zig build benchmark-semantic -- record OUT_DIR [--samples N] [--iterations N]
+zig build benchmark-semantic -- verify ARCHIVE_DIR
+zig build benchmark-semantic -- reproduce OLD_ARCHIVE_DIR NEW_ARCHIVE_DIR
+```
+
+- The measurement step takes one optional positional decimal, 1..32, default
+  3. It has no flags: a token starting with `-` is refused
+  (`UnknownArgument`), and a second positional is refused
+  (`UnexpectedArgument`).
+- The archive step takes `record`, `verify`, or `reproduce`, and accepts
+  `--samples` and `--iterations` (1..32, default 3) once each. There is no
+  stream-chunk option in semantic mode and none may be added: neither
+  measured parser has a stream indexer, so a chunk size would assert a
+  capability the measurement does not have.
+- The two measured parsers are the pinned CommonMark 0.31.2 specification and
+  the opt-in `yaml-extended-e2b-1.2.2` profile.
+- The semantic archive declares its own schema name
+  `simd-semantic-benchmark-archive` at `schema_version` 1 and stores the
+  executable it ran at `bench/simd-semantic-bench`, beside the legacy
+  `simd-benchmark-archive` and `bench/simd-bench`. The runner reports itself
+  as `simd-semantic-benchmark` in semantic mode and `simd-benchmark` in
+  legacy mode; the legacy spelling is unchanged.
+- The legacy measured domain is unchanged: 7 formats × 5 workloads × 6
+  stages is still 35 inputs and 210 cases, and it contains no semantic row.
+- The semantic domain is 24 fixtures — 9 CommonMark, 15 YAML extended — each
+  measured on exactly the stages it declares, which is 41 cases. It is the
+  declared fixture list, not a Cartesian product.
+
+### Semantic archives (observed today)
+
+Fresh semantic archives under ignored `zig-out/bench-evidence/`, recorded,
+verified, and reproduced with ReleaseFast, `vector_len=32`, 3 samples, 3
+iterations:
+
+| Archive | Observed result |
+| --- | --- |
+| `semantic-final-20261001` | Record and verify passed; 3 samples, 24 inputs, 41 cases |
+| `semantic-final-reproduce-20261001` | Reproduce and verify passed; 3 samples, all 24 inputs / 41 cases identical to `semantic-final-20261001` |
+
+Source identity of both:
+
+```text
+4fa28013ae213a4ee40005110ce029c10bc164e0189f51809c14712e61f27f2f
+```
+
+`semantic-closed-20261001` and `semantic-closed-reproduce-20261001`
+(3 samples, 24 inputs, 41 cases each, source identity
+`55c44300a760dc9ba67635f5615fcfb370f7fabb87abb366d2425d4d4c4677b7`) were
+recorded earlier the same day and are historical now, because the sources
+they captured were edited afterwards. Like every other recording they are
+immutable evidence: not overwritten, not deleted.
+
+Semantic timings inside these archives are observations of this machine. They
+are excluded from reproduction comparison, and nothing in this surface is a
+ranking, a speedup, or a comparison against any other library.
+
+### Legacy domain after the change (observed)
+
+The legacy domain was re-recorded after the semantic work:
+
+| Archive | Source identity | Observed result |
+| --- | --- | --- |
+| `legacy-post-semantic-20261001` | `b4eb02a6b71c50be5821c01dc916cb5be22cba093db21d594c4e743b71eda941` | 3 samples, 35 inputs, 210 cases |
+| `legacy-final-20261001` | `5ee8fa0e3d6ca98272beee5420f8e648acdd1b14fdf61b8943df772f772a38b4` | 3 samples, 35 inputs, 210 cases |
+
+Each was compared case by case against the pre-change closure archive
+`acceptance-closed-20261001` (source identity `fcdb7c0e…`): the case key set
+is identical and zero cases differ across input hash, byte count, checksum,
+allocation count, and allocated bytes. `legacy-final-20261001` is the current
+legacy identity, so the `fcdb…` closure family is history for the legacy
+domain now, exactly as the `033b…` family already was.
+
+Measured checksums and allocation observations were byte-identical across
+Debug, ReleaseSafe, and ReleaseFast.
+
+### Real CLI negative controls (observed today)
+
+Observed refusals in semantic mode. No directory was created by any of them.
+
+- Recording over an existing output directory: `PathAlreadyExists`.
+- Verifying a legacy archive as a semantic one: `ManifestSchemaMismatch`.
+- `--samples 0`: `SampleCountOutOfRange`.
+- The legacy `--stream-chunk-size` in semantic mode: `UnknownFlag`.
+
+### Defects this work found and fixed
+
+Recorded because each one shows where the previous gate was blind.
+
+- The semantic measurement executable did not compile at all until its
+  duplicate `build_options` module was removed: a root that declares its own
+  options module and also imports the library hands the same generated
+  options file to two modules of one compilation, which the compiler
+  rejects. The measured width now arrives through `simd_lib`
+  (`semantic_bench.zig:35-41`).
+- An exhausted allocator was being recorded as a measured parser outcome.
+  `error.OutOfMemory` is now propagated out of every measured and every
+  verified call in both format modules, so it aborts a run instead of
+  becoming an outcome string, a checksum, or an oracle comparison.
+- Allocation failures inside the manifest parser were being reported as
+  `ManifestInvalid`, a corrupt manifest, for a manifest that was never read.
+  They now surface as `error.OutOfMemory` (`scripts/benchmark.zig:499-505`).
+- One fixture’s source was one byte short of what its own oracle described,
+  because a multiline string literal supplies no trailing newline. The
+  fixtures now spell the final newline explicitly where the oracle expects
+  one.
+- The check gate never compiled the two semantic executables, which is why
+  the first defect above reached a run at all. The gate now depends on their
+  compile steps.
+
+### Phase 4 — design record, no code
+
+`docs/superpowers/plans/2026-10-01-source-ownership-contract.md` is the phase 4
+design record. It selects a **recorded-borrow** source-lifetime and resource
+contract: documents record their borrowed source once, accessors stop taking a
+source argument, derived values carry the lease and generation of the storage
+they read, and a returned slice names its storage as one of three kinds. It
+implements none of it. Every clause is labelled **Enforced today**,
+**Documented, not enforced**, or **Proposed**, and nothing outside those
+labels is shipped behavior.
+
+A read-only review of the record found wrong line citations and several wrong
+counts, and those corrections were applied. Separate documentation
+corrections made the current contract text match the code where it had
+described as shared, or as checked, what is in fact independent and
+unchecked: the architecture document now states that the JSON-family Stage 2
+accessor performs no source identity check and that pairing the exact bytes
+is a caller obligation (`docs/architecture-stage2-stream.md:163-173`), and it
+and `AGENTS.md` now describe the JSON on-demand reader’s single-focus rule as
+implemented independently, with its own state and its own `FocusLost` name,
+which is what `src/core/ondemand.zig` does.
+
+Nothing is pushed. No commit authorization covers phases 3 or 4.
+
+## Acceptance closure, 2026-10-01 (current at that pass)
+
+This section records the state at the end of phase 1. The phase 3–4 section
+above is the current status. The older observation sections below this one
+are historical context and are labelled where their numbers were superseded.
 
 ### Gate (actual current run)
 
@@ -52,7 +239,9 @@ zig build check -j2 --summary all
 
 **PASS: 128/128 build steps, 4445/4445 tests.** This was an actual run after
 the final comment corrections and strengthened regression coverage, not the
-older 382/482 historical observations.
+older 382/482 historical observations. Those are this pass’s numbers: the
+phase 3–4 pass later the same day reports 135/135 and 4512/4512, and that is
+the current count.
 
 Native column: 350 library + 103 public root + 1 executable + 9 fuzz + 1 corpus
 + 26 CommonMark = 490 tests. The eight explicit-width columns run those same six
@@ -109,8 +298,10 @@ must stay that way. The `76f4b3b4…` archives and the intermediate
 `acceptance-*-u399fP` recordings are likewise immutable history.
 
 The measured domain is unchanged: 7 formats × 5 workloads × 6 stages = 35
-inputs / 210 cases. CommonMark and extended YAML have no benchmark rows; the
-semantic measurements the user asked for are phase 3 and are not implemented.
+inputs / 210 cases. CommonMark and extended YAML still have no row here; the
+semantic measurements the user asked for were built later as their own domain,
+with their own schema and their own archives, and are never back-filled into
+these. See “Phases 3 and 4 closure, 2026-10-01”.
 Recorded timings are per-case, per-sample observations, excluded from
 deterministic comparison, and never a speed ranking or external-library
 comparison.
@@ -291,8 +482,9 @@ still fail current-source reproduction preflight.
 Closure status: **closed for the legacy domain**. New `acceptance-closed-*`
 archives were recorded, reproduced, and verified against the current sources;
 see “Acceptance closure, 2026-10-01”. The CommonMark and extended-YAML semantic
-measurements are a separate, later authorized phase: not implemented, and never
-to be back-filled from these archives.
+measurements are a separate domain and are not back-filled into these
+archives; they were implemented later, with their own schema, bench path, and
+recordings. See “Phases 3 and 4 closure, 2026-10-01”.
 
 ### 4. Repository guidance and cache hygiene
 
@@ -324,8 +516,10 @@ closure time — apply only evidence-backed findings, including the open XML
 ## Directly observed verification (historical, pre-closure)
 
 Everything in this section was observed before the closure pass and is kept as
-history. Where the closure pass produced a stronger statement, the
-“Acceptance closure, 2026-10-01” section above wins.
+history. Where a later pass produced a stronger statement, the section above
+it wins: “Acceptance closure, 2026-10-01” for the phase 1 state, and
+“Phases 3 and 4 closure, 2026-10-01” for the gate counts and archive
+identities that the phase 3–4 work superseded.
 
 ### Complete gate after the final source corrections
 
@@ -333,7 +527,8 @@ history. Where the closure pass produced a stronger statement, the
 zig build check -j2 --summary all
 ```
 
-**PASS: 128/128 build steps, 4445/4445 tests.**
+**PASS: 128/128 build steps, 4445/4445 tests.** This was that pass’s count;
+the current one is 135/135 and 4512/4512, recorded above.
 
 Native column: 350 library + 103 public root + 1 executable + 9 fuzz + 1 corpus
 + 26 CommonMark = 490 tests. The eight explicit-width columns run those same
@@ -420,13 +615,16 @@ Resolved at closure: `/tmp/simd-acceptance.u399fP/old-source-mismatch` was read
 directly and is not found, so “the old-source mismatch created no directory” is
 now an observed filesystem fact rather than an inference from preflight order.
 
-## Remaining authorized work (phases 3–4)
+## Phases 2–4 (all closed)
 
-Acceptance closure and the focused commits are closed. The items below are the
-rest of the user’s `orchestrate: do 1 - 4` request; none of them are done, and
-none may be called done on the strength of the passing gate. The former
+All four phases of the user’s `orchestrate: do 1 - 4` request are accounted
+for: phase 2 by its focused commits, phase 3 by an implemented and recorded
+semantic measurement, phase 4 by a design record that proposes rather than
+implements. None of them may be called done on the strength of the passing
+gate; each is recorded above with what was actually observed. The former
 resume/unblock list, including “no commit unless requested”, is retired:
-focused commits were authorized for phase 2 and have been made. No push is
+focused commits were authorized for phase 2 and have been made. Phases 3 and 4
+reached a green gate afterwards and are committed the same way. No push is
 authorized.
 
 ### Phase 2 — focused Jujutsu commits (done)
@@ -439,34 +637,44 @@ rewrite:
 - `ce28d524` `feat(bench): record, verify, and reproduce immutable benchmark archives`
 - `0611ae5c` `docs: record acceptance closure evidence and correct shipped-contract claims`
 
-Those IDs were read back from the repository after the split. Phase 3 work is
-uncommitted in the working copy and must not be folded into a phase-2 commit.
+Those IDs were read back from the repository after the split, and no commit
+after them is authorized. The phase 3 and phase 4 work is not covered by them
+and must not be folded into a phase-2 commit.
 
-### Phase 3 — CommonMark and extended-YAML semantic measurements
+### Phase 3 — CommonMark and extended-YAML semantic measurements (done)
 
-1. Not implemented. Design the measurement profile, oracle, and limits before
-   recording anything. The legacy 35-input/210-case domain has no CommonMark or
-   extended-YAML rows, and must not be extended by back-filling them.
+Implemented, recorded, verified, and reproduced: 24 fixtures and 41 measured
+cases across the pinned CommonMark 0.31.2 specification and the opt-in
+`yaml-extended-e2b-1.2.2` profile, in their own schema, their own bench path,
+and their own archives. The legacy 35-input/210-case domain was re-recorded
+afterwards and is unchanged case for case. Commands, identities, negative
+controls, and the defects this work found are in “Phases 3 and 4 closure,
+2026-10-01”.
 
-### Phase 4 — next consumer-driven API / source-ownership track
+### Phase 4 — next consumer-driven API / source-ownership track (done as a record)
 
-2. Not implemented: select and document the next API direction and its source
-   lifetime/ownership boundary from actual consumers. Keep the guardrails above
-   — logical width never implies raw object-padding observability.
+`docs/superpowers/plans/2026-10-01-source-ownership-contract.md` selects and
+documents a recorded-borrow source-lifetime and ownership boundary derived
+from actual consumers. It implements nothing, and no clause of it is shipped
+behavior unless the record itself labels it **Enforced today**. Keep the
+guardrails above — logical width never implies raw object-padding
+observability.
 
 ### Working rules
 
-3. Orchestrate substantial independent slices with one writer per file. Do not
+1. Orchestrate substantial independent slices with one writer per file. Do not
    reuse cancelled writers, allow overlapping ownership, or silently shrink
    scope.
-4. Agents MUST skip all compiler probes, builds, tests, gates, lint, and
+2. Agents MUST skip all compiler probes, builds, tests, gates, lint, and
    formatters; the parent runs gates once after writers finish.
-5. Verify behavioral changes with a real smoke run in addition to the full gate,
+3. Verify behavioral changes with a real smoke run in addition to the full gate,
    preserving the six-root width matrix and all offline examples.
-6. Reproduction after captured-source changes requires a fresh exclusive
+4. Reproduction after captured-source changes requires a fresh exclusive
    recording, never a rewritten old manifest or archive.
-7. Delete nothing further: no other temporary-path cleanup is authorized, and
-    the retained archives and the `.zig-cache` symlink stay.
+5. No recording under `zig-out/bench-evidence/` may be overwritten or deleted,
+   and the shared `.zig-cache` symlink stays. Scratch created outside the
+   repository is temporary and may be removed; no other temporary path and no
+   user file may be.
 
 ## Worker handoffs (historical, links unavailable)
 
