@@ -32,7 +32,16 @@ roadmap section as an implemented API.
   trailing zeros, or it advances by the backing width. No contract here
   describes how raw physical object padding reads.
 - `StructuralIndex` uses `u32` offsets and ends with `input_len`, `input_len`,
-  zero. Reject inputs that cannot fit.
+  zero. Reject inputs that cannot fit. A test that needs an input longer than
+  `u32` max must compile on 32-bit targets too, so guard it on
+  `@bitSizeOf(usize) > @bitSizeOf(u32)`: on those targets the oversized length is
+  unrepresentable, not merely rejected.
+- The byte kernels are little-endian only, and this is a known defect rather
+  than a documented limitation. On `s390x-linux`, `powerpc64-linux`, and
+  `aarch64_be-linux` the tree builds and 463 tests run, but the structural
+  indexer returns different widths than on little-endian targets, so the corpus,
+  Stage 2, cursor, and on-demand tests all fail there. Treat a big-endian
+  divergence as a bug to fix, never as an accepted difference.
 - Preserve each format's quote, comment, framing, and token rules. Similar
   JSON-family APIs do not imply shared dialect rules.
 - A Stage 2 document owns its tape but borrows source bytes. Keep source and
@@ -159,6 +168,46 @@ step:
   `[4, 5, 7, 12, 16, 24, 32, 64]`: the enforced minimum, several irregular and
   narrow widths that no native CPU selects, and the native widths. A width
   below 4 must fail, not silently fall back.
+- `zig-gate --no-zbc`: the external aggregate build, test, AST, and lint gate.
+- `zbc --no-color` over every owned `.zig` source, as a separate required
+  command rather than zig-gate's advisory borrow-checker invocation.
+- `zwanzig --threads 2` over the same owned `.zig` sources, with its default
+  rules and no disabled checks.
+- `cross-test --jobs 2 --build-jobs 1`, using the compiler selected by this
+  build and its full version-pinned Tier 1/2 target matrix. It runs `test`,
+  not `check`, in each target build, so the gate does not recurse.
+
+All four external commands run on every gate invocation; their results are
+not cached. Missing executables and nonzero exits fail the gate. Analyzer
+findings and incompatible analyzer frontends must not be suppressed merely
+to obtain a green run. The tools must be available on `PATH`; the gate does
+not install them. They run once on the host, not once per SIMD width.
+
+Cross-test retains logs and `cross-test-summary.json` under
+`zig-out/cross-test/`. Missing foreign runtimes are reported as `build_only`,
+not as executed test passes. Its default exit policy permits explicit partial
+execution coverage; only `cross-test --require-runners` requires every target
+to execute. Do not describe a successful default cross-test run as full
+execution coverage.
+
+## Scratch storage
+
+`/tmp` and `/var/tmp` are small local disks on the compute nodes and must not
+absorb scratch or build caches. The sanctioned roots are `/vol/tmp` and
+`/vol/tmp2` on every node, and `/home/tmp` or `/home/tmp2` on the nodes that
+provide them; check with `lsblk` and `df -hT` rather than assuming. Check which
+roots a node has and how much space remains before putting anything large there.
+
+The gate writes its scratch to `$TMPDIR/<user>/simd-check` under `-Dscratch_dir`,
+which defaults to `/vol/tmp`, and creates that directory only when the gate
+runs. An ordinary `zig build` still touches no shared disk. Cross-test keeps its
+per-target build cache there, which is what makes it too large for `/tmp`.
+`zig-gate` and `zbc` still write a few hundred bytes at their own hardcoded
+`/tmp` paths; that residue is not redirectable and is bounded.
+
+This checkout's `.zig-cache` is a symlink into `/home/tmp`, so the repository's
+own build cache already follows the policy. It is regenerable: delete its
+contents, never the symlink or its directory.
 
 The matrix is a representative sample, not a proof about every width.
 `Mask(N) = @Int(.unsigned, N)` is what makes every width from 4 upward a
@@ -167,9 +216,9 @@ that a native run never reaches, and a green matrix says nothing about widths
 it does not contain. `-Dvector_len` is not restricted to that list. Do not
 narrow the gate to a hand-picked subset of widths or roots.
 
-`zig build` and `zig build check` are side-effect free with respect to benchmark
-archives: constructing the build graph records nothing and touches no archive.
-Only `zig build benchmark` and `zig build benchmark-semantic` write one.
+`zig build` is side-effect free with respect to benchmark archives: constructing
+the build graph records nothing and touches no archive. Only `zig build
+benchmark` and `zig build benchmark-semantic` write one.
 
 ## Repository layout notes
 
@@ -177,12 +226,19 @@ The checkout's `.zig-cache` is a symlink to a shared cache outside the work
 tree. `.gitignore` must list `.zig-cache` without a trailing slash, because a
 trailing slash matches a directory only and would not match that symlink.
 
+`zig build check` is not side-effect free with respect to scratch storage: it
+creates the scratch directory above and the four external commands write into
+it. It still touches no benchmark archive.
+
 ## Evidence
 
 Counts and timings under `docs/superpowers/plans/` are historical records from a
 different host. `382/382`, `482/482`, the AVX2-host native width of 32, and
 every `~/...` path describe that run, not this machine. Do not
 restate them as current results, and do not derive a ranking from them.
+
+The passing gate observations below predate the external-tool expansion.
+They do not establish that the expanded gate passes.
 
 This checkout has its own observation, recorded on 2026-10-01 on the host that
 has AVX-512F and AVX-512BW, so its native width is 64:

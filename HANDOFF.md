@@ -4,7 +4,13 @@
 
 Repository: `~/simd`.
 All observations below were collected on 2026-10-01; this handoff was last
-updated the same day, after the phase 3 and phase 4 closure pass.
+updated the same day, after the phase 3 and phase 4 closure pass and the gate
+expansion.
+
+Later the same day the user added a gate rule — expand the gate with `zig-gate`,
+`zbc`, `zwanzig`, and `cross-test` — and then two housekeeping rules: never put
+bulk scratch on `/tmp` or `/var/tmp`, and clean up after yourself rather than
+polluting the machine. Both are recorded in `AGENTS.md` and long-term memory.
 
 Original objective: **“radically orchestrate: handle priorities 1 - 4.”**
 The user then said **“always orchestrate.”** Substantial implementation
@@ -84,6 +90,91 @@ Still in the gate and unchanged: the six-root matrix at widths
 `[4, 5, 7, 12, 16, 24, 32, 64]` plus the native width-64 column, the offline
 corpora, the pinned CommonMark conformance suite, `zig fmt --check` over the
 owned sources, the 35 benchmark-script tests, and the visualizer smoke.
+
+### Gate expansion and scratch storage (2026-10-01)
+
+`zig build check` now also requires four external commands, each wired as a
+cached-by-nothing, side-effecting run step in `build.zig`:
+
+- `zig-gate --no-zbc`: aggregate fmt, build, test, AST, and lint gate. Its own
+  `zbc` step is advisory, so the gate runs `zbc` separately as required.
+- `zbc --no-color` over every owned `.zig` file.
+- `zwanzig --threads 2` over the same files, default rules, nothing disabled.
+- `cross-test --jobs 2 --build-jobs 1`, given `ZIG` from this build's compiler
+  so the gate cannot silently switch toolchains. It runs `test`, not `check`,
+  per target, so the gate does not recurse into itself.
+
+The two analyzers receive their file list from the same `fmt_paths` scope the
+format check uses, walked at configure time. `build.zig.zon` is excluded because
+neither analyzer takes it. Nothing under `.zig-cache`, `zig-out`, or
+`zig-out/bench-evidence` is ever passed to an analyzer.
+
+**The expanded gate is currently red, and that is the honest state.** Observed
+on this machine before the tools were wired in: `zig-gate` fails on 370
+`ziglint` findings and 55 `zlint` findings; `zbc` reports 64 findings (4
+errors, 60 warnings); `zwanzig` reports 283 diagnostics (5 errors, 278
+warnings), three of which are `frontend-error` entries saying its embedded Zig
+0.15.2 frontend cannot type-check this 0.16.0 tree and that required typed
+checks are therefore skipped. Suppressing any of these to obtain a green run
+is forbidden by the recorded contract in `AGENTS.md`. Clearing them is real
+remediation work, not a gate-config change.
+
+`cross-test --list` on this node selects all 53 Zig 0.16.0 Tier 1/2 targets. One
+(`x86_64-linux`) runs natively and 30 more have QEMU-user runners; the remaining
+22 are `build_only` because their runner is missing (`no_local_runner_*`,
+`missing_wine`, `missing_wasmtime`). A default `cross-test` run exits 0 with
+that partial execution coverage; only `--require-runners` demands full
+execution. Do not describe a default run as full cross-target coverage.
+
+### Cross-target results after the 32-bit fix (observed)
+
+The first cross-test run inside the gate is **not** valid evidence: its build
+cache directory was removed by a cleanup while the run was still executing, and
+the run ended `interrupted` with exit 2. Do not read that run. A later targeted
+run over seven targets, with nothing deleted during it, produced:
+
+```sh
+cross-test --targets 'arm-linux aarch64_be-linux riscv64-linux x86-linux \
+  wasm32-wasi powerpc64-linux s390x-linux' --jobs 2 --build-jobs 1
+# status=fail pass=2 fail=4 build_only=1, 463 tests per executed target
+```
+
+- `arm-linux` and `x86-linux`: build pass, run pass, 463 tests. These two were
+  `build_failed` before the fix.
+- `wasm32-wasi`: build pass, run `runtime_unavailable` (`missing_wasmtime`).
+- `riscv64-linux`: build fails inside the compiler, not this tree —
+  `LLVM ERROR: Incomplete scavenging after 2nd pass`, `signal ABRT`.
+- `s390x-linux`, `powerpc64-linux`, `aarch64_be-linux`: build pass, 463 tests
+  run, tests fail. The three failing targets are the three big-endian ones, and
+  the divergence is in the byte kernels: expected structural widths
+  `[1, 2, 15, 20, 31, ...]` against found `[4, 15, 27, 42, 46, ...]`, failing
+  the corpus, Stage 2, cursor, and on-demand tests. This is a real
+  little-endian-only defect in this library, now recorded in `AGENTS.md`; it was
+  not fixed here because reworking the word-packing kernels is a project of its
+  own, not a gate change.
+
+Scratch storage, per the Rechenbetriebsgruppe rule of 2026-10-01: `/tmp` and
+`/var/tmp` must never absorb bulk scratch. The gate exports `TMPDIR` as
+`$scratch_dir/<user>/simd-check`, `-Dscratch_dir` defaults to `/vol/tmp`
+(present on every node), and a gate step creates the directory only when the
+gate runs, so a plain `zig build` still touches no shared disk. This matters
+because cross-test keeps a per-target build cache under `TMPDIR` — the reason
+it could fill local `/tmp`. `zig-gate` and `zbc` still write a few hundred bytes
+at their own hardcoded `/tmp` paths; that residue is not redirectable and is
+bounded.
+
+Measured storage on this node (`buildhost`): `/tmp` 9.8G, `/var/tmp` 20G,
+`/home/tmp` 1007G, `/home/tmp2` 12T and nearly empty, `/vol/tmp` and
+`/vol/tmp2` 140T NFS each. Re-verify with `lsblk` and `df -hT` on any node
+before writing large data.
+
+Cache cleanup performed on 2026-10-01: this project's `.zig-cache` symlink
+target `/tmp/zig-cache-simd` went from 41G to empty, the symlink
+and its directory preserved, and `/tmp/zcache-semantic` (105M, this project's
+stale cache from an earlier session the same day) was removed. Not touched: the
+shared Zig global cache at `/tmp/zig-global-cache`, every
+benchmark recording under `zig-out/bench-evidence`, and scratch belonging to
+other sessions and projects in `/tmp`, `/var/tmp`, and `/home/tmp`.
 
 ### Semantic measurement surface (implemented)
 
