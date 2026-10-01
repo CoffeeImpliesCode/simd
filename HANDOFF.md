@@ -411,52 +411,61 @@ Observed exit 1:
 - `--samples 0`: `SampleCountOutOfRange`.
 - `--stream-chunk-size 7`: `UnsupportedChunkSize`.
 - Unknown option: `UnknownFlag`.
+- Recorded archive copy whose manifest status was changed to failed:
+  `ManifestFailedStatus`. Observed on a fresh exclusive copy of
+  `acceptance-closed-chunk256-20261001`; the copy was removed afterwards and the
+  originals were untouched.
 
 Resolved at closure: `/tmp/simd-acceptance.u399fP/old-source-mismatch` was read
 directly and is not found, so “the old-source mismatch created no directory” is
 now an observed filesystem fact rather than an inference from preflight order.
 
-## Remaining authorized work (phases 2–4)
+## Remaining authorized work (phases 3–4)
 
-Acceptance closure is closed. The items below are the rest of the user’s
-`orchestrate: do 1 - 4` request; none of them are done, and none may be called
-done on the strength of the passing gate. The former resume/unblock list,
-including “no commit unless requested”, is retired: focused commits are now
-authorized for phase 2, and no push is authorized.
+Acceptance closure and the focused commits are closed. The items below are the
+rest of the user’s `orchestrate: do 1 - 4` request; none of them are done, and
+none may be called done on the strength of the passing gate. The former
+resume/unblock list, including “no commit unless requested”, is retired:
+focused commits were authorized for phase 2 and have been made. No push is
+authorized.
 
-### Phase 2 — focused Jujutsu commits (next)
+### Phase 2 — focused Jujutsu commits (done)
 
-1. Commit the accepted change set as focused commits, parent-owned. Never
-   fabricate a commit ID, description, or result; never push or rewrite history.
-2. Treat the fixed point hash above as historical provenance and re-inventory
-   actual VCS state before committing.
-3. Preserve unrelated user changes and keep this file’s historical-versus-
-   current evidence boundaries intact.
+Committed as four focused changes, oldest first, with no push and no history
+rewrite:
+
+- `a6968e45` `chore(repo): ignore the shared cache symlink without a trailing slash`
+- `bc2fcab3` `fix(simd): bound lane masks to storage width before scanning`
+- `ce28d524` `feat(bench): record, verify, and reproduce immutable benchmark archives`
+- `0611ae5c` `docs: record acceptance closure evidence and correct shipped-contract claims`
+
+Those IDs were read back from the repository after the split. Phase 3 work is
+uncommitted in the working copy and must not be folded into a phase-2 commit.
 
 ### Phase 3 — CommonMark and extended-YAML semantic measurements
 
-4. Not implemented. Design the measurement profile, oracle, and limits before
+1. Not implemented. Design the measurement profile, oracle, and limits before
    recording anything. The legacy 35-input/210-case domain has no CommonMark or
    extended-YAML rows, and must not be extended by back-filling them.
 
 ### Phase 4 — next consumer-driven API / source-ownership track
 
-5. Not implemented: select and document the next API direction and its source
+2. Not implemented: select and document the next API direction and its source
    lifetime/ownership boundary from actual consumers. Keep the guardrails above
    — logical width never implies raw object-padding observability.
 
 ### Working rules
 
-6. Orchestrate substantial independent slices with one writer per file. Do not
+3. Orchestrate substantial independent slices with one writer per file. Do not
    reuse cancelled writers, allow overlapping ownership, or silently shrink
    scope.
-7. Agents MUST skip all compiler probes, builds, tests, gates, lint, and
+4. Agents MUST skip all compiler probes, builds, tests, gates, lint, and
    formatters; the parent runs gates once after writers finish.
-8. Verify behavioral changes with a real smoke run in addition to the full gate,
+5. Verify behavioral changes with a real smoke run in addition to the full gate,
    preserving the six-root width matrix and all offline examples.
-9. Reproduction after captured-source changes requires a fresh exclusive
+6. Reproduction after captured-source changes requires a fresh exclusive
    recording, never a rewritten old manifest or archive.
-10. Delete nothing further: no other temporary-path cleanup is authorized, and
+7. Delete nothing further: no other temporary-path cleanup is authorized, and
     the retained archives and the `.zig-cache` symlink stay.
 
 ## Worker handoffs (historical, links unavailable)
