@@ -14,9 +14,12 @@ roadmap section as an implemented API.
 - `src/core/simd.zig` holds the vector and byte primitives. `stage1.zig` owns
   structural indexes; `stage2.zig` builds validated tapes and cursors;
   `json_value.zig` holds allocation-free value conversion; `resident.zig` owns
-  the lease and guard state every reusable reader shares; `ondemand.zig` owns
-  the JSON on-demand model; `stream.zig` indexes the JSON family and JSONL
-  incrementally. `src/formats/` contains the format-specific adapters.
+  the lease and guard state the JSONL, Markdown, XML, and YAML readers share;
+  `ondemand.zig` owns the JSON on-demand model and implements the same
+  single-focus rule independently, with its own generation and focus state and
+  its own `FocusLost` error name instead of the shared module; `stream.zig`
+  indexes the JSON family and JSONL incrementally. `src/formats/` contains the
+  format-specific adapters.
 - `-Dvector_len=N` requires `N >= 4`, and `build.zig` rejects a smaller value.
   Width is not limited to 16, 32, or 64: the mask type is
   `Mask(N) = @Int(.unsigned, N)`, which is defined for every width from 4
@@ -66,10 +69,16 @@ cursor lifetimes.
   `TapeRecordIterator` under a document lease; a second `iterate` while one is
   active is `DocumentActive`. Advancing the iterator, deinitializing it, or
   calling `reset` invalidates every prior `TapeRecord` and cursor, and stale
-  use fails with `OutOfOrderIteration` or `DocumentReleased` instead of
-  returning a wrong tape. `TapeRecordOptions` bounds input and tape capacity,
-  and a zero limit grows to the checked `u32` boundary. This API is separate
-  from the eager `JsonlDocument`, which owns every record tape at once.
+  use reports an error instead of returning a wrong tape. `reset` clears the
+  active lease, so stale use after a reset fails with `DocumentReleased`. The
+  second stale error, `OutOfOrderIteration`, comes from the record generation
+  rather than from the lease: advancing the iterator invalidates the previous
+  record while the lease is still held, so a record or cursor kept across an
+  advance fails with `OutOfOrderIteration` (`src/formats/jsonl.zig:288-295`,
+  `346-350`, `364-373`, `632`). `TapeRecordOptions` bounds input and tape
+  capacity, and a zero limit grows to the checked `u32` boundary. This API is
+  separate from the eager `JsonlDocument`, which owns every record tape at
+  once.
 - XML value access is checked. Text, CDATA, and attribute events expose
   `decodedLength(source)`, which takes the source slice and returns the
   required output length, and `decodeInto(options)`, which takes
@@ -139,9 +148,13 @@ step:
 - A visualizer smoke run of the real `simd` executable.
 - `zig fmt --check` over the Zig sources this repository owns:
   `build.zig`, `build.zig.zon`, `src`, `test`, `scripts`, `library_test.zig`,
-  `bench.zig`, `kernel_bench.zig`, and `string_bench.zig`.
+  `bench.zig`, `kernel_bench.zig`, `semantic_bench.zig`, and `string_bench.zig`.
 - The `scripts/benchmark.zig` behavior tests, once, on the host. They are not
   repeated per width.
+- The same `scripts/benchmark.zig` source compiled again in semantic mode with
+  its behavior tests, once, on the host, and the semantic measurement
+  executable and archive runner compiled but never run. Neither is repeated per
+  width, and no gate step launches a semantic measurement.
 - The same test roots at a representative matrix of explicit widths in
   `[4, 5, 7, 12, 16, 24, 32, 64]`: the enforced minimum, several irregular and
   narrow widths that no native CPU selects, and the native widths. A width
@@ -156,7 +169,7 @@ narrow the gate to a hand-picked subset of widths or roots.
 
 `zig build` and `zig build check` are side-effect free with respect to benchmark
 archives: constructing the build graph records nothing and touches no archive.
-Only `zig build benchmark` writes one.
+Only `zig build benchmark` and `zig build benchmark-semantic` write one.
 
 ## Repository layout notes
 
@@ -316,3 +329,98 @@ marker-kind projection, YAML rows are `yaml-basic-1.2.2`, and the resident
 Exact match is the reproducibility claim. A recording's timings are retained
 as observations, not a ranking: nothing here compares against another library,
 declares a winner, or restores the historical packet's results.
+
+## Semantic measurement
+
+`zig build bench-semantic` is a second measurement, not an extension of the
+baseline above. `semantic_bench.zig` is its own root and its own executable,
+with its own two format modules, its own fixture tables, and its own decoder;
+what it shares with `bench.zig` is how one case is reported: the same counting
+allocator, the same awake clock, and the same stdout discipline. The legacy
+work domain is untouched by it: 7 formats x 5 workloads x 6 stages is still
+210 cases over 35 input hashes, and that domain contains no semantic row.
+
+The two parsers under measurement are the pinned CommonMark 0.31.2
+specification and the opt-in `yaml-extended-e2b-1.2.2` profile, and the capture
+names both pinned versions in its headers. Neither exposes a stream indexer.
+
+```sh
+zig build bench-semantic -- [ITERATIONS]
+```
+
+`ITERATIONS` is one optional positional decimal from 1 to 32, default 3. This
+executable has no flags: a token that starts with `-` is refused rather than
+ignored, and a second positional is refused. There is no stream-chunk option
+here and none may be added, because neither measured parser streams, so a
+chunk size would assert a capability the measurement does not have.
+
+`zig build benchmark-semantic` records, verifies, and reproduces that same
+measurement:
+
+```sh
+zig build benchmark-semantic -- record OUT_DIR [--samples N] [--iterations N]
+zig build benchmark-semantic -- verify ARCHIVE_DIR
+zig build benchmark-semantic -- reproduce OLD_ARCHIVE_DIR NEW_ARCHIVE_DIR
+```
+
+Samples and iterations are decimal from 1 to 32 and default to 3. Each of
+`--samples` and `--iterations` may appear once, and no other flag is accepted,
+so the legacy `--stream-chunk-size` is `UnknownFlag` here rather than a no-op.
+That runner is `scripts/benchmark.zig` compiled again with `semantic_mode`
+true; `benchmark_options.semantic_mode` is a build-provided constant, not a
+runtime switch a caller could flip. The semantic compilation declares
+`schema="simd-semantic-benchmark-archive"` at `schema_version` 1 and stores the
+executable it ran at `bench/simd-semantic-bench`, beside the legacy
+`simd-benchmark-archive` and its `bench/simd-bench`. It captures the source of
+its own measurement: `build.zig`, `build.zig.zon`, `semantic_bench.zig`,
+`scripts/benchmark.zig`, `scripts/semantic_contract.zig`,
+`scripts/semantic_benchmark_report.zig`, `scripts/commonmark_bench.zig`,
+`scripts/commonmark_bench_fixtures.zig`, `scripts/yaml_extended_bench.zig`,
+`scripts/yaml_extended_bench_fixtures.zig`, and `src/**/*.zig`. The legacy
+bench and its corpus fixtures are not input to this measurement and are not
+captured under it. An archive is identified by its own schema name, so neither
+measurement's archive verifies as the other's; what the two share is the
+archive layout, the exclusive creation rule, the failed-manifest rule, the
+offline verification, the sampling rules, and the toolchain provenance.
+
+The work domain is the declared fixture list rather than a Cartesian product:
+24 fixtures, 9 CommonMark and 15 YAML extended, each measured on exactly the
+stages it declares, which is 41 cases. CommonMark declares four accepted
+families, one raw HTML family, and four resource families, and an accepted
+fixture measures `parse`, `traverse`, and `render_html`. The YAML profile
+declares seven accepted families, five rejection families, and three resource
+families, and an accepted fixture measures `parse` and `traverse`, because the
+YAML profile has no renderer. A rejection or resource fixture declares exactly
+one stage, and its row records the error name the real call returned. A stage
+a fixture does not declare has no row, and the decoder admits no other row
+order.
+
+Every fixture carries an independently authored expectation, and every one is
+checked against the real parser before any timing and before the first byte of
+stdout. The first disagreement ends the run with `OracleMismatch`; the run
+fails rather than adopting what it observed. The decoder then checks every row
+against its own fixture's oracle again and refuses a contradicting outcome
+with `UnexpectedOutcome`, and a capture whose headers name another CommonMark
+revision or another YAML profile is refused with `ProfileMismatch`.
+
+Each measured iteration is a fresh parse, that stage's named consumption, and
+the destruction of what the parse owned, all inside the timed region. Nothing
+is prebuilt and nothing is retained between iterations. A row's `outcome` is
+what the real call returned, `accepted` or an `@errorName`, never an
+expectation copied into a successful result, and every later iteration of a
+case must repeat the first one's outcome and checksum or the run fails with
+`OutcomeDrift` or `ChecksumDrift`.
+
+Semantic timings are observations from the machine that produced them. The
+capture states `streaming=none` and `ranking=none`, and the decoder refuses
+any other boundary claim with `BoundaryViolation`. Nothing in this surface
+presents a ranking, a speedup, or a comparison against another library.
+
+Semantic archives are immutable evidence under the same rules as the legacy
+ones: `record` creates `OUT_DIR` with an exclusive mkdir and writes every
+archive file exclusively, a failed run still writes `manifest.json` with
+`"status":"failed"` and a reason before exiting 1, and a later edit to any
+captured source makes `reproduce` report `IdentityMismatch` instead of a false
+match. `zig build check` compiles both semantic executables and runs their
+behavior tests without launching a measurement; `bench-semantic` and
+`benchmark-semantic` are the only steps that run them.

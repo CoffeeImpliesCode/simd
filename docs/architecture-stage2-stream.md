@@ -162,10 +162,25 @@ comptime { std.debug.assert(@bitSizeOf(TapeWord) == 64); }
 
 ### JSON-family `Document.root(input)` and `TapeCursor` ownership
 
-A JSON-family Stage 2 `Document` owns only its tape and records its `Dialect`.
-`Document.root(input)` borrows the exact immutable bytes used to build that
-tape. The input and the `Document` must outlive the returned `TapeCursor`. Raw
-string, number, and literal views are zero-copy slices of the borrowed input.
+A JSON-family Stage 2 `Document` owns only its tape and records its `Dialect`
+(`src/core/stage2.zig:66-68`). `Document.root(input)` borrows whatever bytes it
+is handed: the document stores no source, and the accessor performs no source
+identity check — it rejects only an empty tape (`src/core/stage2.zig:74-83`).
+Pairing the exact immutable bytes used to build that tape is a caller
+obligation, not an enforced invariant: a cursor can be paired with a different
+input and nothing reports it. The input and the `Document` must outlive the
+returned `TapeCursor`. Raw string, number, and literal views are zero-copy
+slices of the borrowed input, so a mismatched pairing reads the wrong bytes.
+
+The format-local documents are the enforced cases, and they are the ones that
+compare pointer and length identity against the source recorded at build time:
+`MarkdownDocument.root` returns `InvalidSource`
+(`src/formats/markdown.zig:921-924`), `XmlDocument.root` returns
+`SourceMismatch` (`src/formats/xml.zig:1620-1622`), `YamlDocument.root` returns
+`SourceOutOfBounds` (`src/formats/yaml.zig:177-181`), and the extended
+profile's `Document.ensureSource` returns `SourceOutOfBounds`
+(`src/formats/yaml_extended.zig:128-132`). The reusable JSONL record path
+checks the same record-source identity (`src/formats/jsonl.zig:544-557`).
 
 Container tape slots are append-only, so back-patch targets are stable. On
 open, Stage 2 emits `{kind=open, payload=0}` and records the tape index. On
@@ -853,8 +868,14 @@ therefore still require independent complete input owned by the caller.
    record owns an independent strict JSON tape.
 5. Markdown, XML, and YAML use format-local documents and tapes, not JSON DOMs.
 6. Every on-demand reader consumes complete resident input through parser-owned
-   reusable state under a single-focus lease. Failed peeks are sticky; copied
-   documents cannot claim a second focus on shared state.
+   reusable state under a single-focus lease. The JSON, JSONC, and JSON5
+   readers share `core/ondemand.zig`, which implements the same rule
+   independently with its own `generation`, `document_active`, and `focus`
+   state (`src/core/ondemand.zig:51-53`, `226-230`, `281-285`) and its own
+   `FocusLost` error name (`src/core/ondemand.zig:18`) instead of the shared
+   module. JSONL, Markdown, XML, and YAML do share `resident.Lease` and
+   `resident.Guard` (`src/core/resident.zig:43-93`). Failed peeks are sticky;
+   copied documents cannot claim a second focus on shared state.
 7. Streaming ends at index production; `feedFrom` is only an input adapter and
    does not make Stage 2 or on-demand cursors source-safe.
 8. The `feedFrom` reader and its backing storage are caller-owned for the
@@ -962,7 +983,8 @@ artifact this build compiled, then the repository root, then the operation and
 its arguments. That executable always carries the selected optimize mode,
 target, and vector width, and the runner itself is built for the host even
 under a cross `-Dtarget`. `zig build` and `zig build check` record nothing and
-touch no archive; only `zig build benchmark` writes one.
+touch no archive; only `zig build benchmark` and `zig build benchmark-semantic`
+write one.
 
 **Archive layout and failure semantics.** `record` creates `OUT_DIR` with an
 exclusive mkdir and creates every archive file exclusively, so a recording is
@@ -1082,6 +1104,115 @@ fresh exclusive copy of `acceptance-closed-chunk256-20261001` whose
 about the corrupted copy and about the verifier's status check in
 `scripts/benchmark.zig`; it is not a statement about a recorded archive, and
 the recorded archive itself verifies from its own bytes.
+
+## Semantic measurement: CommonMark 0.31.2 and `yaml-extended-e2b-1.2.2`
+
+This is a second, separately identified measurement, not an extension of the
+baseline above. `semantic_bench.zig` is its own root and its own executable; the
+legacy domain, its CLI, its archive schema, and its recorded stdout are
+unchanged by it, and that domain contains no semantic row. The legacy work
+domain is still 7 formats x 5 workloads x 6 stages, 210 cases over 35 input
+hashes, with no `formats.commonmark` row and no `yaml-extended-e2b-1.2.2` row.
+What the two share is how one case is reported: the same counting allocator,
+the same awake clock, and the same stdout discipline.
+
+**Measured parsers.** Two parsers, and only two: the pinned CommonMark 0.31.2
+specification and the opt-in `yaml-extended-e2b-1.2.2` profile. Each is
+reported under its own format name and neither is folded into the other's rows.
+Neither exposes a stream indexer, so streaming stays outside both. Every
+capture states the two profile versions in its headers, and a capture that
+names another CommonMark revision or another YAML profile is refused with
+`ProfileMismatch` rather than compared.
+
+**Measurement step.** The measurement runs under `zig build bench-semantic`,
+which is the only step that launches it:
+
+```sh
+zig build bench-semantic -- [ITERATIONS]
+```
+
+`ITERATIONS` is one optional positional decimal from 1 to 32, default 3. The
+executable has no flags: a token that starts with `-` is `UnknownArgument`
+rather than a knob to invent or ignore, and a second positional is refused.
+There is no stream-chunk option in this surface and none may be added,
+including on the archive side, because neither measured parser provides a
+stream indexer; a chunk size would be a claim the measurement cannot support.
+`zig build check` compiles this executable and the semantic archive runner and
+runs neither, so the gate never launches a semantic measurement.
+
+**Archive step.** `zig build benchmark-semantic` records, verifies, and
+reproduces the same measurement:
+
+```sh
+zig build benchmark-semantic -- record OUT_DIR [--samples N] [--iterations N]
+zig build benchmark-semantic -- verify ARCHIVE_DIR
+zig build benchmark-semantic -- reproduce OLD_ARCHIVE_DIR NEW_ARCHIVE_DIR
+```
+
+Samples and iterations are decimal integers from 1 to 32 and default to 3.
+Each flag may appear once; an unknown flag, a missing value, an out-of-range
+value, or an extra positional prints usage and exits 1, so the legacy
+`--stream-chunk-size` is `UnknownFlag` here and not a no-op. The runner is the
+same `scripts/benchmark.zig` source compiled again with `semantic_mode` true
+and receives the same argv contract: the runner executable, then the
+`simd-semantic-bench` artifact this build compiled, then the repository root,
+then the operation and its arguments. `benchmark_options.semantic_mode` is a
+build-provided constant, so the semantic run is the same source compiled again
+against semantic options, not a runtime switch a caller could flip.
+
+**Schema and stored bench path.** The semantic compilation declares
+`schema="simd-semantic-benchmark-archive"` at `schema_version` 1 and stores the
+captured executable at `bench/simd-semantic-bench`, beside the legacy
+`simd-benchmark-archive` and its `bench/simd-bench`. An archive is identified
+by its own schema name, so neither measurement's archive verifies as the
+other's. What the two modes share is the archive layout, the exclusive creation
+rule, the failed-manifest rule, the offline verification, the sampling rules,
+and the toolchain provenance. The semantic capture set is the source of this
+measurement: `build.zig`, `build.zig.zon`, `semantic_bench.zig`,
+`scripts/benchmark.zig`, `scripts/semantic_contract.zig`,
+`scripts/semantic_benchmark_report.zig`, `scripts/commonmark_bench.zig`,
+`scripts/commonmark_bench_fixtures.zig`, `scripts/yaml_extended_bench.zig`,
+`scripts/yaml_extended_bench_fixtures.zig`, and `src/**/*.zig`. The legacy
+bench and its corpus fixtures are not input to this measurement and are not
+captured under it, and a legacy archive keeps exactly the list it always had.
+As with every archive, an edit to a captured source changes the identity, so
+`reproduce` from a different tree is refused with `IdentityMismatch` rather
+than matched.
+
+**Work domain.** The declared fixture list, not a Cartesian product: 24
+fixtures, 9 CommonMark and 15 YAML extended, each measured on exactly the
+stages it declares, which is 41 cases. CommonMark declares four accepted
+families, one raw HTML family, and four resource families; an accepted fixture
+measures `parse`, `traverse`, and `render_html`, where `parse` is parse
+consumption only and is small by design rather than a whole-document claim. The
+YAML profile declares seven accepted families, five rejection families, and
+three resource families; an accepted fixture measures `parse` and `traverse`,
+and no YAML fixture declares `render_html` because the profile has no renderer.
+A rejection or resource fixture declares exactly one stage, and its `outcome`
+is the error name the real call returned. A stage a fixture does not declare
+has no row, and the decoder admits no other row order.
+
+**Oracles.** Every fixture carries an independently authored expectation, and
+every one is checked against the real parser before any timing and before the
+first byte of stdout. A mismatch ends the run rather than adopting what was
+observed. The decoder then checks every row against its own fixture's oracle
+again, so an outcome that contradicts the oracle is refused with
+`UnexpectedOutcome`.
+
+**Measured work.** Each measured iteration is a fresh parse, the stage's named
+consumption, and the destruction of what that parse owned, all inside the timed
+region. Nothing is prebuilt and nothing is retained between iterations. The
+`outcome` a row records is what the real call returned, `accepted` or an
+`@errorName`, never an expectation copied into a successful result, and every
+later iteration of a case is required to repeat the first one's outcome and
+checksum or the run fails with `OutcomeDrift` or `ChecksumDrift`.
+
+**Claim boundary.** Timings are observations from the machine that produced
+them. The capture states `streaming=none` and `ranking=none` and the decoder
+refuses any other boundary claim with `BoundaryViolation`. Nothing in this
+surface presents a ranking, a speedup, or a comparison against another
+library, and this measurement has no recorded archive on this checkout to
+report.
 
 ## Future roadmap
 
