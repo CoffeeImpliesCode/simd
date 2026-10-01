@@ -70,6 +70,7 @@
         "library_test.zig",
         "bench.zig",
         "kernel_bench.zig",
+        "semantic_bench.zig",
         "string_bench.zig",
         "scripts",
         "src",

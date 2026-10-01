@@ -28,6 +28,7 @@ const fmt_paths = [_][]const u8{
     "library_test.zig",
     "bench.zig",
     "kernel_bench.zig",
+    "semantic_bench.zig",
     "string_bench.zig",
 };
 
@@ -135,11 +136,17 @@ fn addWidthMatrix(
 /// are complete specifiers: they stay meaningful when `-Dtarget` and the CPU
 /// were left at their native defaults, where a bare query would only say
 /// `native` and a native CPU would leave the feature set unstated.
+///
+/// `semantic_mode` selects which measurement the same runtime speaks, and it
+/// is a build-provided constant rather than an argument. Legacy stays the
+/// default; the semantic run is the same source compiled again against
+/// semantic options, not a runtime switch a caller could flip.
 fn addBenchmarkOptions(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     vector_len: ?usize,
+    semantic_mode: bool,
 ) *std.Build.Step.Options {
     const query = std.Target.Query.fromTarget(&target.result);
     const options = b.addOptions();
@@ -152,7 +159,28 @@ fn addBenchmarkOptions(
     );
     options.addOption([]const u8, "bench_optimize", @tagName(optimize));
     options.addOption(?usize, "bench_vector_len", vector_len);
+    options.addOption(bool, "semantic_mode", semantic_mode);
     return options;
+}
+
+/// Builds the `semantic_contract` module the semantic controller, both format
+/// modules, and the semantic report decoder import by name.
+///
+/// It is created per target rather than once and shared: the controller is
+/// compiled for the selected target while the decoder is exercised by the
+/// host-only archive runtime, and one module carries exactly one target. The
+/// module itself imports nothing but `std`, so it never drags a CPU-dependent
+/// library into either consumer.
+fn addSemanticContract(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path("scripts/semantic_contract.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 }
 
 // Although this function looks imperative, note that its job is to
@@ -222,6 +250,24 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     bench_mod.addOptions("build_options", build_options);
+
+    // The semantic measurement is a second root, not a mode of `bench.zig`:
+    // it compiles the two format modules and the protocol decoder into one
+    // executable and shares only the vocabulary those three agree on.
+    //
+    // It declares no `build_options` of its own. It is a consumer of
+    // `lib_mod`, and `lib_mod` already carries that module, so a root that
+    // both declared its own copy and imported the library handed the same
+    // generated options file to two modules of one compilation. The
+    // compiler rejects that outright, so the width it reports is read from
+    // the library, which resolves it from that one options module.
+    const semantic_bench_mod = b.createModule(.{
+        .root_source_file = b.path("semantic_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    semantic_bench_mod.addImport("simd_lib", lib_mod);
+    semantic_bench_mod.addImport("semantic_contract", addSemanticContract(b, target, optimize));
 
     const kernel_bench_mod = b.createModule(.{
         .root_source_file = b.path("kernel_bench.zig"),
@@ -397,13 +443,23 @@ pub fn build(b: *std.Build) void {
     // selected optimize, target, and `-Dvector_len`. Wiring the graph below
     // records nothing: only running `benchmark` does, so `zig build` and
     // `zig build check` stay free of archive writes.
-    const benchmark_options = addBenchmarkOptions(b, target, optimize, vector_len);
+
+    // One contract module for every host-only consumer. It is declared here
+    // rather than per consumer so the legacy runner, the semantic runner, and
+    // the semantic behavior tests all name the same vocabulary; the controller
+    // gets its own, because it is compiled for the selected target.
+    const host_semantic_contract = addSemanticContract(b, b.graph.host, optimize);
+    const benchmark_options = addBenchmarkOptions(b, target, optimize, vector_len, false);
     const bench_script_mod = b.createModule(.{
         .root_source_file = b.path("scripts/benchmark.zig"),
         .target = b.graph.host,
         .optimize = optimize,
     });
     bench_script_mod.addOptions("benchmark_options", benchmark_options);
+    // The legacy runtime never reads the contract in legacy mode. The import is
+    // declared anyway so one `scripts/benchmark.zig` source can name the shared
+    // vocabulary above its mode branch without a mode-dependent import list.
+    bench_script_mod.addImport("semantic_contract", host_semantic_contract);
 
     const bench_runner_exe = b.addExecutable(.{
         .name = "simd-benchmark",
@@ -426,6 +482,79 @@ pub fn build(b: *std.Build) void {
     const run_bench_script_tests = b.addRunArtifact(bench_script_tests);
     run_bench_script_tests.addArg(default_test_seed);
 
+    const semantic_bench_exe = b.addExecutable(.{
+        .name = "simd-semantic-bench",
+        .root_module = semantic_bench_mod,
+    });
+    const semantic_bench_cmd = b.addRunArtifact(semantic_bench_exe);
+    if (b.args) |args| {
+        semantic_bench_cmd.addArgs(args);
+    }
+
+    // The semantic archive runner is the same `scripts/benchmark.zig` source
+    // compiled again with `semantic_mode` true. The implementation is not
+    // copied and not generalized into a framework: the two compilations share
+    // one file, one command surface, and one build, and the legacy one keeps
+    // its own schema name, its own captured bench path, and its own options.
+    // Like the legacy runner it executes on the host under a cross `-Dtarget`,
+    // and like the legacy runner it records nothing until it is run.
+    const semantic_benchmark_options = addBenchmarkOptions(b, target, optimize, vector_len, true);
+    const semantic_bench_script_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/benchmark.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    semantic_bench_script_mod.addOptions("benchmark_options", semantic_benchmark_options);
+    semantic_bench_script_mod.addImport("semantic_contract", host_semantic_contract);
+
+    const semantic_bench_runner_exe = b.addExecutable(.{
+        .name = "simd-semantic-benchmark",
+        .root_module = semantic_bench_script_mod,
+    });
+
+    // argv: runner, the semantic bench executable this build produced, the
+    // repository root, then the operation and its arguments exactly as typed
+    // after `--`. The captured artifact path differs in semantic mode, so the
+    // executable is named to match what the archive stores.
+    const semantic_bench_runner = b.addRunArtifact(semantic_bench_runner_exe);
+    semantic_bench_runner.addArtifactArg(semantic_bench_exe);
+    semantic_bench_runner.addDirectoryArg(b.path("."));
+    if (b.args) |args| {
+        semantic_bench_runner.addArgs(args);
+    }
+
+    // `scripts/benchmark.zig` compiles twice, so its tests compile twice: the
+    // legacy root above reaches `legacy_tests` and this one reaches
+    // `semantic_tests`, each through the `testing.refAllDecls` inside the file.
+    // Same source, same imports, same host target, one comptime option apart, so
+    // this reuses the module the semantic runner is already built from. The name
+    // differs from the legacy script root and from the `semantic_benchmark_test`
+    // root below, so no two compilations collide in the build graph or in
+    // reported output. Like the legacy root it is a test and not a recording
+    // step: compiling and running it writes no archive.
+    const semantic_bench_script_tests = b.addTest(.{
+        .name = "semantic-benchmark-script",
+        .root_module = semantic_bench_script_mod,
+    });
+    const run_semantic_bench_script_tests = b.addRunArtifact(semantic_bench_script_tests);
+    run_semantic_bench_script_tests.addArg(default_test_seed);
+
+    // The semantic behavior tests are host-only and width-independent: they
+    // exercise the stdout protocol and the declared work domain, never a
+    // parser, so one invocation covers them and they stay out of the matrix.
+    const semantic_bench_test_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/semantic_benchmark_test.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    semantic_bench_test_mod.addImport("semantic_contract", host_semantic_contract);
+    const semantic_bench_tests = b.addTest(.{
+        .name = "semantic-benchmark",
+        .root_module = semantic_bench_test_mod,
+    });
+    const run_semantic_bench_tests = b.addRunArtifact(semantic_bench_tests);
+    run_semantic_bench_tests.addArg(default_test_seed);
+
     const corpus_step = b.step("corpus", "Run offline corpus catalogs");
     corpus_step.dependOn(&run_corpus_tests.step);
     corpus_step.dependOn(&run_commonmark_tests.step);
@@ -445,11 +574,23 @@ pub fn build(b: *std.Build) void {
     const bench_string_step = b.step("bench-string", "Run JSON string token benchmarks");
     bench_string_step.dependOn(&run_string_bench.step);
 
+    const bench_semantic_step = b.step(
+        "bench-semantic",
+        "Run the CommonMark and YAML extended semantic measurement",
+    );
+    bench_semantic_step.dependOn(&semantic_bench_cmd.step);
+
     const benchmark_step = b.step(
         "benchmark",
         "Record, verify, or reproduce native benchmark archives",
     );
     benchmark_step.dependOn(&bench_runner.step);
+
+    const benchmark_semantic_step = b.step(
+        "benchmark-semantic",
+        "Record, verify, or reproduce native semantic benchmark archives",
+    );
+    benchmark_semantic_step.dependOn(&semantic_bench_runner.step);
 
     const benchmark_test_step = b.step(
         "benchmark-test",
@@ -501,7 +642,8 @@ pub fn build(b: *std.Build) void {
     const check_step = b.step(
         "check",
         "Full verification gate: format, install build, native tests, " ++
-            "width matrix, offline corpora, benchmark script tests, " ++
+            "width matrix, offline corpora, benchmark and semantic " ++
+            "benchmark script tests, semantic measurement compile, " ++
             "visualizer smoke",
     );
     check_step.dependOn(b.getInstallStep());
@@ -515,6 +657,25 @@ pub fn build(b: *std.Build) void {
     // The benchmark script is host-only and width-independent: one invocation
     // covers its behavior, so it is not swept across `check_vector_lens`.
     check_step.dependOn(&run_bench_script_tests.step);
+    // The semantic compilation of that same script, wired exactly as the legacy
+    // one is: host target, pinned seed, one invocation, never swept across the
+    // width matrix.
+    check_step.dependOn(&run_semantic_bench_script_tests.step);
+    // The semantic behavior tests are host-only and width-independent for the
+    // same reason, so they are included here exactly once and never swept.
+    check_step.dependOn(&run_semantic_bench_tests.step);
+    // The semantic measurement executable and the semantic archive runner
+    // are compiled here and never run. Their own steps are the only ones
+    // that execute them, so depending on the compile steps puts both module
+    // graphs in the gate without launching a measurement: nothing here runs
+    // a parser, records an archive, or writes a directory, and neither
+    // artifact becomes reachable from `install` or the default step. Both
+    // are built once at the selected target and optimize mode, never swept
+    // across `check_vector_lens`. Without this, a module-graph or wiring
+    // defect in either artifact compiled for the first time when someone
+    // asked for a measurement instead of failing the gate.
+    check_step.dependOn(&semantic_bench_exe.step);
+    check_step.dependOn(&semantic_bench_runner_exe.step);
     check_step.dependOn(&visualizer_smoke.step);
     addWidthMatrix(b, check_step, target, optimize, vector_len);
 }
