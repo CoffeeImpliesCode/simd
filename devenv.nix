@@ -4,9 +4,9 @@ let
   zig = pkgs.zig_0_16;
 in
 rec {
-  # build.zig.zon has no external dependencies, so the environment needs
-  # nothing beyond the toolchain. Assert the version so the environment can
-  # never drift away from .minimum_zig_version in build.zig.zon.
+  # The library has no package dependencies. Pin its compiler here; the
+  # external gate tools (zig-gate, zbc, zwanzig, cross-test) come from PATH.
+  # Keep the compiler aligned with build.zig.zon's minimum_zig_version.
   packages = [
     (assert zig.version == "0.16.0"; zig)
   ];

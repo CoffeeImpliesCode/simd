@@ -32,6 +32,48 @@ const fmt_paths = [_][]const u8{
     "string_bench.zig",
 };
 
+/// Default root for scratch that gate subprocesses write.
+///
+/// `/tmp` and `/var/tmp` are small local disks on the compute nodes and must not
+/// absorb bulk scratch; `/vol/tmp` is the sanctioned root present on every node.
+/// `-Dscratch_dir` overrides the root, not the per-user subdirectory below it.
+const gate_scratch_root = "/vol/tmp";
+
+/// Absolute scratch directory handed to gate subprocesses as `TMPDIR`.
+///
+/// The per-user and per-project components keep concurrent checkouts on shared
+/// storage from colliding. The directory is created by a gate step rather than
+/// at configure time, so an ordinary `zig build` still touches no shared disk.
+fn gateScratchDir(b: *std.Build, scratch_root: []const u8) []const u8 {
+    const user = b.graph.environ_map.get("USER") orelse "shared";
+    return b.pathJoin(&.{ scratch_root, user, "simd-check" });
+}
+
+/// The analyzers accept files, not the format check's mixed file/directory list.
+/// Walk only owned source directories; never enter caches or evidence archives.
+fn addAnalysisSources(b: *std.Build, zbc: *std.Build.Step.Run, zwanzig: *std.Build.Step.Run) void {
+    for (fmt_paths) |path| {
+        if (std.mem.endsWith(u8, path, ".zon")) continue;
+        if (std.mem.endsWith(u8, path, ".zig")) {
+            zbc.addFileArg(b.path(path));
+            zwanzig.addFileArg(b.path(path));
+            continue;
+        }
+
+        const dir = b.build_root.handle.openDir(b.graph.io, path, .{ .iterate = true }) catch
+            @panic("unable to open analysis source directory");
+        defer dir.close(b.graph.io);
+        var walker = dir.walk(b.allocator) catch @panic("OOM");
+        defer walker.deinit();
+        while (walker.next(b.graph.io) catch @panic("unable to walk analysis sources")) |entry| {
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".zig")) continue;
+            const source = b.path(b.pathJoin(&.{ path, entry.path }));
+            zbc.addFileArg(source);
+            zwanzig.addFileArg(source);
+        }
+    }
+}
+
 /// One test entry point of this repository.
 const TestRoot = struct {
     /// Label used for the artifact and run step names.
@@ -639,12 +681,38 @@ pub fn build(b: *std.Build) void {
     visualizer_smoke.addCheck(.{ .expect_term = .{ .exited = 0 } });
     visualizer_smoke.addCheck(.{ .expect_stdout_match = "SIMD Vector Visualizer" });
 
+    // External checks are required, uncached commands. Keep zbc separate from
+    // zig-gate's advisory invocation so its nonzero exit always fails check.
+    // Their scratch goes to the sanctioned root: the analyzers keep multi-
+    // hundred-megabyte build caches per target, and /tmp cannot hold them.
+    const scratch_root = b.option(
+        []const u8,
+        "scratch_dir",
+        "Root directory for gate scratch files",
+    ) orelse gate_scratch_root;
+    const scratch_dir = gateScratchDir(b, scratch_root);
+    const scratch_make = b.addSystemCommand(&.{ "mkdir", "-p", scratch_dir });
+
+    const zig_gate = b.addSystemCommand(&.{ "zig-gate", "--no-zbc" });
+    const zbc = b.addSystemCommand(&.{ "zbc", "--no-color" });
+    const zwanzig = b.addSystemCommand(&.{ "zwanzig", "--threads", "2" });
+    const cross_test = b.addSystemCommand(&.{ "cross-test", "--jobs", "2", "--build-jobs", "1" });
+    for ([_]*std.Build.Step.Run{ zig_gate, zbc, zwanzig, cross_test }) |command| {
+        command.setCwd(b.path("."));
+        command.has_side_effects = true;
+        command.step.dependOn(&scratch_make.step);
+        command.setEnvironmentVariable("TMPDIR", scratch_dir);
+    }
+    addAnalysisSources(b, zbc, zwanzig);
+    // Use the compiler that owns this build, not a different PATH selection.
+    cross_test.setEnvironmentVariable("ZIG", b.graph.zig_exe);
+
     const check_step = b.step(
         "check",
         "Full verification gate: format, install build, native tests, " ++
             "width matrix, offline corpora, benchmark and semantic " ++
             "benchmark script tests, semantic measurement compile, " ++
-            "visualizer smoke",
+            "visualizer smoke, zig-gate, zbc, zwanzig, cross-test",
     );
     check_step.dependOn(b.getInstallStep());
     check_step.dependOn(&fmt_check.step);
@@ -678,4 +746,8 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&semantic_bench_runner_exe.step);
     check_step.dependOn(&visualizer_smoke.step);
     addWidthMatrix(b, check_step, target, optimize, vector_len);
+    check_step.dependOn(&zig_gate.step);
+    check_step.dependOn(&zbc.step);
+    check_step.dependOn(&zwanzig.step);
+    check_step.dependOn(&cross_test.step);
 }

@@ -936,7 +936,7 @@ this suite. The YAML extension regressions run through `zig build test`.
 `zig build check` is the width gate and the single acceptance command. It runs
 `zig fmt --check` over the Zig sources this repository owns (`build.zig`,
 `build.zig.zon`, `src`, `test`, `scripts`, `library_test.zig`, `bench.zig`,
-`kernel_bench.zig`, `string_bench.zig`), the full test roots at the native
+`kernel_bench.zig`, `semantic_bench.zig`, `string_bench.zig`), the full test roots at the native
 width, the offline corpus and CommonMark suites, the `scripts/benchmark.zig`
 behavior tests once on the host, and a visualizer smoke run, then repeats the
 test roots at the explicit widths `[4, 5, 7, 12, 16, 24, 32, 64]`.
@@ -948,6 +948,33 @@ irregular and narrow widths no native CPU selects, and the native widths. A
 green matrix is evidence for the widths it contains, not a proof about widths
 it omits, and `-Dvector_len` is not restricted to the listed set. `AGENTS.md`
 records the same contract.
+
+The same acceptance command also requires `zig-gate --no-zbc`, a separate
+blocking `zbc --no-color`, `zwanzig --threads 2`, and
+`cross-test --jobs 2 --build-jobs 1`. Both analyzers receive every owned
+`.zig` source from the formatter's source scope, not caches or benchmark
+archives. The external commands run uncached once on the host; a missing
+executable or nonzero exit fails acceptance. No analyzer rule is disabled.
+The external tools must already be on `PATH`; the build installs none.
+
+Cross-test uses this build's compiler and the complete version-pinned
+Tier 1/2 target matrix. It invokes `test` rather than `check` for each target,
+avoiding recursive gate execution. Its logs and summary live under
+`zig-out/cross-test/`. Unavailable runners produce explicit `build_only`
+coverage, never a test pass; the default cross-test exit policy permits that
+partial execution coverage. Full execution requires `--require-runners` and
+the corresponding installed runtimes. Earlier native/width gate passes do
+not establish a pass of this expanded acceptance command.
+
+Those external commands write scratch outside the local disks: the gate exports
+`TMPDIR` as `$scratch_dir/<user>/simd-check`, `-Dscratch_dir` defaults to the
+`/vol/tmp` root every node provides, and the directory is created only when the
+gate runs. Cross-test's per-target build cache is what makes `/tmp`
+inappropriate. `zig-gate` and `zbc` additionally write a few hundred bytes at
+their own fixed `/tmp` paths; that residue cannot be redirected and stays
+bounded. The repository's `.zig-cache` is a symlink into `/home/tmp`, so the
+project's own build cache already sits on sanctioned storage. `AGENTS.md`
+records the same storage contract.
 
 ## Local performance baseline: record, verify, reproduce
 
