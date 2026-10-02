@@ -67,6 +67,7 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "cross-test.profile.sh",
         "library_test.zig",
         "bench.zig",
         "kernel_bench.zig",
