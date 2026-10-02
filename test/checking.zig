@@ -430,7 +430,7 @@ fn scalarMatchRangePredicate(
 }
 
 pub fn scalarMaskByte(comptime len: usize, input: []const u8, offset: usize, target: u8) lib.Mask(len) {
-    return scalarMask(len, input, offset, 0, scalarMatchBytePredicate, target, 0, 0, 0);
+    return scalarMask(len, scalarMatchBytePredicate, input, offset, 0, target, 0, 0, 0);
 }
 
 pub fn scalarMaskAny2(
@@ -440,7 +440,7 @@ pub fn scalarMaskAny2(
     c1: u8,
     c2: u8,
 ) lib.Mask(len) {
-    return scalarMask(len, input, offset, 0, scalarMatchAny2Predicate, c1, c2, 0, 0);
+    return scalarMask(len, scalarMatchAny2Predicate, input, offset, 0, c1, c2, 0, 0);
 }
 
 pub fn scalarMaskAny4(
@@ -452,7 +452,7 @@ pub fn scalarMaskAny4(
     c3: u8,
     c4: u8,
 ) lib.Mask(len) {
-    return scalarMask(len, input, offset, 0, scalarMatchAny4Predicate, c1, c2, c3, c4);
+    return scalarMask(len, scalarMatchAny4Predicate, input, offset, 0, c1, c2, c3, c4);
 }
 
 pub fn scalarMaskRange(
@@ -462,29 +462,29 @@ pub fn scalarMaskRange(
     minimum: u8,
     maximum: u8,
 ) lib.Mask(len) {
-    return scalarMask(len, input, offset, 0, scalarMatchRangePredicate, minimum, maximum, 0, 0);
+    return scalarMask(len, scalarMatchRangePredicate, input, offset, 0, minimum, maximum, 0, 0);
 }
 
 fn scalarMask(
     comptime len: usize,
+    comptime matches: fn (u8, u8, u8, u8, u8) bool,
     input: []const u8,
     offset: usize,
     fill: u8,
-    comptime matches: fn (u8, u8, u8, u8, u8) bool,
     first: u8,
     second: u8,
     third: u8,
     fourth: u8,
 ) lib.Mask(len) {
-    const Mask = lib.Mask(len);
-    const Shift = std.math.Log2Int(Mask);
-    const one: Mask = 1;
-    var result: Mask = 0;
+    const mask = lib.Mask(len);
+    const shift = std.math.Log2Int(mask);
+    const one: mask = 1;
+    var result: mask = 0;
     var index: usize = 0;
     while (index < len) : (index += 1) {
         const byte = if (offset + index < input.len) input[offset + index] else fill;
         if (matches(byte, first, second, third, fourth)) {
-            result |= one << @as(Shift, @intCast(index));
+            result |= one << @as(shift, @intCast(index));
         }
     }
     return result;
@@ -497,49 +497,59 @@ fn expectStorageMaskEqual(
     expected: lib.Mask(width),
     actual: lib.Mask(width),
 ) !void {
+    const mask_type = lib.Mask(width);
     try testing.expectEqual(
-        lib.simd.exactMask(lib.Mask(width), expected),
-        lib.simd.exactMask(lib.Mask(width), actual),
+        lib.simd.exactMask(mask_type, expected),
+        lib.simd.exactMask(mask_type, actual),
     );
+}
+
+// Each width instantiates the matchers, the scalar oracles, and the mask
+// normalization for its own vector type, and the matchers are inline. Give
+// every width its own function body: folding all twelve into one caller made
+// those inlined instantiations share the caller's comptime branch budget, and
+// the combined type and target evaluation exceeded the default limit.
+fn expectSimdMatchWidth(comptime width: usize, input: []const u8) !void {
+    var iterator = lib.windows(u8, width, 0, input);
+    var offset: usize = 0;
+    var window_count: usize = 0;
+    const max_windows = if (input.len == 0) 0 else (input.len + width - 1) / width;
+    while (iterator.next()) |vector| {
+        window_count += 1;
+        try testing.expect(window_count <= max_windows);
+        try expectStorageMaskEqual(
+            width,
+            scalarMaskByte(width, input, offset, 'a'),
+            lib.matchByte(width, vector, 'a'),
+        );
+        try expectStorageMaskEqual(
+            width,
+            scalarMaskAny2(width, input, offset, '\\', '"'),
+            lib.matchAny2(width, vector, '\\', '"'),
+        );
+        try expectStorageMaskEqual(
+            width,
+            scalarMaskAny4(width, input, offset, '{', '}', '[', ']'),
+            lib.matchAny4(width, vector, '{', '}', '[', ']'),
+        );
+        try expectStorageMaskEqual(
+            width,
+            scalarMaskRange(width, input, offset, 0x20, 0x7f),
+            lib.matchRange(width, vector, 0x20, 0x7f),
+        );
+        const vector_values: [width]u8 = vector;
+        var lane: usize = 0;
+        while (lane < width) : (lane += 1) {
+            const expected = if (offset + lane < input.len) input[offset + lane] else 0;
+            try testing.expectEqual(expected, vector_values[lane]);
+        }
+        offset += width;
+    }
+    try testing.expectEqual(max_windows, window_count);
 }
 
 pub fn expectSimdMatchWindows(input: []const u8) !void {
     inline for ([_]usize{ 4, 5, 7, 12, 16, 20, 24, 32, 48, 64, 65, 72 }) |width| {
-        var iterator = lib.windows(u8, width, input, 0);
-        var offset: usize = 0;
-        var window_count: usize = 0;
-        const max_windows = if (input.len == 0) 0 else (input.len + width - 1) / width;
-        while (iterator.next()) |vector| {
-            window_count += 1;
-            try testing.expect(window_count <= max_windows);
-            try expectStorageMaskEqual(
-                width,
-                scalarMaskByte(width, input, offset, 'a'),
-                lib.matchByte(width, vector, 'a'),
-            );
-            try expectStorageMaskEqual(
-                width,
-                scalarMaskAny2(width, input, offset, '\\', '"'),
-                lib.matchAny2(width, vector, '\\', '"'),
-            );
-            try expectStorageMaskEqual(
-                width,
-                scalarMaskAny4(width, input, offset, '{', '}', '[', ']'),
-                lib.matchAny4(width, vector, '{', '}', '[', ']'),
-            );
-            try expectStorageMaskEqual(
-                width,
-                scalarMaskRange(width, input, offset, 0x20, 0x7f),
-                lib.matchRange(width, vector, 0x20, 0x7f),
-            );
-            const vector_values: [width]u8 = vector;
-            var lane: usize = 0;
-            while (lane < width) : (lane += 1) {
-                const expected = if (offset + lane < input.len) input[offset + lane] else 0;
-                try testing.expectEqual(expected, vector_values[lane]);
-            }
-            offset += width;
-        }
-        try testing.expectEqual(max_windows, window_count);
+        try expectSimdMatchWidth(width, input);
     }
 }

@@ -46,11 +46,11 @@ const yaml_extended = @import("scripts/yaml_extended_bench.zig");
 
 const Allocator = std.mem.Allocator;
 
-const DEFAULT_ITERATIONS: usize = 3;
+const default_iterations: usize = 3;
 
 /// The measured invocation shape. One optional positional count, nothing else.
 const BenchOptions = struct {
-    iterations: usize = DEFAULT_ITERATIONS,
+    iterations: usize = default_iterations,
 };
 
 /// The declared work domain, in the order the protocol prints it. One
@@ -106,11 +106,11 @@ const CountingAllocator = struct {
     allocation_count: usize = 0,
     allocated_bytes: usize = 0,
 
-    fn allocator(self: *@This()) Allocator {
+    fn allocator(self: *CountingAllocator) Allocator {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    fn reset(self: *@This()) void {
+    fn reset(self: *CountingAllocator) void {
         self.allocation_count = 0;
         self.allocated_bytes = 0;
     }
@@ -128,7 +128,7 @@ const CountingAllocator = struct {
         alignment: std.mem.Alignment,
         return_address: usize,
     ) ?[*]u8 {
-        const self: *@This() = @ptrCast(@alignCast(context));
+        const self: *CountingAllocator = @ptrCast(@alignCast(context));
         const result = self.child.rawAlloc(length, alignment, return_address);
         if (result != null) {
             self.allocation_count +|= 1;
@@ -144,7 +144,7 @@ const CountingAllocator = struct {
         new_length: usize,
         return_address: usize,
     ) bool {
-        const self: *@This() = @ptrCast(@alignCast(context));
+        const self: *CountingAllocator = @ptrCast(@alignCast(context));
         const result = self.child.rawResize(memory, alignment, new_length, return_address);
         if (result and new_length > memory.len) {
             self.allocated_bytes +|= new_length - memory.len;
@@ -159,7 +159,7 @@ const CountingAllocator = struct {
         new_length: usize,
         return_address: usize,
     ) ?[*]u8 {
-        const self: *@This() = @ptrCast(@alignCast(context));
+        const self: *CountingAllocator = @ptrCast(@alignCast(context));
         const result = self.child.rawRemap(memory, alignment, new_length, return_address);
         if (result != null and new_length > memory.len) {
             self.allocated_bytes +|= new_length - memory.len;
@@ -173,7 +173,7 @@ const CountingAllocator = struct {
         alignment: std.mem.Alignment,
         return_address: usize,
     ) void {
-        const self: *@This() = @ptrCast(@alignCast(context));
+        const self: *CountingAllocator = @ptrCast(@alignCast(context));
         self.child.rawFree(memory, alignment, return_address);
     }
 };
@@ -203,8 +203,8 @@ fn elapsedNanoseconds(start: i96, end: i96) !u64 {
 /// measurement, so the run fails instead of publishing a row that the archive
 /// would later refuse as unstable.
 fn runCase(
-    io: std.Io,
     allocator: Allocator,
+    io: std.Io,
     format: contract.Format,
     fixture_index: usize,
     stage: contract.Stage,
@@ -325,8 +325,8 @@ pub fn main(init: std.process.Init) !void {
             );
             for (fixture.stages) |stage| {
                 const sample = try runCase(
-                    init.io,
                     init.gpa,
+                    init.io,
                     segment.format,
                     fixture_index,
                     stage,

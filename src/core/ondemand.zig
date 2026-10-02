@@ -64,13 +64,32 @@ pub const Parser = struct {
         ) catch return error.CapacityOverflow;
 
         const indexes = try allocator.alloc(u32, index_capacity);
-        const empty_view = stage2.IndexView.init(&.{}, &.{}, 0) catch unreachable;
+        // An empty input with no global offsets satisfies every check in
+        // `IndexView.init`: the length bound, the `base_offset + limit` sum, and
+        // the monotonicity loop, which has no elements to inspect. `InitError`
+        // cannot carry `IndexView.Error` without widening this error set, so an
+        // unexpected failure is reported rather than propagated.
+        const empty_view = stage2.IndexView.init(&.{}, &.{}, 0) catch |err| {
+            std.debug.panic(
+                "empty IndexView.init failed: {s}",
+                .{@errorName(err)},
+            );
+        };
+        // `TokenReader.init` only validates the view against its input, and both
+        // are empty with a zero base offset, so `ReaderError` is unreachable
+        // here for the same reason as above.
+        const empty_reader = stage2.TokenReader.init(&.{}, empty_view, .json) catch |err| {
+            std.debug.panic(
+                "empty TokenReader.init failed: {s}",
+                .{@errorName(err)},
+            );
+        };
         return .{
             .allocator = allocator,
             .indexes = indexes,
             .capacity = max_capacity,
             .grow_on_demand = max_capacity == 0,
-            .token_reader = stage2.TokenReader.init(&.{}, empty_view, .json) catch unreachable,
+            .token_reader = empty_reader,
         };
     }
 
@@ -191,6 +210,7 @@ pub const Parser = struct {
             return error.InvalidStructuralIndex;
         }
 
+        if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
         const sentinel: u32 = @intCast(input.len);
         self.indexes[token_count..][0..sentinel_count].* = .{
             sentinel,
@@ -426,7 +446,8 @@ pub const EventReader = struct {
             self.parser.event_cached = try self.parser.token_reader.next();
         }
         const token = self.parser.event_cached orelse return null;
-        return try eventFromToken(token);
+        const value = try eventFromToken(token);
+        return value;
     }
 
     pub fn skip(self: *EventReader) Error!void {
@@ -457,7 +478,7 @@ pub const EventReader = struct {
             self.parser.event_cached = null;
             return token;
         }
-        return self.parser.token_reader.next() catch |err| return err;
+        return self.parser.token_reader.next();
     }
 
     fn advanceEpoch(self: *EventReader) void {
@@ -517,6 +538,7 @@ fn validateIndexes(
         previous = offset;
     }
 
+    if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
     const sentinel: u32 = @intCast(input.len);
     if (indexes[count] != sentinel) return error.InvalidStructuralIndex;
     if (indexes[count + 1] != sentinel) return error.InvalidStructuralIndex;
@@ -669,12 +691,12 @@ test "TokenCursor exposes sentinels and skips one nested child" {
     defer document.deinit();
     var cursor = try document.tokenCursor();
 
-    try testing.expectEqual(@as(u8, '['), (try cursor.advance()).?.byte);
-    try testing.expectEqual(@as(u8, '1'), (try cursor.advance()).?.byte);
-    try testing.expectEqual(@as(u8, ','), (try cursor.advance()).?.byte);
-    try testing.expectEqual(@as(u8, '{'), (try cursor.advance()).?.byte);
+    try testing.expectEqual(@as(u8, '['), ((try cursor.advance()) orelse return error.TestUnexpectedResult).byte);
+    try testing.expectEqual(@as(u8, '1'), ((try cursor.advance()) orelse return error.TestUnexpectedResult).byte);
+    try testing.expectEqual(@as(u8, ','), ((try cursor.advance()) orelse return error.TestUnexpectedResult).byte);
+    try testing.expectEqual(@as(u8, '{'), ((try cursor.advance()) orelse return error.TestUnexpectedResult).byte);
     try cursor.skipChild(1);
-    try testing.expectEqual(@as(u8, ','), (try cursor.peek()).?.byte);
+    try testing.expectEqual(@as(u8, ','), ((try cursor.peek()) orelse return error.TestUnexpectedResult).byte);
 
     while (try cursor.advance()) |_| {}
     try testing.expectEqual(@as(u32, @intCast(input.len)), try cursor.peekIndex(0));
@@ -692,21 +714,21 @@ test "EventReader emits raw JSON events without allocation" {
     defer document.deinit();
     var reader = try document.eventReader();
 
-    try expectEvent(.object_start, (try reader.next()).?);
-    try expectEvent(.{ .key = "text" }, (try reader.next()).?);
-    try expectEvent(.{ .string = "a\\\"b" }, (try reader.peek()).?);
-    try expectEvent(.{ .string = "a\\\"b" }, (try reader.next()).?);
-    try expectEvent(.{ .key = "n" }, (try reader.next()).?);
-    try expectEvent(.{ .number = "-12.5" }, (try reader.next()).?);
-    try expectEvent(.{ .key = "ok" }, (try reader.next()).?);
-    try expectEvent(.{ .bool = true }, (try reader.next()).?);
-    try expectEvent(.{ .key = "none" }, (try reader.next()).?);
-    try expectEvent(.null, (try reader.next()).?);
-    try expectEvent(.{ .key = "a" }, (try reader.next()).?);
-    try expectEvent(.array_start, (try reader.next()).?);
-    try expectEvent(.{ .bool = false }, (try reader.next()).?);
-    try expectEvent(.array_end, (try reader.next()).?);
-    try expectEvent(.object_end, (try reader.next()).?);
+    try expectEvent(.object_start, (try reader.next()) orelse return error.TestUnexpectedResult);
+    try expectEvent(.{ .key = "text" }, (try reader.next()) orelse return error.TestUnexpectedResult);
+    try expectEvent(.{ .string = "a\\\"b" }, (try reader.peek()) orelse return error.TestUnexpectedResult);
+    try expectEvent(.{ .string = "a\\\"b" }, (try reader.next()) orelse return error.TestUnexpectedResult);
+    try expectEvent(.{ .key = "n" }, (try reader.next()) orelse return error.TestUnexpectedResult);
+    try expectEvent(.{ .number = "-12.5" }, (try reader.next()) orelse return error.TestUnexpectedResult);
+    try expectEvent(.{ .key = "ok" }, (try reader.next()) orelse return error.TestUnexpectedResult);
+    try expectEvent(.{ .bool = true }, (try reader.next()) orelse return error.TestUnexpectedResult);
+    try expectEvent(.{ .key = "none" }, (try reader.next()) orelse return error.TestUnexpectedResult);
+    try expectEvent(.null, (try reader.next()) orelse return error.TestUnexpectedResult);
+    try expectEvent(.{ .key = "a" }, (try reader.next()) orelse return error.TestUnexpectedResult);
+    try expectEvent(.array_start, (try reader.next()) orelse return error.TestUnexpectedResult);
+    try expectEvent(.{ .bool = false }, (try reader.next()) orelse return error.TestUnexpectedResult);
+    try expectEvent(.array_end, (try reader.next()) orelse return error.TestUnexpectedResult);
+    try expectEvent(.object_end, (try reader.next()) orelse return error.TestUnexpectedResult);
     try testing.expect((try reader.next()) == null);
 }
 
@@ -721,7 +743,7 @@ test "EventReader keeps failed peek sticky" {
     defer document.deinit();
     var reader = try document.eventReader();
 
-    try expectEvent(.array_start, (try reader.next()).?);
+    try expectEvent(.array_start, (try reader.next()) orelse return error.TestUnexpectedResult);
     try testing.expectError(error.UnexpectedToken, reader.peek());
     try testing.expectError(error.UnexpectedToken, reader.next());
 }
@@ -739,7 +761,7 @@ test "copied Document cannot claim shared event reader" {
 
     var reader = try document.eventReader();
     try testing.expectError(error.FocusAlreadyClaimed, copied.eventReader());
-    try expectEvent(.array_start, (try reader.next()).?);
+    try expectEvent(.array_start, (try reader.next()) orelse return error.TestUnexpectedResult);
 }
 
 test "EventReader rejects trailing commas and malformed numbers" {
@@ -786,7 +808,7 @@ test "EventReader enforces the fixed depth bound" {
     var reader = try document.eventReader();
 
     for (0..max_depth) |_| {
-        try expectEvent(.array_start, (try reader.next()).?);
+        try expectEvent(.array_start, (try reader.next()) orelse return error.TestUnexpectedResult);
     }
     try testing.expectError(error.DepthExceeded, reader.next());
 }
@@ -809,7 +831,7 @@ test "EventReader handles zero-index quoted dialect roots" {
         var reader = try document.eventReader();
 
         const raw = case.input[1 .. case.input.len - 1];
-        const event = (try reader.next()).?;
+        const event = (try reader.next()) orelse return error.TestUnexpectedResult;
         try expectEvent(.{ .string = raw }, event);
         switch (event) {
             .string => |actual| try testing.expect(actual.ptr == raw.ptr),
@@ -850,14 +872,14 @@ test "EventReader completes JSONC comments and JSON5 syntax" {
         defer document.deinit();
         var reader = try document.eventReader();
 
-        try expectEvent(.object_start, (try reader.next()).?);
-        try expectEvent(.{ .key = "a" }, (try reader.next()).?);
+        try expectEvent(.object_start, (try reader.next()) orelse return error.TestUnexpectedResult);
+        try expectEvent(.{ .key = "a" }, (try reader.next()) orelse return error.TestUnexpectedResult);
         if (case.dialect == .jsonc) {
-            try expectEvent(.{ .number = "1" }, (try reader.next()).?);
+            try expectEvent(.{ .number = "1" }, (try reader.next()) orelse return error.TestUnexpectedResult);
         } else {
-            try expectEvent(.{ .string = "x" }, (try reader.next()).?);
+            try expectEvent(.{ .string = "x" }, (try reader.next()) orelse return error.TestUnexpectedResult);
         }
-        try expectEvent(.object_end, (try reader.next()).?);
+        try expectEvent(.object_end, (try reader.next()) orelse return error.TestUnexpectedResult);
         try testing.expect((try reader.next()) == null);
     }
 }
@@ -873,7 +895,7 @@ test "EventReader rejects copies and released documents before source access" {
     var reader = try document.eventReader();
     var copied = reader;
 
-    try expectEvent(.array_start, (try reader.next()).?);
+    try expectEvent(.array_start, (try reader.next()) orelse return error.TestUnexpectedResult);
     try testing.expectError(error.OutOfOrderIteration, copied.next());
 
     document.deinit();

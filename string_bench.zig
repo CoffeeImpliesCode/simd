@@ -17,7 +17,7 @@ fn makeInput(allocator: std.mem.Allocator, case: Case) ![]u8 {
         const start = 1 + index * case.pattern.len;
         @memcpy(input[start..][0..case.pattern.len], case.pattern);
     }
-    input[input.len - 1] = '"';
+    input[body_len + 1] = '"';
     return input;
 }
 

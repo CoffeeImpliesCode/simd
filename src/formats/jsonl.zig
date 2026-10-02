@@ -122,7 +122,7 @@ pub const Parser = struct {
     pub fn init(allocator: std.mem.Allocator, max_capacity: usize) InitError!Parser {
         if (max_capacity > std.math.maxInt(u32)) return error.InputTooLarge;
 
-        var parser = Parser{
+        var parser: Parser = .{
             .allocator = allocator,
             .storage = resident.IndexBuffer(void, false).init(allocator),
             .indexes = &.{},
@@ -259,7 +259,7 @@ pub const TapeRecordParser = struct {
             return error.TapeTooLarge;
         }
 
-        var parser = TapeRecordParser{
+        var parser: TapeRecordParser = .{
             .allocator = allocator,
             .options = options,
             .storage = resident.IndexBuffer(void, false).init(allocator),
@@ -381,7 +381,7 @@ pub const TapeRecordParser = struct {
         lease: resident.Lease,
         generation: u64,
     ) TapeRecordError!TapeRecordResult {
-        var tape_allocator = TapeReuseAllocator{ .parser = self };
+        var tape_allocator: TapeReuseAllocator = .{ .parser = self };
         const document = stage2.buildTapeView(
             tape_allocator.allocator(),
             source,
@@ -428,12 +428,13 @@ pub const TapeRecordParser = struct {
         view: stage2.IndexView,
     ) TapeRecordError!?stage2.Diagnostic {
         // Reader setup only checks the index view; next() reports syntax failures.
-        if (self.reader) |*reader| {
-            reader.reset(source, view, .json) catch |err| return @errorCast(err);
-        } else {
+        var reader = if (self.reader) |*existing| blk: {
+            existing.reset(source, view, .json) catch |err| return @errorCast(err);
+            break :blk existing;
+        } else blk: {
             self.reader = stage2.TokenReader.init(source, view, .json) catch |err| return @errorCast(err);
-        }
-        var reader = &self.reader.?;
+            break :blk &self.reader.?;
+        };
         while (true) {
             const token = reader.next() catch |err| {
                 if (err == error.TapeTooLarge) return error.TapeTooLarge;
@@ -522,7 +523,7 @@ pub const TapeRecord = struct {
     pub fn root(self: *const TapeRecord) TapeRecordError!TapeRecordCursor {
         try self.check();
         const words = self.parser.tape_storage[self.tape_start..self.tape_end];
-        const document = stage2.Document{ .tape = words, .dialect = .json };
+        const document: stage2.Document = .{ .tape = words, .dialect = .json };
         const base_cursor = try document.root(self.source);
         return .{
             .parser = self.parser,
@@ -804,8 +805,8 @@ pub const EventReader = struct {
                 self.document.indexes[range.index_start..range.index_end],
                 @intCast(range.source_start),
             ) catch return error.InvalidStructuralIndex;
-            if (self.reader) |*reader| {
-                try reader.reset(source, view, .json);
+            if (self.reader) |*existing| {
+                try existing.reset(source, view, .json);
             } else {
                 self.reader = try stage2.TokenReader.init(source, view, .json);
             }
@@ -823,7 +824,9 @@ pub const EventReader = struct {
         }
 
         const active = &self.active.?;
-        const reader = &self.reader.?;
+        // `self.active` is only set together with `self.reader`, so reaching
+        // here with a live record means the reader exists too.
+        const reader = if (self.reader) |*value| value else return error.InvalidStructuralIndex;
         const parsed = reader.next() catch |err| {
             self.failure_offset = active.range.source_start + reader.failure_offset;
             self.byte_position = active.range.source_start + reader.byte_position;
@@ -944,8 +947,8 @@ pub const TokenCursor = struct {
                 self.document.indexes[range.index_start..range.index_end],
                 @intCast(range.source_start),
             ) catch return error.InvalidStructuralIndex;
-            if (self.reader) |*reader| {
-                try reader.reset(source, view, .json);
+            if (self.reader) |*existing| {
+                try existing.reset(source, view, .json);
             } else {
                 self.reader = try stage2.TokenReader.init(source, view, .json);
             }
@@ -963,7 +966,9 @@ pub const TokenCursor = struct {
         }
 
         const active = &self.active.?;
-        const reader = &self.reader.?;
+        // `self.active` is only set together with `self.reader`, so reaching
+        // here with a live record means the reader exists too.
+        const reader = if (self.reader) |*value| value else return error.InvalidStructuralIndex;
         const parsed = reader.next() catch |err| {
             self.failure_offset =
                 active.range.source_start + reader.failure_offset;
@@ -1042,11 +1047,11 @@ pub fn buildJsonlTape(
     while (try record_iterator.next()) |record_range| {
         const record_source = input[record_range.source_start..record_range.source_end];
         const base_offset: u32 = @intCast(record_range.source_start);
-        const view = stage2.IndexView.init(
+        const view = try stage2.IndexView.init(
             record_source,
             structural_index.slice()[record_range.index_start..record_range.index_end],
             base_offset,
-        ) catch |err| return err;
+        );
         var document = try stage2.buildTapeView(allocator, record_source, view, .json);
         records.append(allocator, .{
             .source = record_source,
@@ -1081,11 +1086,11 @@ pub fn validateJsonl(
     while (try record_iterator.next()) |record_range| : (record_index += 1) {
         const record_source = input[record_range.source_start..record_range.source_end];
         const base_offset: u32 = @intCast(record_range.source_start);
-        const view = stage2.IndexView.init(
+        const view = try stage2.IndexView.init(
             record_source,
             structural_index.slice()[record_range.index_start..record_range.index_end],
             base_offset,
-        ) catch |err| return err;
+        );
         const diagnostic = try stage2.validateView(record_source, view, .json);
         if (diagnostic) |local| {
             const global_offset = record_range.source_start + @min(
@@ -1137,7 +1142,7 @@ const RecordIterator = struct {
                 if (offset >= self.input.len) continue;
                 if (self.input[offset] != '\n') continue;
 
-                const record = RecordRange{
+                const record: RecordRange = .{
                     .source_start = self.source_start,
                     .source_end = offset,
                     .index_start = self.index_start,
@@ -1156,7 +1161,7 @@ const RecordIterator = struct {
                 return null;
             }
 
-            const record = RecordRange{
+            const record: RecordRange = .{
                 .source_start = self.source_start,
                 .source_end = self.input.len,
                 .index_start = self.index_start,
@@ -1196,16 +1201,16 @@ pub fn indexJsonl(
 /// The returned count excludes sentinels. `out` is unchanged beyond that
 /// prefix. Record-separator LF bytes are emitted only outside quoted strings.
 pub fn indexJsonlInto(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     out: []u32,
     input: []const u8,
 ) !usize {
     if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
 
-    var sink = IndexSink{ .out = out };
+    var sink: IndexSink = .{ .out = out };
     var lexical_state: json_lexical.State = .{};
     try json_lexical.feed(
-        VLEN,
+        vlen,
         .jsonl,
         &lexical_state,
         input,
@@ -1217,7 +1222,7 @@ pub fn indexJsonlInto(
 }
 
 pub fn indexJsonlImpl(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     allocator: std.mem.Allocator,
     input: []const u8,
 ) !stage1.StructuralIndex {
@@ -1225,7 +1230,7 @@ pub fn indexJsonlImpl(
     errdefer indexes.deinit(allocator);
 
     indexes.count = indexJsonlInto(
-        VLEN,
+        vlen,
         indexes.indexes[0 .. indexes.indexes.len - sentinel_count],
         input,
     ) catch |err| switch (err) {
@@ -1345,14 +1350,14 @@ fn expectMatchesScalar(input: []const u8) !void {
 }
 
 fn expectMatchesScalarAtWidth(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     input: []const u8,
 ) !void {
     var expected = try scalarIndexJsonl(testing.allocator, input);
     defer expected.deinit(testing.allocator);
     try expectValidIndexes(input.len, expected.slice());
 
-    var actual = try indexJsonlImpl(VLEN, testing.allocator, input);
+    var actual = try indexJsonlImpl(vlen, testing.allocator, input);
     defer actual.deinit(testing.allocator);
 
     try testing.expectEqualSlices(u32, expected.slice(), actual.slice());
@@ -1751,8 +1756,8 @@ test "buildJsonlTape skips blank and trailing records while retaining CR" {
 
 test "validateJsonl does not split a quoted LF into two records" {
     const input = "{\"text\":\"first\nsecond\"}\n{}\n";
-    const quoted_lf = std.mem.indexOfScalar(u8, input, '\n').?;
-    const diagnostic = (try validateJsonl(testing.allocator, input)).?;
+    const quoted_lf = std.mem.indexOfScalar(u8, input, '\n') orelse return error.ExpectedJsonlByte;
+    const diagnostic = (try validateJsonl(testing.allocator, input)) orelse return error.ExpectedJsonlDiagnostic;
 
     try testing.expectEqual(@as(usize, 0), diagnostic.record_index);
     try testing.expectEqual(@as(usize, 0), diagnostic.source_start);
@@ -1765,8 +1770,8 @@ test "validateJsonl does not split a quoted LF into two records" {
 
 test "validateJsonl reports later record errors in global coordinates" {
     const input = "{}\n  [1,]\n{}\n";
-    const close_bracket = std.mem.indexOfScalar(u8, input, ']').?;
-    const diagnostic = (try validateJsonl(testing.allocator, input)).?;
+    const close_bracket = std.mem.indexOfScalar(u8, input, ']') orelse return error.ExpectedJsonlByte;
+    const diagnostic = (try validateJsonl(testing.allocator, input)) orelse return error.ExpectedJsonlDiagnostic;
 
     try testing.expectEqual(@as(usize, 1), diagnostic.record_index);
     try testing.expectEqual(@as(usize, 3), diagnostic.source_start);
@@ -1789,26 +1794,26 @@ test "JSONL resident events stay lazy with global record spans" {
     defer document.deinit();
     var reader = try document.eventReader();
 
-    const first_start = (try reader.next()).?;
+    const first_start = (try reader.next()) orelse return error.ExpectedJsonlEvent;
     try testing.expectEqual(EventKind.record_start, first_start.kind);
     try testing.expectEqual(@as(u32, 0), first_start.record_index);
     try testing.expectEqual(@as(u32, 0), first_start.offset);
     try testing.expect(first_start.raw.ptr == input.ptr);
 
-    const first_value = (try reader.peek()).?;
+    const first_value = (try reader.peek()) orelse return error.ExpectedJsonlEvent;
     try testing.expectEqual(EventKind.number, first_value.kind);
     try testing.expectEqual(first_value, (try reader.peek()).?);
     try testing.expectEqual(@as(u32, 0), first_value.offset);
     try testing.expect(first_value.raw.ptr == input.ptr);
     try testing.expectEqualStrings("1", first_value.raw);
-    _ = (try reader.next()).?;
+    _ = (try reader.next()) orelse return error.ExpectedJsonlEvent;
 
-    const first_end = (try reader.next()).?;
+    const first_end = (try reader.next()) orelse return error.ExpectedJsonlEvent;
     try testing.expectEqual(EventKind.record_end, first_end.kind);
     try testing.expectEqual(@as(u32, 1), first_end.offset);
     try testing.expectEqual(@as(usize, 0), first_end.raw.len);
 
-    const second_start = (try reader.next()).?;
+    const second_start = (try reader.next()) orelse return error.ExpectedJsonlEvent;
     try testing.expectEqual(EventKind.record_start, second_start.kind);
     try testing.expectEqual(@as(u32, 1), second_start.record_index);
     try testing.expectEqual(@as(u32, 2), second_start.offset);
@@ -1858,22 +1863,22 @@ test "JSONL resident token cursor emits boundaries and skips one record" {
     defer document.deinit();
     var cursor = try document.tokenCursor();
 
-    const first = (try cursor.peek()).?;
+    const first = (try cursor.peek()) orelse return error.ExpectedJsonlEvent;
     try testing.expectEqual(EventKind.record_start, first.kind);
     try testing.expectEqual(first, (try cursor.peek()).?);
     try testing.expectEqual(@as(u32, 0), first.offset);
     try cursor.skipChild();
 
-    const second_start = (try cursor.advance()).?;
+    const second_start = (try cursor.advance()) orelse return error.ExpectedJsonlEvent;
     try testing.expectEqual(EventKind.record_start, second_start.kind);
     try testing.expectEqual(@as(u32, @intCast(input.len - 4)), second_start.offset);
 
-    const second = (try cursor.advance()).?;
+    const second = (try cursor.advance()) orelse return error.ExpectedJsonlEvent;
     try testing.expectEqual(EventKind.null_literal, second.kind);
     try testing.expectEqualStrings("null", second.raw);
     try testing.expectEqual(@as(u32, @intCast(input.len - 4)), second.offset);
 
-    const second_end = (try cursor.advance()).?;
+    const second_end = (try cursor.advance()) orelse return error.ExpectedJsonlEvent;
     try testing.expectEqual(EventKind.record_end, second_end.kind);
     try testing.expectEqual(@as(u32, @intCast(input.len)), second_end.offset);
     try testing.expect((try cursor.advance()) == null);

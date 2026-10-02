@@ -1,6 +1,5 @@
 const std = @import("std");
 const simd = @import("simd.zig");
-const assert = std.debug.assert;
 const testing = std.testing;
 
 pub const Style = struct {
@@ -23,9 +22,9 @@ pub const Style = struct {
     }
 };
 
-pub fn HighlightLayer(comptime VLEN: usize) type {
+pub fn HighlightLayer(comptime vlen: usize) type {
     return struct {
-        mask: simd.Mask(VLEN),
+        mask: simd.Mask(vlen),
         style: Style,
         name: []const u8,
     };
@@ -45,19 +44,19 @@ pub fn printAscii(character: u8, writer: anytype) !void {
 }
 
 pub fn highlightMulti(
-    comptime VLEN: usize,
-    bytes: simd.Vec(VLEN, u8),
-    layers: []const HighlightLayer(VLEN),
+    comptime vlen: usize,
+    bytes: simd.Vec(u8, vlen),
+    layers: []const HighlightLayer(vlen),
     note: []const u8,
     writer: anytype,
 ) !void {
-    const Mask = simd.Mask(VLEN);
-    const Shift = std.math.Log2Int(Mask);
-    const values: [VLEN]u8 = bytes;
+    const mask = simd.Mask(vlen);
+    const shift = std.math.Log2Int(mask);
+    const values: [vlen]u8 = bytes;
 
     for (values, 0..) |character, bit_index| {
-        const bit: Mask = @as(Mask, 1) <<
-            @as(Shift, @intCast(bit_index));
+        const bit: mask = @as(mask, 1) <<
+            @as(shift, @intCast(bit_index));
         var composite: Style = .{};
         var has_style = false;
 
@@ -108,20 +107,20 @@ test "Style default check" {
 test "highlightMulti styles the lanes a mask names" {
     // Exercise a logical width narrower than its target storage while styling
     // exactly the lanes selected by the matcher.
-    const VLEN = 24;
-    var bytes: simd.Vec(VLEN, u8) = @splat('a');
+    const vlen = 24;
+    var bytes: simd.Vec(u8, vlen) = @splat('a');
     bytes[0] = 'b';
     bytes[7] = 'b';
-    bytes[VLEN - 1] = 'b';
-    const layers = [_]HighlightLayer(VLEN){.{
-        .mask = simd.matchByte(VLEN, bytes, 'b'),
+    bytes[vlen - 1] = 'b';
+    const layers = [_]HighlightLayer(vlen){.{
+        .mask = simd.matchByte(vlen, bytes, 'b'),
         .style = .{ .bold = true },
         .name = "b",
     }};
     var output: std.Io.Writer.Allocating = .init(testing.allocator);
     defer output.deinit();
 
-    try highlightMulti(VLEN, bytes, &layers, "b", &output.writer);
+    try highlightMulti(vlen, bytes, &layers, "b", &output.writer);
 
     // Exactly the three named lanes are styled: one style sequence and one
     // reset each.

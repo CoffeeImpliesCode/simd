@@ -16,7 +16,7 @@ fn appendXmlIndexedAttribute(
     index: usize,
 ) !void {
     var number: [20]u8 = undefined;
-    const number_text = std.fmt.bufPrint(&number, "{d}", .{index}) catch unreachable;
+    const number_text = try std.fmt.bufPrint(&number, "{d}", .{index});
     try input.appendSlice(allocator, " a");
     try input.appendSlice(allocator, number_text);
     try input.appendSlice(allocator, "='x'");
@@ -205,7 +205,7 @@ test "XML event decoding rejects forged spans and member slices" {
     const attribute = try cursor.currentAttribute();
 
     const copied_raw = "a='ok'";
-    const copied = xml.XmlAttributeEvent{
+    const copied: xml.XmlAttributeEvent = .{
         .raw = copied_raw,
         .name = copied_raw[0..1],
         .value = copied_raw[3..5],
@@ -267,7 +267,7 @@ test "XML checked tape events reject mutated tape words" {
 
 test "XML decoder validates Unicode references entities characters and UTF-8" {
     const unicode_raw = "&#x1F642;&#128578;&#xD;";
-    const unicode_event = xml.XmlTextEvent{ .raw = unicode_raw, .offset = 0 };
+    const unicode_event: xml.XmlTextEvent = .{ .raw = unicode_raw, .offset = 0 };
     var output: [16]u8 = undefined;
     const count = try unicode_event.decodeInto(.{
         .source = unicode_raw,
@@ -291,12 +291,12 @@ test "XML decoder validates Unicode references entities characters and UTF-8" {
         "&#999999999999999999999999;",
     };
     for (invalid_entities) |raw| {
-        const event = xml.XmlTextEvent{ .raw = raw, .offset = 0 };
+        const event: xml.XmlTextEvent = .{ .raw = raw, .offset = 0 };
         try testing.expectError(error.InvalidEntity, event.decodedLength(raw));
     }
 
     const invalid_character = [_]u8{0};
-    const character_event = xml.XmlTextEvent{
+    const character_event: xml.XmlTextEvent = .{
         .raw = invalid_character[0..],
         .offset = 0,
     };
@@ -306,11 +306,11 @@ test "XML decoder validates Unicode references entities characters and UTF-8" {
     );
 
     const invalid_utf8 = [_]u8{ 0xC0, 0xAF };
-    const utf8_event = xml.XmlTextEvent{ .raw = invalid_utf8[0..], .offset = 0 };
+    const utf8_event: xml.XmlTextEvent = .{ .raw = invalid_utf8[0..], .offset = 0 };
     var invalid_output = [_]u8{0xA5} ** 16;
     const invalid_before = invalid_output;
     const invalid_raw = "&unknown;";
-    const invalid_event = xml.XmlTextEvent{ .raw = invalid_raw, .offset = 0 };
+    const invalid_event: xml.XmlTextEvent = .{ .raw = invalid_raw, .offset = 0 };
     try testing.expectError(
         error.InvalidEntity,
         invalid_event.decodeInto(.{
@@ -362,12 +362,14 @@ test "XML declaration info is checked borrowed metadata" {
     const raw = "<?xml version='1.0' encoding=\"utf-8\" standalone='yes'?>";
     const info = try xml.parseDeclarationInfo(raw);
     try testing.expectEqualStrings("1.0", info.version);
-    try testing.expectEqualStrings("utf-8", info.encoding.?);
-    try testing.expectEqualStrings("yes", info.standalone.?);
+    const encoding = info.encoding orelse return error.TestUnexpectedResult;
+    const standalone = info.standalone orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("utf-8", encoding);
+    try testing.expectEqualStrings("yes", standalone);
     try testing.expect(@intFromPtr(info.version.ptr) >= @intFromPtr(raw.ptr));
     try testing.expect(@intFromPtr(info.version.ptr) + info.version.len <= @intFromPtr(raw.ptr) + raw.len);
-    try testing.expect(@intFromPtr(info.encoding.?.ptr) >= @intFromPtr(raw.ptr));
-    try testing.expect(@intFromPtr(info.standalone.?.ptr) >= @intFromPtr(raw.ptr));
+    try testing.expect(@intFromPtr(encoding.ptr) >= @intFromPtr(raw.ptr));
+    try testing.expect(@intFromPtr(standalone.ptr) >= @intFromPtr(raw.ptr));
 
     const minimal = try xml.parseDeclarationInfo("<?xml version=\"1.0\"?>");
     try testing.expect(minimal.encoding == null);
@@ -379,13 +381,13 @@ test "XML declaration info is checked borrowed metadata" {
     var document = try xml.initOnDemandDocument(&parser, input);
     defer document.deinit();
     var reader = try document.eventReader();
-    const event = (try reader.next()).?;
+    const event = (try reader.next()) orelse return error.TestUnexpectedResult;
     switch (event) {
         .xml_declaration => |declaration| {
             const event_info = try declaration.info(input);
             const union_info = try event.declarationInfo(input);
             try testing.expectEqualStrings("1.0", event_info.version);
-            try testing.expectEqualStrings("utf-8", event_info.encoding.?);
+            try testing.expectEqualStrings("utf-8", event_info.encoding orelse return error.TestUnexpectedResult);
             const version_offset = @intFromPtr(info.version.ptr) - @intFromPtr(raw.ptr);
             try testing.expect(event_info.version.ptr == input.ptr + version_offset);
             try testing.expect(union_info.version.ptr == input.ptr + version_offset);
@@ -433,9 +435,10 @@ test "XML documents expose optional checked declaration metadata" {
     const declared_input = "<?xml version='1.0' standalone=\"no\"?><r/>";
     var declared = try xml.buildXmlTape(testing.allocator, declared_input);
     defer declared.deinit(testing.allocator);
-    const declared_info = (try declared.declarationInfo(declared_input)).?;
+    const declared_info = (try declared.declarationInfo(declared_input)) orelse
+        return error.TestUnexpectedResult;
     try testing.expectEqualStrings("1.0", declared_info.version);
-    try testing.expectEqualStrings("no", declared_info.standalone.?);
+    try testing.expectEqualStrings("no", declared_info.standalone orelse return error.TestUnexpectedResult);
 
     const plain_input = "<r/>";
     var plain = try xml.buildXmlTape(testing.allocator, plain_input);
@@ -464,14 +467,15 @@ test "XmlQName split validates lexical NCNames and borrows input" {
 
     const prefixed_raw = "pre:local";
     const prefixed = try xml.XmlQName.split(prefixed_raw);
-    try testing.expectEqualStrings("pre", prefixed.prefix.?);
+    const prefixed_prefix = prefixed.prefix orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("pre", prefixed_prefix);
     try testing.expectEqualStrings("local", prefixed.local_name);
-    try testing.expect(prefixed.prefix.?.ptr == prefixed_raw.ptr);
+    try testing.expect(prefixed_prefix.ptr == prefixed_raw.ptr);
     try testing.expect(prefixed.local_name.ptr == prefixed_raw.ptr + 4);
 
     const unicode_raw = "\xCF\x80:\xE5\x90\x8D";
     const unicode = try xml.XmlQName.split(unicode_raw);
-    try testing.expectEqualStrings("\xCF\x80", unicode.prefix.?);
+    try testing.expectEqualStrings("\xCF\x80", unicode.prefix orelse return error.TestUnexpectedResult);
     try testing.expectEqualStrings("\xE5\x90\x8D", unicode.local_name);
 
     const invalid = [_][]const u8{

@@ -36,7 +36,11 @@ test "CommonMark 0.31.2 corpus renders every pinned example" {
         };
         defer document.deinit();
 
-        const rendered = commonmark.renderCommonMarkHtml(testing.allocator, &document, .{ .mode = .conformance }) catch |err| {
+        const rendered = commonmark.renderCommonMarkHtml(
+            testing.allocator,
+            &document,
+            .{ .mode = .conformance },
+        ) catch |err| {
             std.debug.print(
                 "CommonMark example {d} ({s}, lines {d}-{d}) render failed: {s}\n",
                 .{ example.example, example.section, example.start_line, example.end_line, @errorName(err) },
@@ -151,7 +155,10 @@ test "CommonMark nested lists preserve indentation and container hierarchy" {
     defer document.deinit();
     const rendered = try commonmark.renderCommonMarkHtml(testing.allocator, &document, .{ .mode = .conformance });
     defer testing.allocator.free(rendered);
-    try testing.expectEqualStrings("<ul>\n<li>foo\n<ul>\n<li>bar\n<ul>\n<li>baz</li>\n</ul>\n</li>\n</ul>\n</li>\n</ul>\n", rendered);
+    try testing.expectEqualStrings(
+        "<ul>\n<li>foo\n<ul>\n<li>bar\n<ul>\n<li>baz</li>\n</ul>\n</li>\n</ul>\n</li>\n</ul>\n",
+        rendered,
+    );
 }
 
 test "CommonMark links reject nested links and preserve delimiter boundaries" {
@@ -170,7 +177,9 @@ test "CommonMark autolinks support URI backslash escapes and percent-encode brac
     const rendered = try commonmark.renderCommonMarkHtml(testing.allocator, &document, .{ .mode = .conformance });
     defer testing.allocator.free(rendered);
     try testing.expectEqualStrings(
-        "<p><a href=\"https://example.com?find=%5C*\">https://example.com?find=\\*</a></p>\n<p>[foo<a href=\"https://example.com/?search=%5D(uri)\">https://example.com/?search=](uri)</a></p>\n",
+        "<p><a href=\"https://example.com?find=%5C*\">https://example.com?find=\\*</a></p>\n" ++
+            "<p>[foo<a href=\"https://example.com/?search=%5D(uri)\">" ++
+            "https://example.com/?search=](uri)</a></p>\n",
         rendered,
     );
 }
@@ -317,7 +326,11 @@ test "CommonMark safe URL checks cover autolinks and browser-stripped controls" 
         const safe = try commonmark.renderCommonMarkHtml(testing.allocator, &document, .{});
         defer testing.allocator.free(safe);
         try testing.expect(std.mem.indexOf(u8, safe, "href=\"\"") != null);
-        const conformance = try commonmark.renderCommonMarkHtml(testing.allocator, &document, .{ .mode = .conformance });
+        const conformance = try commonmark.renderCommonMarkHtml(
+            testing.allocator,
+            &document,
+            .{ .mode = .conformance },
+        );
         defer testing.allocator.free(conformance);
         try testing.expect(std.mem.indexOf(u8, conformance, "href=\"\"") == null);
     }
@@ -404,7 +417,11 @@ test "CommonMark overlong reference candidates remain literal text" {
         try testing.expectEqualStrings(case.expected, rendered);
     }
     const label = "é" ** 999;
-    var document = try commonmark.parseCommonMark(testing.allocator, "[" ++ label ++ "]: /target\n\n[" ++ label ++ "]\n", .{});
+    var document = try commonmark.parseCommonMark(
+        testing.allocator,
+        "[" ++ label ++ "]: /target\n\n[" ++ label ++ "]\n",
+        .{},
+    );
     defer document.deinit();
     const rendered = try commonmark.renderCommonMarkHtml(testing.allocator, &document, .{});
     defer testing.allocator.free(rendered);

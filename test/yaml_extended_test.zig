@@ -66,7 +66,8 @@ fn expectResourceOutcome(
         expected_error,
         yaml.buildYamlTape(testing.allocator, input, limits),
     );
-    const diagnostic = (try yaml.validateYaml(testing.allocator, input, limits)).?;
+    const diagnostic = (try yaml.validateYaml(testing.allocator, input, limits)) orelse
+        return error.ExpectedDiagnostic;
     try testing.expectEqual(expected_error, diagnostic.err);
     try testing.expectEqual(yaml.DiagnosticKind.resource, diagnostic.kind);
 }
@@ -330,7 +331,7 @@ test "literal block diagnostics identify malformed headers and bad content inden
             testing.allocator,
             input,
             yaml.default_limits,
-        )).?;
+        )) orelse return error.ExpectedDiagnostic;
         try testing.expectEqual(error.Invalid, diagnostic.err);
         try testing.expectEqual(yaml.DiagnosticKind.syntax, diagnostic.kind);
         try testing.expectEqual(@as(u32, 1), diagnostic.line);
@@ -342,7 +343,7 @@ test "literal block diagnostics identify malformed headers and bad content inden
         testing.allocator,
         bad_indent,
         yaml.default_limits,
-    )).?;
+    )) orelse return error.ExpectedDiagnostic;
     try testing.expectEqual(error.Invalid, diagnostic.err);
     try testing.expectEqual(yaml.DiagnosticKind.syntax, diagnostic.kind);
     try testing.expectEqual(@as(usize, 21), diagnostic.byte_offset);
@@ -414,7 +415,7 @@ test "quoted scalar diagnostics reject invalid escapes and unterminated multilin
         testing.allocator,
         invalid_escape,
         yaml.default_limits,
-    )).?;
+    )) orelse return error.ExpectedDiagnostic;
     try testing.expectEqual(error.Invalid, invalid_diagnostic.err);
     try testing.expectEqual(yaml.DiagnosticKind.syntax, invalid_diagnostic.kind);
     try testing.expectEqual(@as(usize, 11), invalid_diagnostic.byte_offset);
@@ -424,7 +425,7 @@ test "quoted scalar diagnostics reject invalid escapes and unterminated multilin
         testing.allocator,
         unterminated,
         yaml.default_limits,
-    )).?;
+    )) orelse return error.ExpectedDiagnostic;
     try testing.expectEqual(error.Invalid, unterminated_diagnostic.err);
     try testing.expectEqual(yaml.DiagnosticKind.syntax, unterminated_diagnostic.kind);
     try testing.expectEqual(@as(usize, 7), unterminated_diagnostic.byte_offset);
@@ -545,7 +546,7 @@ test "compact mappings support quoted pairs comments block scalars and sibling i
         testing.allocator,
         malformed,
         yaml.default_limits,
-    )).?;
+    )) orelse return error.ExpectedDiagnostic;
     try testing.expectEqual(error.Invalid, diagnostic.err);
     try testing.expectEqual(@as(usize, 2), diagnostic.byte_offset);
 }
@@ -564,7 +565,7 @@ test "extended profile keeps deferred YAML features unsupported" {
             testing.allocator,
             input,
             yaml.default_limits,
-        )).?;
+        )) orelse return error.ExpectedDiagnostic;
         try testing.expectEqual(error.Unsupported, diagnostic.err);
         try testing.expectEqual(yaml.DiagnosticKind.unsupported, diagnostic.kind);
         try testing.expectError(
@@ -724,12 +725,13 @@ test "borrowed plain keys and values enforce scalar source limits" {
 
 test "basic validation preserves source diagnostics" {
     const input = ": value\n";
-    const expected = (try basic.validateYaml(testing.allocator, input)).?;
+    const expected = (try basic.validateYaml(testing.allocator, input)) orelse
+        return error.ExpectedDiagnostic;
     const actual = (try yaml.validateYaml(
         testing.allocator,
         input,
         yaml.default_limits,
-    )).?;
+    )) orelse return error.ExpectedDiagnostic;
     try testing.expectEqual(@as(yaml.Error, expected.err), actual.err);
     try testing.expectEqual(yaml.DiagnosticKind.syntax, actual.kind);
     try testing.expectEqual(expected.byte_offset, actual.byte_offset);
@@ -773,7 +775,7 @@ test "root collections accept one document end marker" {
         testing.allocator,
         multiple_documents,
         yaml.default_limits,
-    )).?;
+    )) orelse return error.ExpectedDiagnostic;
     try testing.expectEqual(error.Unsupported, diagnostic.err);
     try testing.expectEqual(yaml.DiagnosticKind.unsupported, diagnostic.kind);
     try testing.expectError(
@@ -785,20 +787,23 @@ test "root collections accept one document end marker" {
 test "basic profile keeps source validation and extension opt-in" {
     const block = "k: |\n  a\n";
     try testing.expectError(error.Unsupported, basic.buildYamlTape(testing.allocator, block));
-    const block_diagnostic = (try basic.validateYaml(testing.allocator, block)).?;
+    const block_diagnostic = (try basic.validateYaml(testing.allocator, block)) orelse
+        return error.ExpectedDiagnostic;
     try testing.expectEqual(error.Unsupported, block_diagnostic.err);
     try testing.expectEqual(basic.YamlDiagnosticKind.unsupported, block_diagnostic.kind);
 
     const control = "k: \xc2\x80\n";
     try testing.expectError(error.Invalid, basic.buildYamlTape(testing.allocator, control));
-    const control_diagnostic = (try basic.validateYaml(testing.allocator, control)).?;
+    const control_diagnostic = (try basic.validateYaml(testing.allocator, control)) orelse
+        return error.ExpectedDiagnostic;
     try testing.expectEqual(error.Invalid, control_diagnostic.err);
     try testing.expectEqual(basic.YamlDiagnosticKind.syntax, control_diagnostic.kind);
     try testing.expectEqual(@as(usize, 3), control_diagnostic.byte_offset);
 
     const noncharacter = "k: \xef\xbf\xbe\n";
     try testing.expectError(error.Invalid, basic.buildYamlTape(testing.allocator, noncharacter));
-    const noncharacter_diagnostic = (try basic.validateYaml(testing.allocator, noncharacter)).?;
+    const noncharacter_diagnostic = (try basic.validateYaml(testing.allocator, noncharacter)) orelse
+        return error.ExpectedDiagnostic;
     try testing.expectEqual(error.Invalid, noncharacter_diagnostic.err);
     try testing.expectEqual(basic.YamlDiagnosticKind.syntax, noncharacter_diagnostic.kind);
     try testing.expectEqual(@as(usize, 3), noncharacter_diagnostic.byte_offset);
@@ -844,7 +849,7 @@ test "block auto indentation follows first content line" {
         testing.allocator,
         input,
         yaml.default_limits,
-    )).?;
+    )) orelse return error.ExpectedDiagnostic;
     try testing.expectEqual(error.Invalid, diagnostic.err);
     try testing.expectEqual(yaml.DiagnosticKind.syntax, diagnostic.kind);
     try testing.expectEqual(@as(usize, 13), diagnostic.byte_offset);
@@ -883,7 +888,7 @@ test "extended YAML enforces printable source characters" {
         testing.allocator,
         nul_block,
         yaml.default_limits,
-    )).?;
+    )) orelse return error.ExpectedDiagnostic;
     try testing.expectEqual(error.Invalid, nul_diagnostic.err);
     try testing.expectEqual(yaml.DiagnosticKind.syntax, nul_diagnostic.kind);
     try testing.expectEqual(@as(usize, 7), nul_diagnostic.byte_offset);
@@ -896,7 +901,7 @@ test "extended YAML enforces printable source characters" {
         testing.allocator,
         nul_quoted,
         yaml.default_limits,
-    )).?;
+    )) orelse return error.ExpectedDiagnostic;
     try testing.expectEqual(error.Invalid, quoted_diagnostic.err);
     try testing.expectEqual(yaml.DiagnosticKind.syntax, quoted_diagnostic.kind);
     try testing.expectEqual(@as(usize, 8), quoted_diagnostic.byte_offset);
@@ -909,7 +914,7 @@ test "extended YAML enforces printable source characters" {
         testing.allocator,
         control,
         yaml.default_limits,
-    )).?;
+    )) orelse return error.ExpectedDiagnostic;
     try testing.expectEqual(error.Invalid, control_diagnostic.err);
     try testing.expectEqual(yaml.DiagnosticKind.syntax, control_diagnostic.kind);
     try testing.expectEqual(@as(usize, 7), control_diagnostic.byte_offset);
@@ -920,7 +925,7 @@ test "extended YAML enforces printable source characters" {
         testing.allocator,
         noncharacter,
         yaml.default_limits,
-    )).?;
+    )) orelse return error.ExpectedDiagnostic;
     try testing.expectEqual(error.Invalid, noncharacter_diagnostic.err);
     try testing.expectEqual(yaml.DiagnosticKind.syntax, noncharacter_diagnostic.kind);
     try testing.expectEqual(@as(usize, 7), noncharacter_diagnostic.byte_offset);
@@ -951,7 +956,7 @@ test "multiline quoted scalars enforce continuation line limits" {
         testing.allocator,
         single_two_line,
         .{ .scalar_line_count_max = 1 },
-    )).?;
+    )) orelse return error.ExpectedDiagnostic;
     try testing.expectEqual(@as(usize, 12), single_two_line_diagnostic.byte_offset);
 
     var single_two_line_document = try yaml.buildYamlTape(
@@ -995,7 +1000,7 @@ test "multiline quoted scalars enforce continuation line limits" {
         testing.allocator,
         single_three_line,
         .{ .scalar_line_count_max = 2 },
-    )).?;
+    )) orelse return error.ExpectedDiagnostic;
     try testing.expectEqual(@as(usize, 18), single_three_line_diagnostic.byte_offset);
 
     const double_two_line = "value: \"one\n  two\"\n";
@@ -1008,7 +1013,7 @@ test "multiline quoted scalars enforce continuation line limits" {
         testing.allocator,
         double_two_line,
         .{ .scalar_line_count_max = 1 },
-    )).?;
+    )) orelse return error.ExpectedDiagnostic;
     try testing.expectEqual(@as(usize, 12), double_two_line_diagnostic.byte_offset);
 
     var double_two_line_document = try yaml.buildYamlTape(
@@ -1052,7 +1057,7 @@ test "multiline quoted scalars enforce continuation line limits" {
         testing.allocator,
         double_three_line,
         .{ .scalar_line_count_max = 2 },
-    )).?;
+    )) orelse return error.ExpectedDiagnostic;
     try testing.expectEqual(@as(usize, 18), double_three_line_diagnostic.byte_offset);
 
     const escaped_two_line = "value: \"one\\\n  two\"\n";
@@ -1065,7 +1070,7 @@ test "multiline quoted scalars enforce continuation line limits" {
         testing.allocator,
         escaped_two_line,
         .{ .scalar_line_count_max = 1 },
-    )).?;
+    )) orelse return error.ExpectedDiagnostic;
     try testing.expectEqual(@as(usize, 13), escaped_two_line_diagnostic.byte_offset);
 
     var escaped_two_line_document = try yaml.buildYamlTape(
@@ -1109,7 +1114,7 @@ test "multiline quoted scalars enforce continuation line limits" {
         testing.allocator,
         escaped_three_line,
         .{ .scalar_line_count_max = 2 },
-    )).?;
+    )) orelse return error.ExpectedDiagnostic;
     try testing.expectEqual(@as(usize, 20), escaped_three_line_diagnostic.byte_offset);
 }
 
@@ -1183,7 +1188,7 @@ test "extended YAML checks all configured resource limits before growth" {
         testing.allocator,
         "value: |\n  long\n",
         .{ .cooked_bytes_max = 3 },
-    )).?;
+    )) orelse return error.ExpectedDiagnostic;
     try testing.expectEqual(error.CookedBytesExceeded, diagnostic.err);
     try testing.expectEqual(yaml.DiagnosticKind.resource, diagnostic.kind);
     try testing.expectEqual(@as(usize, 7), diagnostic.byte_offset);
@@ -1257,7 +1262,7 @@ test "extended YAML allocation failures clean all document-owned storage" {
 }
 
 test "extended YAML rejects depth budgets beyond supported parser storage" {
-    const limits = yaml.Limits{ .depth_max = basic.yaml_max_depth + 1 };
+    const limits: yaml.Limits = .{ .depth_max = basic.yaml_max_depth + 1 };
     try testing.expectError(error.InvalidLimits, yaml.buildYamlTape(testing.allocator, "k: v\n", limits));
     try testing.expectError(error.InvalidLimits, yaml.validateYaml(testing.allocator, "k: v\n", limits));
 }
@@ -1283,7 +1288,8 @@ test "empty block scalar chomping removes automatic indentation" {
 test "automatic block indentation rejects overindented leading blank lines" {
     for ([_][]const u8{ "k: |\n    \n  a\n", "k: >\n    \n  a\n" }) |input| {
         try testing.expectError(error.Invalid, yaml.buildYamlTape(testing.allocator, input, .{}));
-        const diagnostic = (try yaml.validateYaml(testing.allocator, input, .{})).?;
+        const diagnostic = (try yaml.validateYaml(testing.allocator, input, .{})) orelse
+            return error.ExpectedDiagnostic;
         try testing.expectEqual(error.Invalid, diagnostic.err);
         try testing.expectEqual(@as(usize, 12), diagnostic.byte_offset);
     }

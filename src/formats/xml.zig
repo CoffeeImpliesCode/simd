@@ -68,7 +68,7 @@ const XmlLexicalSink = struct {
     result: *XmlStructuralIndex,
 
     fn appendToken(
-        self: *@This(),
+        self: *XmlLexicalSink,
         index: usize,
         kind: XmlTokenKind,
     ) error{CapacityExceeded}!void {
@@ -88,7 +88,7 @@ const XmlStreamSink = struct {
     owner: *XmlStreamIndexer,
 
     fn appendToken(
-        self: *@This(),
+        self: *XmlStreamSink,
         index: usize,
         kind: XmlTokenKind,
     ) error{CapacityExceeded}!void {
@@ -96,8 +96,8 @@ const XmlStreamSink = struct {
     }
 };
 
-fn xmlValidMask(comptime VLEN: usize, valid_count: usize) simd.Mask(VLEN) {
-    return simd.validMask(VLEN, valid_count);
+fn xmlValidMask(comptime vlen: usize, valid_count: usize) simd.Mask(vlen) {
+    return simd.validMask(vlen, valid_count);
 }
 
 fn xmlPreviousByte(
@@ -155,24 +155,25 @@ fn xmlRememberOpaqueTail(
     input: []const u8,
     mode: XmlLexicalMode,
 ) void {
-    if (input.len == 0) return;
+    const len = input.len;
+    if (len == 0) return;
     switch (mode) {
         .comment => {
-            if (input.len == 1) {
+            if (len == 1) {
                 state.comment_previous_previous = state.comment_previous;
                 state.comment_previous = input[0];
             } else {
-                state.comment_previous_previous = input[input.len - 2];
-                state.comment_previous = input[input.len - 1];
+                state.comment_previous_previous = input[len - 2];
+                state.comment_previous = input[len - 1];
             }
         },
         .cdata => {
-            if (input.len == 1) {
+            if (len == 1) {
                 state.cdata_previous_previous = state.cdata_previous;
                 state.cdata_previous = input[0];
             } else {
-                state.cdata_previous_previous = input[input.len - 2];
-                state.cdata_previous = input[input.len - 1];
+                state.cdata_previous_previous = input[len - 2];
+                state.cdata_previous = input[len - 1];
             }
         },
         else => {},
@@ -323,28 +324,28 @@ fn xmlProcessOpener(
 }
 
 fn xmlMaskForState(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     state: *const XmlLexicalState,
-    vector: simd.Vec(VLEN, u8),
-) simd.Mask(VLEN) {
+    vector: simd.Vec(u8, vlen),
+) simd.Mask(vlen) {
     return switch (state.mode) {
-        .outside => simd.matchByte(VLEN, vector, '<'),
-        .tag => simd.matchAny4(VLEN, vector, '=', '"', '\'', '>') |
-            simd.matchByte(VLEN, vector, '<'),
-        .attribute_quote => simd.matchByte(VLEN, vector, state.attribute_quote),
-        .comment, .cdata => simd.matchByte(VLEN, vector, '>'),
+        .outside => simd.matchByte(vlen, vector, '<'),
+        .tag => simd.matchAny4(vlen, vector, '=', '"', '\'', '>') |
+            simd.matchByte(vlen, vector, '<'),
+        .attribute_quote => simd.matchByte(vlen, vector, state.attribute_quote),
+        .comment, .cdata => simd.matchByte(vlen, vector, '>'),
         .opener => 0,
     };
 }
 
 fn scanXmlLexical(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     state: *XmlLexicalState,
     input: []const u8,
     base_offset: usize,
     sink: anytype,
 ) !void {
-    const Mask = simd.Mask(VLEN);
+    const mask_type = simd.Mask(vlen);
     var cursor: usize = 0;
     while (cursor < input.len) {
         if (state.mode == .opener) {
@@ -354,22 +355,22 @@ fn scanXmlLexical(
         }
 
         const block_start = cursor;
-        const block_end = @min(cursor + VLEN, input.len);
+        const block_end = @min(cursor + vlen, input.len);
         const valid_count = block_end - cursor;
-        const vector: simd.Vec(VLEN, u8) = if (valid_count == VLEN)
-            input[cursor..][0..VLEN].*
+        const vector: simd.Vec(u8, vlen) = if (valid_count == vlen)
+            input[cursor..][0..vlen].*
         else blk: {
-            var tail: [VLEN]u8 = @splat(0);
+            var tail: [vlen]u8 = @splat(0);
             @memcpy(tail[0..valid_count], input[cursor..block_end]);
             break :blk tail;
         };
         // A mode transition invalidates the remaining candidates, so the suffix
         // is rescanned with a freshly selected mask.
-        const mask: Mask = xmlMaskForState(VLEN, state, vector) &
-            xmlValidMask(VLEN, valid_count);
-        var candidate_indexes: [VLEN]u32 = undefined;
+        const mask: mask_type = xmlMaskForState(vlen, state, vector) &
+            xmlValidMask(vlen, valid_count);
+        var candidate_indexes: [vlen]u32 = undefined;
         const candidate_count = try simd.extractBitIndexesChecked(
-            Mask,
+            mask_type,
             mask,
             base_offset + cursor,
             &candidate_indexes,
@@ -492,7 +493,7 @@ pub const XmlStreamIndexer = struct {
     lexical: XmlLexicalState = .{},
     finished: bool = false,
 
-    const Self = @This();
+    const Self = XmlStreamIndexer;
     const initial_output_capacity: usize = 1;
 
     pub const InitError = stage1.StructuralIndex.InitError;
@@ -510,7 +511,7 @@ pub const XmlStreamIndexer = struct {
     pub const FeedFromError = FeedError || FinishError || std.Io.Reader.ShortError;
 
     /// Allocates structural storage with `chunk_len` as its initial capacity.
-    pub fn init(allocator: std.mem.Allocator, chunk_len: usize) InitError!Self {
+    pub fn init(allocator: std.mem.Allocator, chunk_len: usize) InitError!XmlStreamIndexer {
         const output_capacity = @max(chunk_len, initial_output_capacity);
         var index = try stage1.StructuralIndex.init(allocator, output_capacity);
         errdefer index.deinit(allocator);
@@ -543,7 +544,7 @@ pub const XmlStreamIndexer = struct {
         try self.ensureOutputCapacity(additional);
         const base_offset = self.input_len;
         self.input_len = new_input_len;
-        var sink = XmlStreamSink{ .owner = self };
+        var sink: XmlStreamSink = .{ .owner = self };
         try scanXmlLexical(simd.default_vector_len, &self.lexical, data, base_offset, &sink);
     }
 
@@ -569,7 +570,7 @@ pub const XmlStreamIndexer = struct {
         if (self.finished) return;
         const deferred_opener = if (self.lexical.mode == .opener) @as(usize, 1) else 0;
         try self.ensureOutputCapacity(deferred_opener);
-        var sink = XmlStreamSink{ .owner = self };
+        var sink: XmlStreamSink = .{ .owner = self };
         try finishXmlLexical(&self.lexical, &sink);
         if (self.index) |*index| {
             try index.finish(self.input_len);
@@ -608,18 +609,21 @@ pub const XmlStreamIndexer = struct {
         index: usize,
         kind: XmlTokenKind,
     ) error{CapacityExceeded}!void {
-        const structural_index = self.index orelse return error.CapacityExceeded;
+        const structural_index = if (self.index) |*stored| stored else return error.CapacityExceeded;
         const kinds = self.kinds orelse return error.CapacityExceeded;
         if (structural_index.count >= structural_index.indexes.len - 3) {
             return error.CapacityExceeded;
         }
         if (structural_index.count >= kinds.len) return error.CapacityExceeded;
-        self.index.?.indexes[structural_index.count] = @intCast(index);
-        self.kinds.?[structural_index.count] = kind;
-        self.index.?.count += 1;
+        structural_index.indexes[structural_index.count] = @intCast(index);
+        kinds[structural_index.count] = kind;
+        structural_index.count += 1;
     }
 
-    fn ensureOutputCapacity(self: *Self, additional: usize) (std.mem.Allocator.Error || error{ CapacityOverflow, InputTooLarge })!void {
+    fn ensureOutputCapacity(
+        self: *Self,
+        additional: usize,
+    ) (std.mem.Allocator.Error || error{ CapacityOverflow, InputTooLarge })!void {
         if (self.index == null) {
             const output_capacity = @max(additional, initial_output_capacity);
             var index = try stage1.StructuralIndex.init(
@@ -661,7 +665,7 @@ pub fn indexXml(
 }
 
 pub fn indexXmlImpl(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     allocator: std.mem.Allocator,
     input: []const u8,
 ) !XmlStructuralIndex {
@@ -671,14 +675,14 @@ pub fn indexXmlImpl(
     const kinds = try allocator.alloc(XmlTokenKind, input.len);
     errdefer allocator.free(kinds);
 
-    var result = XmlStructuralIndex{
+    var result: XmlStructuralIndex = .{
         .indexes = structural_indexes.indexes,
         .kinds = kinds,
         .count = 0,
     };
     var state: XmlLexicalState = .{};
-    var sink = XmlLexicalSink{ .result = &result };
-    scanXmlLexical(VLEN, &state, input, 0, &sink) catch |err| switch (err) {
+    var sink: XmlLexicalSink = .{ .result = &result };
+    scanXmlLexical(vlen, &state, input, 0, &sink) catch |err| switch (err) {
         error.CapacityExceeded => unreachable,
         error.InputTooLarge => return error.InputTooLarge,
     };
@@ -704,9 +708,7 @@ fn isCommentTerminatorAt(
     if (input_index < comment_start_offset) return false;
     if (input_index - comment_start_offset < 6) return false;
     if (input[input_index] != '>') return false;
-    if (input[input_index - 2] != '-') return false;
-    if (input[input_index - 1] != '-') return false;
-    return true;
+    return std.mem.eql(u8, input[input_index - 2 .. input_index + 1], "-->");
 }
 
 fn scalarIndexXml(allocator: std.mem.Allocator, input: []const u8) !XmlStructuralIndex {
@@ -831,10 +833,10 @@ fn expectIndexInvariants(index: *const XmlStructuralIndex, input_len: usize) !vo
     }
 }
 
-fn expectMatchesScalarAtWidth(comptime VLEN: usize, input: []const u8) !void {
+fn expectMatchesScalarAtWidth(comptime vlen: usize, input: []const u8) !void {
     var expected = try scalarIndexXml(testing.allocator, input);
     defer expected.deinit(testing.allocator);
-    var actual = try indexXmlImpl(VLEN, testing.allocator, input);
+    var actual = try indexXmlImpl(vlen, testing.allocator, input);
     defer actual.deinit(testing.allocator);
 
     try testing.expectEqual(expected.count, actual.count);
@@ -853,8 +855,8 @@ fn expectMatchesScalarAtWidth(comptime VLEN: usize, input: []const u8) !void {
 }
 
 fn expectMatchesScalar(input: []const u8) !void {
-    inline for (.{ 4, 5, 7, 16, 32, 64 }) |VLEN| {
-        try expectMatchesScalarAtWidth(VLEN, input);
+    inline for (.{ 4, 5, 7, 16, 32, 64 }) |vlen| {
+        try expectMatchesScalarAtWidth(vlen, input);
     }
 }
 
@@ -947,27 +949,27 @@ fn expectStreamMatchesDocuments(documents: []const []const u8) !void {
 }
 
 fn expectFragmentAnchorAtVectorBoundaries(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     fragment: []const u8,
     anchor_in_fragment: usize,
 ) !void {
-    const boundary_offsets = [_]usize{ VLEN - 2, VLEN - 1, VLEN, VLEN + 1 };
+    const boundary_offsets = [_]usize{ vlen - 2, vlen - 1, vlen, vlen + 1 };
     std.debug.assert(anchor_in_fragment < fragment.len);
 
     for (boundary_offsets) |boundary_offset| {
         // Keep an anchor near the fragment's end at a block-relative boundary
         // even when the first boundary is before the anchor in the fragment.
         const preceding_block_count = if (boundary_offset < anchor_in_fragment)
-            (anchor_in_fragment - boundary_offset + VLEN - 1) / VLEN
+            (anchor_in_fragment - boundary_offset + vlen - 1) / vlen
         else
             0;
-        const anchor_offset = boundary_offset + preceding_block_count * VLEN;
+        const anchor_offset = boundary_offset + preceding_block_count * vlen;
         const fragment_offset = anchor_offset - anchor_in_fragment;
         std.debug.assert(anchor_offset >= anchor_in_fragment);
         var input: [160]u8 = @splat('x');
         std.debug.assert(fragment_offset + fragment.len <= input.len);
         @memcpy(input[fragment_offset..][0..fragment.len], fragment);
-        try expectMatchesScalarAtWidth(VLEN, &input);
+        try expectMatchesScalarAtWidth(vlen, &input);
     }
 }
 
@@ -1244,35 +1246,35 @@ test "XML stream finish flushes pending state and reset starts at zero" {
 
 test "indexXml matches scalar oracle at every vector width boundary" {
     // Each XML construct crosses offsets adjacent to 16-, 32-, and 64-byte windows.
-    inline for (.{ 16, 32, 64 }) |VLEN| {
+    inline for (.{ 16, 32, 64 }) |vlen| {
         const comment = "<!-- <foo a='x'> -->";
-        try expectFragmentAnchorAtVectorBoundaries(VLEN, comment, 0);
-        try expectFragmentAnchorAtVectorBoundaries(VLEN, comment, comment.len - 3);
+        try expectFragmentAnchorAtVectorBoundaries(vlen, comment, 0);
+        try expectFragmentAnchorAtVectorBoundaries(vlen, comment, comment.len - 3);
 
         const malformed_comment = "<!--><fake/>";
-        for ([_]usize{ VLEN - 2, VLEN - 1, VLEN, VLEN + 1 }) |comment_offset| {
+        for ([_]usize{ vlen - 2, vlen - 1, vlen, vlen + 1 }) |comment_offset| {
             var input: [160]u8 = @splat('x');
             @memcpy(input[comment_offset..][0..malformed_comment.len], malformed_comment);
-            try expectMatchesScalarAtWidth(VLEN, &input);
+            try expectMatchesScalarAtWidth(vlen, &input);
         }
 
         const cdata = "<![CDATA[ <not-a-tag> ]]>";
-        try expectFragmentAnchorAtVectorBoundaries(VLEN, cdata, 0);
-        try expectFragmentAnchorAtVectorBoundaries(VLEN, cdata, cdata.len - 3);
+        try expectFragmentAnchorAtVectorBoundaries(vlen, cdata, 0);
+        try expectFragmentAnchorAtVectorBoundaries(vlen, cdata, cdata.len - 3);
 
         const attributes = "<tag first = 'one' second=\"two\"   />";
-        try expectFragmentAnchorAtVectorBoundaries(VLEN, attributes, 11);
-        try expectFragmentAnchorAtVectorBoundaries(VLEN, attributes, 13);
-        try expectFragmentAnchorAtVectorBoundaries(VLEN, attributes, attributes.len - 2);
+        try expectFragmentAnchorAtVectorBoundaries(vlen, attributes, 11);
+        try expectFragmentAnchorAtVectorBoundaries(vlen, attributes, 13);
+        try expectFragmentAnchorAtVectorBoundaries(vlen, attributes, attributes.len - 2);
 
         const tags = "<root><child a='x'/></root>";
-        try expectFragmentAnchorAtVectorBoundaries(VLEN, tags, 0);
-        try expectFragmentAnchorAtVectorBoundaries(VLEN, tags, 6);
-        try expectFragmentAnchorAtVectorBoundaries(VLEN, tags, tags.len - 7);
+        try expectFragmentAnchorAtVectorBoundaries(vlen, tags, 0);
+        try expectFragmentAnchorAtVectorBoundaries(vlen, tags, 6);
+        try expectFragmentAnchorAtVectorBoundaries(vlen, tags, tags.len - 7);
 
         const instruction = "<?xml version=\"1.0\" encoding = 'UTF-8'?>";
-        try expectFragmentAnchorAtVectorBoundaries(VLEN, instruction, 0);
-        try expectFragmentAnchorAtVectorBoundaries(VLEN, instruction, instruction.len - 2);
+        try expectFragmentAnchorAtVectorBoundaries(vlen, instruction, 0);
+        try expectFragmentAnchorAtVectorBoundaries(vlen, instruction, instruction.len - 2);
     }
 }
 
@@ -1616,7 +1618,8 @@ pub const XmlDocument = struct {
         while (tape_index < self.tape.len) : (tape_index += 1) {
             const token = try xmlTapeToken(self, input, tape_index);
             if (token.kind == .xml_declaration) {
-                return try parseDeclarationInfo(token.raw);
+                const value = try parseDeclarationInfo(token.raw);
+                return value;
             }
         }
         return null;
@@ -1673,7 +1676,7 @@ fn xmlTapeSpanMatchesKind(kind: XmlTapeKind, raw: []const u8) bool {
     if (raw.len == 0) return false;
 
     var stack: [1]XmlFrame = undefined;
-    var parser = XmlParser{
+    var parser: XmlParser = .{
         .input = raw,
         .output = null,
         .stack = stack[0..],
@@ -1724,7 +1727,7 @@ fn xmlTapeSpanMatchesKind(kind: XmlTapeKind, raw: []const u8) bool {
 
 fn xmlTapeAttributeMatches(raw: []const u8) bool {
     var stack: [1]XmlFrame = undefined;
-    var parser = XmlParser{
+    var parser: XmlParser = .{
         .input = raw,
         .output = null,
         .stack = stack[0..],
@@ -1749,25 +1752,26 @@ pub const XmlTapeCursor = struct {
     input: []const u8,
     position: usize,
 
-    fn ensureSource(self: *const @This()) XmlError!void {
+    fn ensureSource(self: *const XmlTapeCursor) XmlError!void {
         const source = self.document.source orelse return error.SourceMismatch;
         if (source.ptr != self.input.ptr or source.len != self.input.len) {
             return error.SourceMismatch;
         }
     }
 
-    pub fn peek(self: *const @This()) XmlError!?XmlToken {
+    pub fn peek(self: *const XmlTapeCursor) XmlError!?XmlToken {
         try self.ensureSource();
         if (self.position >= self.document.tape.len) return null;
-        return try xmlTapeToken(self.document, self.input, self.position);
+        const value = try xmlTapeToken(self.document, self.input, self.position);
+        return value;
     }
 
-    pub fn currentAttribute(self: *const @This()) XmlError!XmlAttributeEvent {
+    pub fn currentAttribute(self: *const XmlTapeCursor) XmlError!XmlAttributeEvent {
         const token = try self.currentTokenOfKind(.attribute);
         return makeXmlAttributeEvent(token.raw, token.offset);
     }
 
-    pub fn currentText(self: *const @This()) XmlError!XmlTextEvent {
+    pub fn currentText(self: *const XmlTapeCursor) XmlError!XmlTextEvent {
         const token = try self.currentTokenOfKind(.text);
         return .{
             .raw = token.raw,
@@ -1775,7 +1779,7 @@ pub const XmlTapeCursor = struct {
         };
     }
 
-    pub fn currentCdata(self: *const @This()) XmlError!XmlCdataEvent {
+    pub fn currentCdata(self: *const XmlTapeCursor) XmlError!XmlCdataEvent {
         const token = try self.currentTokenOfKind(.cdata);
         if (token.raw.len < "<![CDATA[]]>".len) return error.InvalidTapeOrder;
         const content_start = "<![CDATA[".len;
@@ -1791,20 +1795,20 @@ pub const XmlTapeCursor = struct {
         };
     }
 
-    fn currentTokenOfKind(self: *const @This(), kind: XmlTapeKind) XmlError!XmlToken {
+    fn currentTokenOfKind(self: *const XmlTapeCursor, kind: XmlTapeKind) XmlError!XmlToken {
         try self.ensureSource();
         const token = try self.peek() orelse return error.TapeOutOfBounds;
         if (token.kind != kind) return error.InvalidTapeOrder;
         return token;
     }
 
-    pub fn advance(self: *@This()) XmlError!?XmlToken {
+    pub fn advance(self: *XmlTapeCursor) XmlError!?XmlToken {
         const token = try self.peek() orelse return null;
         self.position += 1;
         return token;
     }
 
-    pub fn skipChild(self: *@This()) XmlError!void {
+    pub fn skipChild(self: *XmlTapeCursor) XmlError!void {
         const first = try self.peek() orelse return;
         switch (first.kind) {
             .self_closing_element => {
@@ -1857,14 +1861,14 @@ pub fn buildXmlTape(
     // Every frame is written before stack_top exposes it. Keep the backing storage
     // uninitialized to avoid clearing the fixed stack for each parse.
     var stack: [xml_max_depth]XmlFrame = undefined;
-    var output = XmlTapeOutput{
+    var output: XmlTapeOutput = .{
         .storage = .{ .builder = .{
             .allocator = allocator,
             .tape = &tape,
         } },
     };
 
-    var parser = XmlParser{
+    var parser: XmlParser = .{
         .input = input,
         .output = &output,
         .stack = stack[0..],
@@ -1879,8 +1883,8 @@ pub fn buildXmlTape(
 
 fn validateXmlTape(tape: []const XmlTapeWord, input: []const u8) XmlError!void {
     var stack: [xml_max_depth]XmlFrame = undefined;
-    var output = XmlTapeOutput{ .storage = .{ .validator = tape } };
-    var parser = XmlParser{
+    var output: XmlTapeOutput = .{ .storage = .{ .validator = tape } };
+    var parser: XmlParser = .{
         .input = input,
         .output = &output,
         .stack = stack[0..],
@@ -1898,7 +1902,7 @@ pub fn validateXml(input: []const u8) XmlValidationError!?XmlDiagnostic {
     // uninitialized to avoid clearing the fixed stack for each parse.
     var stack: [xml_max_depth]XmlFrame = undefined;
 
-    var parser = XmlParser{
+    var parser: XmlParser = .{
         .input = input,
         .output = null,
         .stack = stack[0..],
@@ -1961,7 +1965,7 @@ const XmlTapeOutput = struct {
     },
     count: usize = 0,
 
-    fn append(self: *@This(), kind: XmlTapeKind, start: usize, end: usize) XmlParseError!void {
+    fn append(self: *XmlTapeOutput, kind: XmlTapeKind, start: usize, end: usize) XmlParseError!void {
         switch (self.storage) {
             .builder => |builder| {
                 try builder.tape.append(builder.allocator, .{
@@ -1996,7 +2000,7 @@ const XmlTapeOutput = struct {
     }
 
     fn updateOpening(
-        self: *@This(),
+        self: *XmlTapeOutput,
         tape_index: usize,
         kind: XmlTapeKind,
         length: usize,
@@ -2016,7 +2020,7 @@ const XmlTapeOutput = struct {
         }
     }
 
-    fn finish(self: *const @This()) XmlError!void {
+    fn finish(self: *const XmlTapeOutput) XmlError!void {
         switch (self.storage) {
             .builder => {},
             .validator => |expected| {
@@ -2032,8 +2036,8 @@ const XmlSourceProof = struct {
 
 fn findFirstInvalidXmlChar(input: []const u8, limit: usize) ?usize {
     const vector_len = simd.default_vector_len;
-    const Mask = simd.Mask(vector_len);
-    const MaskStorage = if (vector_len <= 8)
+    const mask = simd.Mask(vector_len);
+    const mask_storage = if (vector_len <= 8)
         u8
     else if (vector_len <= 16)
         u16
@@ -2043,29 +2047,19 @@ fn findFirstInvalidXmlChar(input: []const u8, limit: usize) ?usize {
         u64
     else
         @Int(.unsigned, (vector_len + 7) / 8 * 8);
-    const logical_mask: MaskStorage = @intCast(std.math.maxInt(Mask));
+    const logical_mask: mask_storage = @intCast(std.math.maxInt(mask));
     var cursor: usize = 0;
 
-    const Vec = simd.Vec(vector_len, u8);
-    const splat_20: Vec = @splat(0x20);
-    const splat_tab: Vec = @splat(0x09);
-    const splat_lf: Vec = @splat(0x0A);
-    const splat_cr: Vec = @splat(0x0D);
-    const splat_ef: Vec = @splat(0xEF);
+    const vec = simd.Vec(u8, vector_len);
 
     while (limit - cursor >= vector_len) : (cursor += vector_len) {
-        const block: Vec = input[cursor..][0..vector_len].*;
-        const is_ctrl = block < splat_20;
-        const is_tab = block == splat_tab;
-        const is_lf = block == splat_lf;
-        const is_cr = block == splat_cr;
-        const is_ws = is_tab | is_lf | is_cr;
-        const invalid_ctrl = is_ctrl & ~is_ws;
-        const ctrl_mask_raw: Mask = @bitCast(invalid_ctrl);
-        const ctrl_mask = @as(MaskStorage, @intCast(ctrl_mask_raw)) & logical_mask;
-        const ef_eq = block == splat_ef;
-        const ef_mask_raw: Mask = @bitCast(ef_eq);
-        const ef_mask = @as(MaskStorage, @intCast(ef_mask_raw)) & logical_mask;
+        const block: vec = input[cursor..][0..vector_len].*;
+        const ctrl_mask_raw = simd.matchRange(vector_len, block, 0, 0x1f) &
+            ~(simd.matchAny2(vector_len, block, '\t', '\n') |
+                simd.matchByte(vector_len, block, '\r'));
+        const ctrl_mask = @as(mask_storage, @intCast(ctrl_mask_raw)) & logical_mask;
+        const ef_mask_raw = simd.matchByte(vector_len, block, 0xef);
+        const ef_mask = @as(mask_storage, @intCast(ef_mask_raw)) & logical_mask;
 
         if ((ctrl_mask | ef_mask) != 0) {
             var earliest: ?usize = null;
@@ -2125,7 +2119,7 @@ const XmlParser = struct {
         if (startsWithAt(self.input, 0, "\xEF\xBB\xBF")) self.position = 3;
 
         if (self.source_error == null) {
-            var proof = XmlSourceProof{};
+            var proof: XmlSourceProof = .{};
             self.runGrammarWithProof(&proof) catch |err| return self.handleGrammarError(err);
         } else {
             self.runGrammar() catch |err| return self.handleGrammarError(err);
@@ -2449,14 +2443,6 @@ const XmlParser = struct {
         self.position = close + 2;
     }
 
-    fn parseDeclarationAttributes(
-        self: *XmlParser,
-        attributes_start: usize,
-        close: usize,
-    ) XmlParseError!void {
-        return self.parseDeclarationAttributesWithProof(attributes_start, close, null);
-    }
-
     fn parseDeclarationAttributesWithProof(
         self: *XmlParser,
         attributes_start: usize,
@@ -2467,7 +2453,7 @@ const XmlParser = struct {
         var version_seen = false;
         var pseudo_attribute_seen = false;
         var declaration_order: u8 = 0;
-        var name_filter = XmlAttributeNameFilter{};
+        var name_filter: XmlAttributeNameFilter = .{};
         while (cursor < close) {
             const separator_start = cursor;
             cursor = skipXmlWhitespace(self.input, cursor);
@@ -2557,7 +2543,7 @@ const XmlParser = struct {
         var cursor = name_end;
         var self_closing = false;
         var attribute_seen = false;
-        var name_filter = XmlAttributeNameFilter{};
+        var name_filter: XmlAttributeNameFilter = .{};
         while (true) {
             const separator_start = cursor;
             cursor = skipXmlWhitespace(self.input, cursor);
@@ -2691,6 +2677,9 @@ const XmlPendingOpen = struct {
 
 pub const Parser = struct {
     max_capacity: usize,
+    // SAFETY: every frame is written before `stack_top` exposes it, so no slot
+    // is read while uninitialized. The storage stays uninitialized to avoid
+    // clearing the fixed stack for each parse.
     stack: [xml_max_depth]XmlFrame = undefined,
     state: resident.State = .{},
 
@@ -2721,7 +2710,7 @@ pub const Parser = struct {
         const lease = try self.state.begin();
         errdefer lease.release();
         try self.checkInputSize(input.len);
-        var grammar = XmlParser{
+        var grammar: XmlParser = .{
             .input = input,
             .output = null,
             .stack = self.stack[0..],
@@ -2748,6 +2737,7 @@ pub const XmlOnDemandDocument = struct {
 
     pub fn deinit(self: *XmlOnDemandDocument) void {
         self.lease.release();
+        self.* = undefined;
     }
 
     fn claim(self: *XmlOnDemandDocument) XmlError!resident.Guard {
@@ -2811,7 +2801,7 @@ pub const XmlOnDemandDocument = struct {
         } };
     }
 
-    fn skipPendingAttributes(self: *@This(), guard: *resident.Guard) XmlParseError!void {
+    fn skipPendingAttributes(self: *XmlOnDemandDocument, guard: *resident.Guard) XmlParseError!void {
         while (self.pending.active) {
             if (try self.nextAttribute()) |_| {
                 try guard.advance();
@@ -2821,7 +2811,7 @@ pub const XmlOnDemandDocument = struct {
         }
     }
 
-    fn cacheFailure(self: *@This(), err: XmlError) XmlParseError {
+    fn cacheFailure(self: *XmlOnDemandDocument, err: XmlError) XmlParseError {
         if (self.failure) |failure| {
             self.grammar.failure_offset = failure.offset;
             self.grammar.position = failure.offset;
@@ -2830,9 +2820,7 @@ pub const XmlOnDemandDocument = struct {
 
         var selected_error = err;
         var selected_offset = self.grammar.failure_offset;
-        const eager = validateXml(self.input) catch |validation_error| {
-            return validation_error;
-        };
+        const eager = try validateXml(self.input);
         if (eager) |diagnostic| {
             selected_error = diagnostic.err;
             selected_offset = diagnostic.byte_offset;
@@ -2847,7 +2835,7 @@ pub const XmlOnDemandDocument = struct {
         return selected_error;
     }
 
-    fn nextEventCore(self: *@This()) XmlParseError!?XmlEvent {
+    fn nextEventCore(self: *XmlOnDemandDocument) XmlParseError!?XmlEvent {
         if (self.failure) |failure| {
             self.grammar.failure_offset = failure.offset;
             self.grammar.position = failure.offset;
@@ -2990,6 +2978,8 @@ pub const XmlOnDemandDocument = struct {
         const saved_grammar = self.grammar;
         const saved_pending = self.pending;
         const saved_stack_top = self.grammar.stack_top;
+        // SAFETY: `saved_frame` is read only under the same
+        // `saved_stack_top < stack.len` condition that assigns it.
         var saved_frame: XmlFrame = undefined;
         if (saved_stack_top < self.grammar.stack.len) {
             saved_frame = self.grammar.stack[saved_stack_top];
@@ -3077,22 +3067,22 @@ pub const XmlEventReader = struct {
     document: *XmlOnDemandDocument,
     guard: resident.Guard,
 
-    fn ensureFocused(self: *const @This()) XmlError!void {
+    fn ensureFocused(self: *const XmlEventReader) XmlError!void {
         try self.guard.check();
     }
 
-    pub fn next(self: *@This()) XmlParseError!?XmlEvent {
+    pub fn next(self: *XmlEventReader) XmlParseError!?XmlEvent {
         try self.ensureFocused();
         const event = try self.document.nextEventCore();
         if (event != null) try self.guard.advance();
         return event;
     }
 
-    pub fn peek(self: *const @This()) XmlParseError!?XmlEvent {
+    pub fn peek(self: *const XmlEventReader) XmlParseError!?XmlEvent {
         try self.ensureFocused();
         return self.document.peekEventCore();
     }
-    pub fn skip(self: *@This()) XmlParseError!void {
+    pub fn skip(self: *XmlEventReader) XmlParseError!void {
         const first = try self.next() orelse return;
         switch (first) {
             .element_start => {},
@@ -3119,24 +3109,24 @@ pub const XmlTokenCursor = struct {
     document: *XmlOnDemandDocument,
     guard: resident.Guard,
 
-    fn ensureFocused(self: *const @This()) XmlError!void {
+    fn ensureFocused(self: *const XmlTokenCursor) XmlError!void {
         try self.guard.check();
     }
 
-    pub fn peek(self: *const @This()) XmlParseError!?XmlToken {
+    pub fn peek(self: *const XmlTokenCursor) XmlParseError!?XmlToken {
         try self.ensureFocused();
         const event = try self.document.peekEventCore() orelse return null;
         return xmlEventToken(event);
     }
 
-    pub fn advance(self: *@This()) XmlParseError!?XmlToken {
+    pub fn advance(self: *XmlTokenCursor) XmlParseError!?XmlToken {
         try self.ensureFocused();
         const event = try self.document.nextEventCore() orelse return null;
         try self.guard.advance();
         return xmlEventToken(event);
     }
 
-    pub fn skipChild(self: *@This()) XmlParseError!void {
+    pub fn skipChild(self: *XmlTokenCursor) XmlParseError!void {
         const first = try self.peek() orelse return;
         switch (first.kind) {
             .self_closing_element => {
@@ -3190,8 +3180,8 @@ pub fn initStreamIndexer(
 // Text candidate: find the next markup delimiter without decoding ordinary bytes.
 fn findXmlTextEnd(input: []const u8, start: usize) usize {
     const vector_len = simd.default_vector_len;
-    const Mask = simd.Mask(vector_len);
-    const MaskStorage = if (vector_len <= 8)
+    const mask = simd.Mask(vector_len);
+    const mask_storage = if (vector_len <= 8)
         u8
     else if (vector_len <= 16)
         u16
@@ -3201,14 +3191,14 @@ fn findXmlTextEnd(input: []const u8, start: usize) usize {
         u64
     else
         @Int(.unsigned, (vector_len + 7) / 8 * 8);
-    const logical_mask: MaskStorage = @intCast(std.math.maxInt(Mask));
+    const logical_mask: mask_storage = @intCast(std.math.maxInt(mask));
     var cursor = start;
     while (input.len - cursor >= vector_len) {
-        const block: simd.Vec(vector_len, u8) = input[cursor..][0..vector_len].*;
-        const less_than: Mask = simd.matchByte(vector_len, block, '<');
+        const block: simd.Vec(u8, vector_len) = input[cursor..][0..vector_len].*;
+        const less_than: mask = simd.matchByte(vector_len, block, '<');
         // Non-byte-aligned masks have spare storage bits; clear them before `@ctz`.
         const less_than_storage =
-            @as(MaskStorage, @intCast(less_than)) & logical_mask;
+            @as(mask_storage, @intCast(less_than)) & logical_mask;
         if (less_than_storage != 0) {
             return cursor + @as(usize, @intCast(@ctz(less_than_storage)));
         }
@@ -3256,8 +3246,8 @@ fn skipXmlProvenData(
 ) usize {
     if (!entities and !forbid_cdata_end and !forbid_less_than) return end;
     const vector_len = simd.default_vector_len;
-    const Mask = simd.Mask(vector_len);
-    const MaskStorage = if (vector_len <= 8)
+    const mask_type = simd.Mask(vector_len);
+    const mask_storage = if (vector_len <= 8)
         u8
     else if (vector_len <= 16)
         u16
@@ -3267,16 +3257,16 @@ fn skipXmlProvenData(
         u64
     else
         @Int(.unsigned, (vector_len + 7) / 8 * 8);
-    const logical_mask: MaskStorage = @intCast(std.math.maxInt(Mask));
+    const logical_mask: mask_storage = @intCast(std.math.maxInt(mask_type));
 
     var cursor = start;
     while (end - cursor >= vector_len) {
-        const block: simd.Vec(vector_len, u8) = input[cursor..][0..vector_len].*;
-        var mask: Mask = 0;
+        const block: simd.Vec(u8, vector_len) = input[cursor..][0..vector_len].*;
+        var mask: mask_type = 0;
         if (entities) mask |= simd.matchByte(vector_len, block, '&');
         if (forbid_cdata_end) mask |= simd.matchByte(vector_len, block, ']');
         if (forbid_less_than) mask |= simd.matchByte(vector_len, block, '<');
-        const storage = @as(MaskStorage, @intCast(mask)) & logical_mask;
+        const storage = @as(mask_storage, @intCast(mask)) & logical_mask;
         if (storage != 0) {
             return cursor + @as(usize, @intCast(@ctz(storage)));
         }
@@ -3295,14 +3285,6 @@ fn skipXmlProvenData(
     return cursor;
 }
 
-fn xmlUtf8SequenceLength(first: u8) ?usize {
-    return switch (first) {
-        0xC2...0xDF => 2,
-        0xE0...0xEF => 3,
-        0xF0...0xF4 => 4,
-        else => null,
-    };
-}
 // Name candidate: classify ASCII bytes directly and retain checked Unicode fallback.
 fn parseXmlName(input: []const u8, start: usize) ?usize {
     if (start >= input.len) return null;
@@ -3327,17 +3309,6 @@ fn parseXmlName(input: []const u8, start: usize) ?usize {
     }
     return cursor;
 }
-
-const ascii_name_start_table: [256]bool = blk: {
-    var table = [_]bool{false} ** 256;
-    for (0..256) |i| {
-        const b: u8 = @intCast(i);
-        if (b < 0x80 and isAsciiXmlNameStart(b)) {
-            table[i] = true;
-        }
-    }
-    break :blk table;
-};
 
 const ascii_name_char_table: [256]bool = blk: {
     var table = [_]bool{false} ** 256;
@@ -3371,7 +3342,7 @@ fn isAsciiXmlNameChar(byte: u8) bool {
 const XmlAttributeNameFilter = struct {
     bits: [128]u8 = [_]u8{0} ** 128,
 
-    fn maybeSeenAndInsert(self: *@This(), name: []const u8) bool {
+    fn maybeSeenAndInsert(self: *XmlAttributeNameFilter, name: []const u8) bool {
         const hash = hashXmlAttributeName(name);
         const first_bit: usize = @intCast(hash & 0x3FF);
         const second_bit: usize = @intCast((hash >> 10) & 0x3FF);
@@ -3530,16 +3501,16 @@ fn utf8SequenceStart(input: []const u8, invalid_offset: usize) usize {
         sequence_start -= 1;
         continuation_count += 1;
     }
-    if (sequence_start == 0) return invalid_offset;
-
-    const lead = input[sequence_start - 1];
-    const expected_continuations: usize = switch (lead) {
-        0xC0...0xDF => 1,
-        0xE0...0xEF => 2,
-        0xF0...0xF4 => 3,
-        else => 0,
-    };
-    if (continuation_count < expected_continuations) return sequence_start - 1;
+    if (sequence_start > 0) {
+        const lead = input[sequence_start - 1];
+        const expected_continuations: usize = switch (lead) {
+            0xC0...0xDF => 1,
+            0xE0...0xEF => 2,
+            0xF0...0xF4 => 3,
+            else => 0,
+        };
+        if (continuation_count < expected_continuations) return sequence_start - 1;
+    }
     return invalid_offset;
 }
 
@@ -3655,7 +3626,7 @@ fn validateXmlRawData(
 ) XmlError!void {
     if (raw.len == 0) return;
     var stack: [1]XmlFrame = undefined;
-    var parser = XmlParser{
+    var parser: XmlParser = .{
         .input = raw,
         .output = null,
         .stack = stack[0..],
@@ -3774,7 +3745,7 @@ fn decodeXmlValue(
     var cursor: usize = 0;
     var output_length: usize = 0;
     while (cursor < raw.len) {
-        var codepoint: u21 = undefined;
+        var codepoint: u21 = 0;
         var consumed: usize = 0;
         var referenced = false;
 
@@ -4339,7 +4310,7 @@ const XmlFaultingReader = struct {
         writer: *std.Io.Writer,
         limit: std.Io.Limit,
     ) std.Io.Reader.StreamError!usize {
-        const self: *@This() = @alignCast(@fieldParentPtr("reader", reader));
+        const self: *XmlFaultingReader = @alignCast(@fieldParentPtr("reader", reader));
         if (self.offset >= self.fail_at) return error.ReadFailed;
 
         const available = self.fail_at - self.offset;
@@ -4360,7 +4331,7 @@ test "XML resident reader yields native zero-copy events" {
     defer document.deinit();
     var reader = try document.eventReader();
 
-    const root = (try reader.next()).?;
+    const root = (try reader.next()) orelse return error.UnexpectedXmlEvent;
     try testing.expectEqualStrings("<root a='v'>", root.raw());
     try testing.expect(root.raw().ptr == input.ptr);
     switch (root) {
@@ -4371,7 +4342,7 @@ test "XML resident reader yields native zero-copy events" {
         else => return error.UnexpectedXmlEvent,
     }
 
-    switch ((try reader.next()).?) {
+    switch ((try reader.next()) orelse return error.UnexpectedXmlEvent) {
         .attribute => |attribute| {
             try testing.expectEqualStrings("a='v'", attribute.raw);
             try testing.expectEqualStrings("a", attribute.name);
@@ -4380,32 +4351,32 @@ test "XML resident reader yields native zero-copy events" {
         },
         else => return error.UnexpectedXmlEvent,
     }
-    switch ((try reader.next()).?) {
+    switch ((try reader.next()) orelse return error.UnexpectedXmlEvent) {
         .text => |text| try testing.expectEqualStrings("text", text.raw),
         else => return error.UnexpectedXmlEvent,
     }
-    switch ((try reader.next()).?) {
+    switch ((try reader.next()) orelse return error.UnexpectedXmlEvent) {
         .comment => |comment| {
             try testing.expectEqualStrings("<!--comment-->", comment.raw);
             try testing.expectEqualStrings("comment", comment.content);
         },
         else => return error.UnexpectedXmlEvent,
     }
-    switch ((try reader.next()).?) {
+    switch ((try reader.next()) orelse return error.UnexpectedXmlEvent) {
         .cdata => |cdata| {
             try testing.expectEqualStrings("<![CDATA[data]]>", cdata.raw);
             try testing.expectEqualStrings("data", cdata.content);
         },
         else => return error.UnexpectedXmlEvent,
     }
-    switch ((try reader.next()).?) {
+    switch ((try reader.next()) orelse return error.UnexpectedXmlEvent) {
         .processing_instruction => |instruction| {
             try testing.expectEqualStrings("work", instruction.target);
             try testing.expectEqualStrings("yes", instruction.data);
         },
         else => return error.UnexpectedXmlEvent,
     }
-    switch ((try reader.next()).?) {
+    switch ((try reader.next()) orelse return error.UnexpectedXmlEvent) {
         .element_end => |element| try testing.expectEqualStrings("root", element.name),
         else => return error.UnexpectedXmlEvent,
     }
@@ -4435,7 +4406,11 @@ test "XML resident source validation matches eager in every grammar region" {
         .{ .input = "<a x='\xEF\xBF\xBF'/>", .expected_error = error.InvalidCharacter, .expected_offset = 6 },
         .{ .input = "<a\xEF\xBF\xBF/>", .expected_error = error.InvalidCharacter, .expected_offset = 2 },
         .{ .input = "<a><!--\xEF\xBF\xBF--></a>", .expected_error = error.InvalidCharacter, .expected_offset = 7 },
-        .{ .input = "<a><![CDATA[\xEF\xBF\xBF]]></a>", .expected_error = error.InvalidCharacter, .expected_offset = 12 },
+        .{
+            .input = "<a><![CDATA[\xEF\xBF\xBF]]></a>",
+            .expected_error = error.InvalidCharacter,
+            .expected_offset = 12,
+        },
         .{ .input = "<a><?work \xEF\xBF\xBF?></a>", .expected_error = error.InvalidCharacter, .expected_offset = 10 },
         .{ .input = "<a>\xFF</a>", .expected_error = error.InvalidUtf8, .expected_offset = 3 },
         .{ .input = "<a x='\xFF'/>", .expected_error = error.InvalidUtf8, .expected_offset = 6 },
@@ -4553,18 +4528,18 @@ test "XML resident event skip consumes the next element subtree" {
     defer document.deinit();
     var reader = try document.eventReader();
 
-    switch ((try reader.next()).?) {
+    switch ((try reader.next()) orelse return error.UnexpectedXmlEvent) {
         .element_start => {},
         else => return error.UnexpectedXmlEvent,
     }
     try reader.skip();
-    switch ((try reader.next()).?) {
+    switch ((try reader.next()) orelse return error.UnexpectedXmlEvent) {
         .self_closing_element => |event| {
             try testing.expectEqualStrings("<tail/>", event.raw);
         },
         else => return error.UnexpectedXmlEvent,
     }
-    switch ((try reader.next()).?) {
+    switch ((try reader.next()) orelse return error.UnexpectedXmlEvent) {
         .element_end => |event| {
             try testing.expectEqualStrings("</root>", event.raw);
         },
@@ -4616,7 +4591,7 @@ test "XML resident cursor peeks and validates subtree skips" {
     defer document.deinit();
     var cursor = try document.tokenCursor();
 
-    const root = (try cursor.peek()).?;
+    const root = (try cursor.peek()) orelse return error.UnexpectedXmlToken;
     try testing.expectEqual(XmlTapeKind.element_start, root.kind);
     try testing.expectEqualStrings("<root>", root.raw);
     try testing.expectEqualStrings(root.raw, (try cursor.advance()).?.raw);

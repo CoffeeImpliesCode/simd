@@ -12,7 +12,7 @@ const IndexSink = struct {
     indexes: []u32,
     count: usize = 0,
 
-    pub fn appendOffset(self: *@This(), offset: usize) lexical.Error!void {
+    pub fn appendOffset(self: *IndexSink, offset: usize) lexical.Error!void {
         if (offset > std.math.maxInt(u32)) return error.InputTooLarge;
         if (self.count >= self.indexes.len) return error.CapacityExceeded;
         self.indexes[self.count] = @intCast(offset);
@@ -20,7 +20,7 @@ const IndexSink = struct {
     }
 
     pub fn appendMask(
-        self: *@This(),
+        self: *IndexSink,
         comptime T: type,
         mask: T,
         base_offset: usize,
@@ -91,15 +91,15 @@ pub fn validateJsonc(
 }
 
 pub fn indexJsoncInto(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     indexes: []u32,
     input: []const u8,
 ) lexical.Error!usize {
     if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
 
-    var sink = IndexSink{ .indexes = indexes };
+    var sink: IndexSink = .{ .indexes = indexes };
     var state: lexical.State = .{};
-    lexical.feed(VLEN, .jsonc, &state, input, 0, &sink) catch |err| switch (err) {
+    lexical.feed(vlen, .jsonc, &state, input, 0, &sink) catch |err| switch (err) {
         error.NonContiguousInput => unreachable,
         error.CapacityExceeded => return error.CapacityExceeded,
         error.InputTooLarge => return error.InputTooLarge,
@@ -113,7 +113,7 @@ pub fn indexJsoncInto(
 }
 
 pub fn indexJsoncImpl(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     allocator: std.mem.Allocator,
     input: []const u8,
 ) !stage1.StructuralIndex {
@@ -123,7 +123,7 @@ pub fn indexJsoncImpl(
     errdefer result.deinit(allocator);
 
     result.count = indexJsoncInto(
-        VLEN,
+        vlen,
         result.indexes[0 .. result.indexes.len - sentinel_count],
         input,
     ) catch |err| switch (err) {
@@ -237,11 +237,11 @@ fn expectJsoncMatchesScalar(input: []const u8) !void {
     return expectJsoncMatchesScalarAtWidth(simd.default_vector_len, input);
 }
 
-fn expectJsoncMatchesScalarAtWidth(comptime VLEN: usize, input: []const u8) !void {
+fn expectJsoncMatchesScalarAtWidth(comptime vlen: usize, input: []const u8) !void {
     var expected = try scalarIndexJsonc(testing.allocator, input);
     defer expected.deinit(testing.allocator);
 
-    var actual = try indexJsoncImpl(VLEN, testing.allocator, input);
+    var actual = try indexJsoncImpl(vlen, testing.allocator, input);
     defer actual.deinit(testing.allocator);
 
     try testing.expectEqualSlices(u32, expected.slice(), actual.slice());

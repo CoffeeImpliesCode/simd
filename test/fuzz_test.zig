@@ -61,16 +61,16 @@ fn scalarUtf8SequenceStart(input: []const u8, invalid_offset: usize) usize {
         sequence_start -= 1;
         continuation_count += 1;
     }
-    if (sequence_start == 0) return invalid_offset;
-
-    const lead = input[sequence_start - 1];
-    const expected_continuations: usize = switch (lead) {
-        0xC0...0xDF => 1,
-        0xE0...0xEF => 2,
-        0xF0...0xF4 => 3,
-        else => 0,
-    };
-    if (continuation_count < expected_continuations) return sequence_start - 1;
+    if (sequence_start > 0) {
+        const lead = input[sequence_start - 1];
+        const expected_continuations: usize = switch (lead) {
+            0xC0...0xDF => 1,
+            0xE0...0xEF => 2,
+            0xF0...0xF4 => 3,
+            else => 0,
+        };
+        if (continuation_count < expected_continuations) return sequence_start - 1;
+    }
     return invalid_offset;
 }
 
@@ -94,7 +94,15 @@ fn scalarXmlCharacterFailureOffset(
             std.unicode.utf8ByteSequenceLength(input[index]) catch return null,
         );
         if (input.len - index < width) return null;
-        const codepoint = std.unicode.utf8Decode(input[index .. index + width]) catch return null;
+        // The deprecated slice decoder has no replacement that reports an
+        // invalid sequence, so dispatch to the per-width decoders it wraps.
+        const codepoint: u21 = switch (width) {
+            1 => input[index],
+            2 => std.unicode.utf8Decode2(input[index..][0..2].*) catch return null,
+            3 => std.unicode.utf8Decode3(input[index..][0..3].*) catch return null,
+            4 => std.unicode.utf8Decode4(input[index..][0..4].*) catch return null,
+            else => return null,
+        };
         if (!isXmlCharacterScalar(codepoint)) return index;
         index += width;
     }

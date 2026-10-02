@@ -216,12 +216,11 @@ test "public Stage 2 JSON corpus builds validates and exposes raw spans" {
     const diagnostic = (try lib.formats.json.validateJson(
         testing.allocator,
         invalid_input,
-    )).?;
+    )) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(error.TrailingComma, diagnostic.err);
-    try testing.expectEqual(
-        std.mem.indexOfScalar(u8, invalid_input, ']').?,
-        diagnostic.byte_offset,
-    );
+    const close_bracket = std.mem.indexOfScalar(u8, invalid_input, ']') orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(close_bracket, diagnostic.byte_offset);
 }
 
 test "public Stage 2 JSONC corpus accepts comments and rejects trailing commas" {
@@ -249,12 +248,11 @@ test "public Stage 2 JSONC corpus accepts comments and rejects trailing commas" 
     const diagnostic = (try lib.formats.jsonc.validateJsonc(
         testing.allocator,
         invalid_input,
-    )).?;
+    )) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(error.TrailingComma, diagnostic.err);
-    try testing.expectEqual(
-        std.mem.indexOfScalar(u8, invalid_input, '}').?,
-        diagnostic.byte_offset,
-    );
+    const close_brace = std.mem.indexOfScalar(u8, invalid_input, '}') orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(close_brace, diagnostic.byte_offset);
 }
 
 test "public Stage 2 JSON5 corpus preserves extended grammar raw spans" {
@@ -304,7 +302,7 @@ test "public Stage 2 JSON5 corpus preserves extended grammar raw spans" {
     const diagnostic = (try lib.formats.json5.validateJson5(
         testing.allocator,
         invalid_input,
-    )).?;
+    )) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(error.InvalidNumber, diagnostic.err);
     try testing.expectEqual(@as(usize, 8), diagnostic.byte_offset);
 }
@@ -322,7 +320,8 @@ test "public Stage 2 JSONL corpus exposes records and global diagnostics" {
     );
     defer corpus_document.deinit(testing.allocator);
     try testing.expect(corpus_document.records.len > 0);
-    const first_corpus_record = corpus_document.record(0).?;
+    const first_corpus_record = corpus_document.record(0) orelse
+        return error.TestUnexpectedResult;
     try testing.expectEqual(@as(usize, 0), first_corpus_record.source_start);
     try testing.expect(first_corpus_record.source_end > first_corpus_record.source_start);
     var corpus_cursor = try first_corpus_record.root();
@@ -357,11 +356,12 @@ test "public Stage 2 JSONL corpus exposes records and global diagnostics" {
     );
 
     const invalid_input = "{}\n  [1,]\n{}\n";
-    const close_bracket = std.mem.indexOfScalar(u8, invalid_input, ']').?;
+    const close_bracket = std.mem.indexOfScalar(u8, invalid_input, ']') orelse
+        return error.TestUnexpectedResult;
     const diagnostic = (try lib.formats.jsonl.validateJsonl(
         testing.allocator,
         invalid_input,
-    )).?;
+    )) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(usize, 1), diagnostic.record_index);
     try testing.expectEqual(@as(usize, 3), diagnostic.source_start);
     try testing.expectEqual(close_bracket + 1, diagnostic.source_end);
@@ -483,7 +483,7 @@ test "public Stage 2 Markdown corpus preserves token parity and local limits" {
     const invalid_input = "#";
     var indexes = [_]u32{@intCast(invalid_input.len)};
     var kinds = [_]lib.formats.markdown.MarkdownTokenKind{.heading};
-    const forged = lib.formats.markdown.MarkdownStructuralIndex{
+    const forged: lib.formats.markdown.MarkdownStructuralIndex = .{
         .indexes = &indexes,
         .kinds = &kinds,
         .count = 1,
@@ -491,7 +491,7 @@ test "public Stage 2 Markdown corpus preserves token parity and local limits" {
     const diagnostic = (try lib.formats.markdown.validateMarkdownIndex(
         invalid_input,
         &forged,
-    )).?;
+    )) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(error.InvalidTokenIndex, diagnostic.err);
     try testing.expectEqual(invalid_input.len, diagnostic.byte_offset);
 }
@@ -532,7 +532,8 @@ test "public Stage 2 XML catalog exposes source spans and matching errors" {
     try testing.expect(saw_self_close);
 
     const invalid_input = "<a><b></a>";
-    const diagnostic = (try lib.formats.xml.validateXml(invalid_input)).?;
+    const diagnostic = (try lib.formats.xml.validateXml(invalid_input)) orelse
+        return error.TestUnexpectedResult;
     try testing.expectEqual(error.MismatchedTag, diagnostic.err);
     try testing.expectEqual(@as(usize, 8), diagnostic.byte_offset);
     try testing.expectEqual(@as(u32, 1), diagnostic.line);
@@ -586,7 +587,7 @@ test "public YAML corpus exposes index, tape, diagnostics, and unsupported resul
     const invalid = (try lib.formats.yaml.validateYaml(
         testing.allocator,
         invalid_input,
-    )).?;
+    )) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(error.Invalid, invalid.err);
     try testing.expectEqual(
         lib.formats.yaml.YamlDiagnosticKind.syntax,
@@ -607,7 +608,7 @@ test "public YAML corpus exposes index, tape, diagnostics, and unsupported resul
     const unsupported = (try lib.formats.yaml.validateYaml(
         testing.allocator,
         unsupported_input,
-    )).?;
+    )) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(error.Unsupported, unsupported.err);
     try testing.expectEqual(
         lib.formats.yaml.YamlDiagnosticKind.unsupported,
@@ -724,7 +725,7 @@ test "public JSON cursor rejects malformed borrowed source and public tape" {
     try testing.expectError(error.InvalidSource, malformed_escape_cursor.rawValue());
 
     var empty_tape: [0]lib.stage2.TapeWord = .{};
-    const empty_document = lib.stage2.Document{
+    const empty_document: lib.stage2.Document = .{
         .tape = empty_tape[0..],
         .dialect = .json,
     };
@@ -735,7 +736,7 @@ test "public JSON cursor rejects malformed borrowed source and public tape" {
         .payload = 0,
         .offset = 0,
     }};
-    const invalid_kind_document = lib.stage2.Document{
+    const invalid_kind_document: lib.stage2.Document = .{
         .tape = invalid_kind_tape[0..],
         .dialect = .json,
     };
@@ -753,7 +754,7 @@ test "public JSON cursor rejects malformed borrowed source and public tape" {
             .offset = 1,
         },
     };
-    const wrong_end_document = lib.stage2.Document{
+    const wrong_end_document: lib.stage2.Document = .{
         .tape = wrong_end_tape[0..],
         .dialect = .json,
     };
@@ -777,7 +778,7 @@ test "public JSON cursor rejects malformed borrowed source and public tape" {
             .offset = 2,
         },
     };
-    const malformed_interior_document = lib.stage2.Document{
+    const malformed_interior_document: lib.stage2.Document = .{
         .tape = malformed_interior_tape[0..],
         .dialect = .json,
     };
@@ -812,6 +813,16 @@ fn expectOnDemandEvent(
         },
         else => {},
     }
+}
+
+/// Reads the next on-demand event, failing the test when the reader owes none.
+fn nextOnDemandEvent(reader: *lib.ondemand.EventReader) !lib.ondemand.Event {
+    return (try reader.next()) orelse error.TestUnexpectedResult;
+}
+
+/// Peeks the next on-demand event, failing the test when the reader owes none.
+fn peekOnDemandEvent(reader: *lib.ondemand.EventReader) !lib.ondemand.Event {
+    return (try reader.peek()) orelse error.TestUnexpectedResult;
 }
 
 fn expectOnDemandRawStringEvent(
@@ -875,18 +886,18 @@ test "on-demand Parser emits JSON events from quote-aware indexes" {
     defer document.deinit();
     var reader = try document.eventReader();
 
-    try expectOnDemandEvent(.object_start, (try reader.next()).?);
-    try expectOnDemandEvent(.{ .key = "syntax{}[],:" }, (try reader.peek()).?);
-    try expectOnDemandEvent(.{ .key = "syntax{}[],:" }, (try reader.next()).?);
-    try expectOnDemandEvent(.{ .string = "text { [ ] } , :" }, (try reader.next()).?);
-    try expectOnDemandEvent(.{ .key = "items" }, (try reader.next()).?);
-    try expectOnDemandEvent(.array_start, (try reader.next()).?);
-    try expectOnDemandEvent(.{ .number = "42" }, (try reader.next()).?);
-    try expectOnDemandEvent(.{ .bool = true }, (try reader.next()).?);
-    try expectOnDemandEvent(.{ .bool = false }, (try reader.next()).?);
-    try expectOnDemandEvent(.null, (try reader.next()).?);
-    try expectOnDemandEvent(.array_end, (try reader.next()).?);
-    try expectOnDemandEvent(.object_end, (try reader.next()).?);
+    try expectOnDemandEvent(.object_start, try nextOnDemandEvent(&reader));
+    try expectOnDemandEvent(.{ .key = "syntax{}[],:" }, try peekOnDemandEvent(&reader));
+    try expectOnDemandEvent(.{ .key = "syntax{}[],:" }, try nextOnDemandEvent(&reader));
+    try expectOnDemandEvent(.{ .string = "text { [ ] } , :" }, try nextOnDemandEvent(&reader));
+    try expectOnDemandEvent(.{ .key = "items" }, try nextOnDemandEvent(&reader));
+    try expectOnDemandEvent(.array_start, try nextOnDemandEvent(&reader));
+    try expectOnDemandEvent(.{ .number = "42" }, try nextOnDemandEvent(&reader));
+    try expectOnDemandEvent(.{ .bool = true }, try nextOnDemandEvent(&reader));
+    try expectOnDemandEvent(.{ .bool = false }, try nextOnDemandEvent(&reader));
+    try expectOnDemandEvent(.null, try nextOnDemandEvent(&reader));
+    try expectOnDemandEvent(.array_end, try nextOnDemandEvent(&reader));
+    try expectOnDemandEvent(.object_end, try nextOnDemandEvent(&reader));
     try testing.expect((try reader.next()) == null);
 }
 
@@ -905,12 +916,12 @@ test "on-demand EventReader skips one nested JSON value" {
     defer document.deinit();
     var reader = try document.eventReader();
 
-    try expectOnDemandEvent(.object_start, (try reader.next()).?);
-    try expectOnDemandEvent(.{ .key = "skip" }, (try reader.next()).?);
+    try expectOnDemandEvent(.object_start, try nextOnDemandEvent(&reader));
+    try expectOnDemandEvent(.{ .key = "skip" }, try nextOnDemandEvent(&reader));
     try reader.skip();
-    try expectOnDemandEvent(.{ .key = "after" }, (try reader.next()).?);
-    try expectOnDemandEvent(.null, (try reader.next()).?);
-    try expectOnDemandEvent(.object_end, (try reader.next()).?);
+    try expectOnDemandEvent(.{ .key = "after" }, try nextOnDemandEvent(&reader));
+    try expectOnDemandEvent(.null, try nextOnDemandEvent(&reader));
+    try expectOnDemandEvent(.object_end, try nextOnDemandEvent(&reader));
     try testing.expect((try reader.next()) == null);
 }
 
@@ -1083,10 +1094,10 @@ test "on-demand EventReader preserves valid events before string errors" {
     defer document.deinit();
     var reader = try document.eventReader();
 
-    try expectOnDemandEvent(.object_start, (try reader.next()).?);
-    try expectOnDemandEvent(.{ .key = "ok" }, (try reader.next()).?);
-    try expectOnDemandRawStringEvent(input[7..12], (try reader.next()).?);
-    try expectOnDemandEvent(.{ .key = "bad" }, (try reader.next()).?);
+    try expectOnDemandEvent(.object_start, try nextOnDemandEvent(&reader));
+    try expectOnDemandEvent(.{ .key = "ok" }, try nextOnDemandEvent(&reader));
+    try expectOnDemandRawStringEvent(input[7..12], try nextOnDemandEvent(&reader));
+    try expectOnDemandEvent(.{ .key = "bad" }, try nextOnDemandEvent(&reader));
     try testing.expectError(error.InvalidEscape, reader.next());
 }
 
@@ -1366,8 +1377,8 @@ test "stream: one feed and byte feeds match JSON indexing" {
 
 test "stream: empty feeds and SIMD boundary cuts match JSON indexing" {
     const input =
-        \\{"padding":"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz","tail":[false,null,-987654321]}
-    ;
+        "{\"padding\":\"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" ++
+        "0123456789abcdefghijklmnopqrstuvwxyz\",\"tail\":[false,null,-987654321]}";
     const cut_center: usize = @max(2, @min(vector_len, input.len -| 2));
     const cuts = [_]usize{
         cut_center - 1,
@@ -1382,10 +1393,13 @@ test "stream: quote backslash and atom splits match JSON indexing" {
     const input =
         \\{"text":"odd\\\"quote","atom":-12345,"bool":true}
     ;
-    const quote_cut = std.mem.indexOf(u8, input, "\"odd").? + 1;
-    const backslash_cut = std.mem.indexOf(u8, input, "\\\\\\\"").? + 2;
-    const atom_cut = std.mem.indexOf(u8, input, "-12345").? + 3;
-    const cuts = [_]usize{ quote_cut, backslash_cut, atom_cut };
+    const quote_at = std.mem.indexOf(u8, input, "\"odd") orelse
+        return error.TestUnexpectedResult;
+    const backslash_at = std.mem.indexOf(u8, input, "\\\\\\\"") orelse
+        return error.TestUnexpectedResult;
+    const atom_at = std.mem.indexOf(u8, input, "-12345") orelse
+        return error.TestUnexpectedResult;
+    const cuts = [_]usize{ quote_at + 1, backslash_at + 2, atom_at + 3 };
 
     try expectJsonStreamWithCuts(input, &cuts, false);
 }
@@ -1518,7 +1532,8 @@ test "public Markdown stream preserves output, sentinels, and token kinds" {
         "> quote\n" ++
         "```zig\n# hidden\n```\n" ++
         "`inline` ***\n";
-    const crlf_cut = std.mem.indexOf(u8, input, "\r\n").? + 1;
+    const crlf_cut = (std.mem.indexOf(u8, input, "\r\n") orelse
+        return error.TestUnexpectedResult) + 1;
     const final_cut = input.len -| 1;
     const vector_cut = @min(vector_len, final_cut);
     const cuts: []const usize = if (vector_cut > crlf_cut and vector_cut < final_cut)
@@ -1534,8 +1549,10 @@ test "public XML stream preserves output, sentinels, and token kinds" {
     const input =
         "<?xml version=\"1.0\"?><root a=\"1\"><item/>" ++
         "<!-- comment --><![CDATA[text]]></root>";
-    const processing_instruction_cut = std.mem.indexOf(u8, input, "?>").? + 1;
-    const cdata_cut = std.mem.indexOf(u8, input, "<![CDATA[").? + 1;
+    const processing_instruction_cut = (std.mem.indexOf(u8, input, "?>") orelse
+        return error.TestUnexpectedResult) + 1;
+    const cdata_cut = (std.mem.indexOf(u8, input, "<![CDATA[") orelse
+        return error.TestUnexpectedResult) + 1;
     const final_cut = input.len -| 1;
     const vector_cut = @min(vector_len, final_cut);
     const cuts: []const usize = if (vector_cut > 1 and vector_cut < processing_instruction_cut)

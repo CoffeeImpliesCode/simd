@@ -173,7 +173,7 @@ test "JSONL reusable record tape enforces exact lease transitions" {
     try testing.expectError(error.DocumentActive, parser.iterate("0"));
     var copied_iterator = first_iterator;
 
-    var first_record = switch ((try first_iterator.next()).?) {
+    var first_record = switch ((try first_iterator.next()) orelse return error.ExpectedRecord) {
         .record => |record| record,
         .diagnostic => return error.UnexpectedDiagnostic,
     };
@@ -188,7 +188,7 @@ test "JSONL reusable record tape enforces exact lease transitions" {
     try testing.expectError(error.DocumentReleased, stale_cursor.peek());
 
     var early_iterator = try parser.iterate("true\nfalse\n");
-    var early_record = switch ((try early_iterator.next()).?) {
+    var early_record = switch ((try early_iterator.next()) orelse return error.ExpectedRecord) {
         .record => |record| record,
         .diagnostic => return error.UnexpectedDiagnostic,
     };
@@ -197,7 +197,7 @@ test "JSONL reusable record tape enforces exact lease transitions" {
     try testing.expectError(error.DocumentReleased, early_cursor.peek());
 
     var reset_iterator = try parser.iterate("null\n");
-    var reset_record = switch ((try reset_iterator.next()).?) {
+    var reset_record = switch ((try reset_iterator.next()) orelse return error.ExpectedRecord) {
         .record => |record| record,
         .diagnostic => return error.UnexpectedDiagnostic,
     };
@@ -285,7 +285,7 @@ test "JSONL reusable record tape preserves depth and u24 boundaries" {
     const expected_depth = (try jsonl.validateJsonl(
         testing.allocator,
         excessive_depth,
-    )).?;
+    )) orelse return error.ExpectedDiagnostic;
     const actual_depth = try reusableDiagnostic(excessive_depth);
     try testing.expectEqual(error.DepthExceeded, actual_depth.err);
     try expectDiagnosticEqual(expected_depth, actual_depth);
@@ -347,7 +347,7 @@ test "JSONL validation allocates only the global structural index" {
     const diagnostic = (try jsonl.validateJsonl(
         invalid_fixed.allocator(),
         invalid_input,
-    )).?;
+    )) orelse return error.ExpectedDiagnostic;
     try testing.expectEqual(@as(usize, 1), diagnostic.record_index);
     try testing.expectEqual(error.TrailingComma, diagnostic.err);
 }
@@ -358,7 +358,7 @@ test "JSONL reusable record tape rejects forged bounds" {
     var iterator = try parser.iterate("{\"a\":1}\n");
     defer iterator.deinit();
 
-    var record = switch ((try iterator.next()).?) {
+    var record = switch ((try iterator.next()) orelse return error.ExpectedRecord) {
         .record => |value| value,
         .diagnostic => return error.UnexpectedDiagnostic,
     };
@@ -399,7 +399,7 @@ test "JSONL reusable iterator copies go stale on terminal outcomes" {
 
     var diagnostic_iterator = try parser.iterate("[,]\n");
     var diagnostic_copy = diagnostic_iterator;
-    const diagnostic_result = (try diagnostic_iterator.next()).?;
+    const diagnostic_result = (try diagnostic_iterator.next()) orelse return error.ExpectedDiagnostic;
     switch (diagnostic_result) {
         .diagnostic => {},
         .record => return error.UnexpectedRecord,

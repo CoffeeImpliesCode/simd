@@ -12,7 +12,7 @@ const IndexSink = struct {
     indexes: []u32,
     count: usize = 0,
 
-    pub fn appendOffset(self: *@This(), offset: usize) lexical.Error!void {
+    pub fn appendOffset(self: *IndexSink, offset: usize) lexical.Error!void {
         if (offset > std.math.maxInt(u32)) return error.InputTooLarge;
         if (self.count >= self.indexes.len) return error.CapacityExceeded;
         self.indexes[self.count] = @intCast(offset);
@@ -20,7 +20,7 @@ const IndexSink = struct {
     }
 
     pub fn appendMask(
-        self: *@This(),
+        self: *IndexSink,
         comptime T: type,
         mask: T,
         base_offset: usize,
@@ -91,15 +91,15 @@ pub fn validateJson5(
 }
 
 pub fn indexJson5Into(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     indexes: []u32,
     input: []const u8,
 ) lexical.Error!usize {
     if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
 
-    var sink = IndexSink{ .indexes = indexes };
+    var sink: IndexSink = .{ .indexes = indexes };
     var state: lexical.State = .{};
-    lexical.feed(VLEN, .json5, &state, input, 0, &sink) catch |err| switch (err) {
+    lexical.feed(vlen, .json5, &state, input, 0, &sink) catch |err| switch (err) {
         error.NonContiguousInput => unreachable,
         error.CapacityExceeded => return error.CapacityExceeded,
         error.InputTooLarge => return error.InputTooLarge,
@@ -113,7 +113,7 @@ pub fn indexJson5Into(
 }
 
 pub fn indexJson5Impl(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     allocator: std.mem.Allocator,
     input: []const u8,
 ) !stage1.StructuralIndex {
@@ -122,7 +122,7 @@ pub fn indexJson5Impl(
     errdefer result.deinit(allocator);
 
     result.count = indexJson5Into(
-        VLEN,
+        vlen,
         result.indexes[0 .. result.indexes.len - sentinel_count],
         input,
     ) catch |err| switch (err) {
@@ -311,13 +311,13 @@ fn expectJson5MatchesScalar(input: []const u8) !void {
 }
 
 fn expectJson5ImplMatchesScalar(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     input: []const u8,
 ) !void {
     var expected = try scalarIndexJson5(testing.allocator, input);
     defer expected.deinit(testing.allocator);
 
-    var actual = try indexJson5Impl(VLEN, testing.allocator, input);
+    var actual = try indexJson5Impl(vlen, testing.allocator, input);
     defer actual.deinit(testing.allocator);
 
     try testing.expectEqualSlices(u32, expected.slice(), actual.slice());
@@ -328,46 +328,46 @@ test "indexJson5 implementations match scalar around vector boundaries" {
         0, 1, 14, 15, 16, 17, 30, 31, 32, 33, 62, 63, 64, 65, 66,
     };
 
-    inline for ([_]usize{ 4, 5, 7, 16, 32, 64 }) |VLEN| {
+    inline for ([_]usize{ 4, 5, 7, 16, 32, 64 }) |vlen| {
         for (boundary_lengths) |length| {
             var boundary_input: [66]u8 = @splat(' ');
             if (length > 0) {
                 boundary_input[length - 1] = '$';
             }
-            try expectJson5ImplMatchesScalar(VLEN, boundary_input[0..length]);
+            try expectJson5ImplMatchesScalar(vlen, boundary_input[0..length]);
         }
 
-        var block_input: [VLEN * 5 + 8]u8 = @splat(' ');
+        var block_input: [vlen * 5 + 8]u8 = @splat(' ');
         block_input[0] = '{';
-        block_input[VLEN - 1] = 0xc3;
-        block_input[VLEN] = 0xa9;
-        block_input[VLEN + 1] = ':';
-        block_input[VLEN + 2 .. VLEN + 6].* = "0x2A".*;
-        block_input[VLEN + 6] = ',';
-        block_input[VLEN * 2 - 1] = '/';
-        block_input[VLEN * 2] = '*';
-        block_input[VLEN * 2 + 1 .. VLEN * 2 + 4].* = "\"['".*;
-        block_input[VLEN * 3 - 1] = '*';
-        block_input[VLEN * 3] = '/';
-        block_input[VLEN * 3 + 1 .. VLEN * 3 + 4].* = "_k:".*;
-        block_input[VLEN * 3 + 4] = '\'';
-        block_input[VLEN * 4 - 1] = '\\';
-        block_input[VLEN * 4] = '\'';
-        block_input[VLEN * 4 + 1] = '\'';
-        block_input[VLEN * 4 + 2] = ',';
-        block_input[VLEN * 5 - 1] = 0xc2;
-        block_input[VLEN * 5] = 0xa0;
-        block_input[VLEN * 5 + 1 .. VLEN * 5 + 8].* = "$ok:1,}".*;
-        try expectJson5ImplMatchesScalar(VLEN, &block_input);
+        block_input[vlen - 1] = 0xc3;
+        block_input[vlen] = 0xa9;
+        block_input[vlen + 1] = ':';
+        block_input[vlen + 2 .. vlen + 6].* = "0x2A".*;
+        block_input[vlen + 6] = ',';
+        block_input[vlen * 2 - 1] = '/';
+        block_input[vlen * 2] = '*';
+        block_input[vlen * 2 + 1 .. vlen * 2 + 4].* = "\"['".*;
+        block_input[vlen * 3 - 1] = '*';
+        block_input[vlen * 3] = '/';
+        block_input[vlen * 3 + 1 .. vlen * 3 + 4].* = "_k:".*;
+        block_input[vlen * 3 + 4] = '\'';
+        block_input[vlen * 4 - 1] = '\\';
+        block_input[vlen * 4] = '\'';
+        block_input[vlen * 4 + 1] = '\'';
+        block_input[vlen * 4 + 2] = ',';
+        block_input[vlen * 5 - 1] = 0xc2;
+        block_input[vlen * 5] = 0xa0;
+        block_input[vlen * 5 + 1 .. vlen * 5 + 8].* = "$ok:1,}".*;
+        try expectJson5ImplMatchesScalar(vlen, &block_input);
 
-        var line_input: [VLEN * 2 + 5]u8 = @splat(' ');
+        var line_input: [vlen * 2 + 5]u8 = @splat(' ');
         line_input[0] = '[';
-        line_input[VLEN - 1] = '/';
-        line_input[VLEN] = '/';
-        line_input[VLEN + 1 .. VLEN + 4].* = "'{\"".*;
-        line_input[VLEN * 2 - 1] = '\n';
-        line_input[VLEN * 2 .. VLEN * 2 + 5].* = "0xf,]".*;
-        try expectJson5ImplMatchesScalar(VLEN, &line_input);
+        line_input[vlen - 1] = '/';
+        line_input[vlen] = '/';
+        line_input[vlen + 1 .. vlen + 4].* = "'{\"".*;
+        line_input[vlen * 2 - 1] = '\n';
+        line_input[vlen * 2 .. vlen * 2 + 5].* = "0xf,]".*;
+        try expectJson5ImplMatchesScalar(vlen, &line_input);
     }
 }
 
@@ -473,15 +473,15 @@ test "indexJson5 excludes comments and comment markers in single strings" {
 
 test "indexJson5 tracks opposite quote delimiters inside strings" {
     const input = "{\"text\":\"a'b\", next:1}";
-    inline for ([_]usize{ 4, 5, 7, 16, 32, 64 }) |VLEN| {
-        try expectJson5ImplMatchesScalar(VLEN, input);
+    inline for ([_]usize{ 4, 5, 7, 16, 32, 64 }) |vlen| {
+        try expectJson5ImplMatchesScalar(vlen, input);
     }
 }
 
 test "indexJson5 keeps adjacent escaped and Unicode atom bytes together" {
     const input = "{foo\\u004bar:1, éfoo:2}";
-    inline for ([_]usize{ 4, 5, 7, 16, 32, 64 }) |VLEN| {
-        try expectJson5ImplMatchesScalar(VLEN, input);
+    inline for ([_]usize{ 4, 5, 7, 16, 32, 64 }) |vlen| {
+        try expectJson5ImplMatchesScalar(vlen, input);
     }
 }
 
@@ -627,9 +627,9 @@ test "indexJson5 matches scalar for adversarial lexical forms" {
         "['escaped \\' quote',\"double // /*\",-0X2b,]",
     };
 
-    inline for ([_]usize{ 4, 5, 7, 16, 32, 64 }) |VLEN| {
+    inline for ([_]usize{ 4, 5, 7, 16, 32, 64 }) |vlen| {
         for (cases) |input| {
-            try expectJson5ImplMatchesScalar(VLEN, input);
+            try expectJson5ImplMatchesScalar(vlen, input);
         }
     }
 }
@@ -731,8 +731,8 @@ test "indexJson5 matches scalar for every byte value" {
     for (0..input.len) |byte_offset| {
         input[byte_offset] = @as(u8, @truncate(byte_offset));
     }
-    inline for ([_]usize{ 4, 5, 7, 16, 32, 64 }) |VLEN| {
-        try expectJson5ImplMatchesScalar(VLEN, &input);
+    inline for ([_]usize{ 4, 5, 7, 16, 32, 64 }) |vlen| {
+        try expectJson5ImplMatchesScalar(vlen, &input);
     }
 }
 

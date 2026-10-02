@@ -22,18 +22,28 @@ pub const matchRange = simd.matchRange;
 pub const extractBitIndexes = simd.extractBitIndexes;
 pub const computeBackslashRuns = simd.computeBackslashRuns;
 
+const json_format = @import("formats/json.zig");
+const jsonl_format = @import("formats/jsonl.zig");
+const jsonc_format = @import("formats/jsonc.zig");
+const json5_format = @import("formats/json5.zig");
+const markdown_format = @import("formats/markdown.zig");
+const commonmark_format = @import("formats/commonmark.zig");
+const xml_format = @import("formats/xml.zig");
+const yaml_format = @import("formats/yaml.zig");
+const yaml_extended_format = @import("formats/yaml_extended.zig");
+
 pub const StructuralIndex = stage1.StructuralIndex;
 
 pub const formats = struct {
-    pub const json = @import("formats/json.zig");
-    pub const jsonl = @import("formats/jsonl.zig");
-    pub const jsonc = @import("formats/jsonc.zig");
-    pub const json5 = @import("formats/json5.zig");
-    pub const markdown = @import("formats/markdown.zig");
-    pub const commonmark = @import("formats/commonmark.zig");
-    pub const xml = @import("formats/xml.zig");
-    pub const yaml = @import("formats/yaml.zig");
-    pub const yaml_extended = @import("formats/yaml_extended.zig");
+    pub const json = json_format;
+    pub const jsonl = jsonl_format;
+    pub const jsonc = jsonc_format;
+    pub const json5 = json5_format;
+    pub const markdown = markdown_format;
+    pub const commonmark = commonmark_format;
+    pub const xml = xml_format;
+    pub const yaml = yaml_format;
+    pub const yaml_extended = yaml_extended_format;
 };
 
 test "refAllDecls" {

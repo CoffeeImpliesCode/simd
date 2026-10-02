@@ -17,7 +17,7 @@ pub const native_vector_len: usize = switch (builtin.cpu.arch) {
 
 pub const default_vector_len: usize = build_options.vector_len orelse native_vector_len;
 
-pub fn Vec(comptime len: usize, comptime T: type) type {
+pub fn Vec(comptime T: type, comptime len: usize) type {
     comptime assert(len > 0);
     return @Vector(len, T);
 }
@@ -63,7 +63,7 @@ pub fn ChunkIterator(comptime T: type, comptime len: usize, comptime pad: bool) 
             };
         }
 
-        pub fn next(self: *Self) ?Vec(len, T) {
+        pub fn next(self: *Self) ?Vec(T, len) {
             if (self.rest.len < len) {
                 if (self.rest.len == 0 or !pad) return null;
                 var values: [len]T = @splat(self.fill.?);
@@ -73,7 +73,7 @@ pub fn ChunkIterator(comptime T: type, comptime len: usize, comptime pad: bool) 
                 self.rest = &.{};
                 return values;
             }
-            const v: Vec(len, T) = self.rest[0..len].*;
+            const v: Vec(T, len) = self.rest[0..len].*;
             self.rest = self.rest[len..];
             return v;
         }
@@ -83,18 +83,18 @@ pub fn ChunkIterator(comptime T: type, comptime len: usize, comptime pad: bool) 
 pub fn windows(
     comptime T: type,
     comptime len: usize,
-    data: []const T,
     comptime fill: ?T,
+    data: []const T,
 ) ChunkIterator(T, len, fill != null) {
     return ChunkIterator(T, len, fill != null).init(data, fill);
 }
 
 const PrefixXorPclmul = struct {
-    fn multiply(bitmask: u64) u64 {
+    fn multiply(_bitmask: u64) u64 {
         const product = asm (
             \\ vpclmulqdq $0x00, %[bitmask], %[ones], %[out]
             : [out] "=x" (-> @Vector(2, u64)),
-            : [bitmask] "x" (@as(@Vector(2, u64), @bitCast(@as(u128, bitmask)))),
+            : [bitmask] "x" (@as(@Vector(2, u64), @bitCast(@as(u128, _bitmask)))),
               [ones] "x" (@as(@Vector(2, u64), @bitCast(@as(u128, std.math.maxInt(u64))))),
         );
         return @truncate(@as(u128, @bitCast(product)));
@@ -110,10 +110,11 @@ pub fn prefixXor(comptime T: type, bitmask: T) T {
         builtin.cpu.has(.x86, .avx) and
         builtin.cpu.has(.x86, .pclmul))
     {
-        const Unsigned = @Int(.unsigned, bits);
-        const extended: u64 = @as(Unsigned, @bitCast(bitmask));
+        const unsigned = @Int(.unsigned, bits);
+        const widened: unsigned = @bitCast(bitmask);
+        const extended: u64 = widened;
         const prefix = PrefixXorPclmul.multiply(extended);
-        return @bitCast(@as(Unsigned, @truncate(prefix)));
+        return @bitCast(@as(unsigned, @truncate(prefix)));
     }
     var x = bitmask;
     const steps = @typeInfo(std.math.Log2Int(T)).int.bits;
@@ -188,9 +189,9 @@ pub fn computeBackslashRuns(
 /// not byte alignment or a fixed power-of-two rule.
 pub fn MaskStorage(comptime bits: usize) type {
     comptime assert(bits > 0);
-    const Result = Mask(bits);
-    if (@bitSizeOf(Result) == @sizeOf(Result) * 8) return Result;
-    return @Int(.unsigned, @sizeOf(Result) * 8);
+    const result = Mask(bits);
+    if (@bitSizeOf(result) == @sizeOf(result) * 8) return result;
+    return @Int(.unsigned, @sizeOf(result) * 8);
 }
 
 /// Widens `mask` to its storage type and explicitly bounds the logical lanes.
@@ -201,39 +202,140 @@ pub fn MaskStorage(comptime bits: usize) type {
 pub fn exactMask(comptime T: type, mask: T) MaskStorage(@typeInfo(T).int.bits) {
     comptime validateMaskType(T);
 
-    const Storage = MaskStorage(@typeInfo(T).int.bits);
-    if (Storage == T) return mask;
+    const storage = MaskStorage(@typeInfo(T).int.bits);
+    if (storage == T) return mask;
 
-    const logical_bits: Storage = @intCast(std.math.maxInt(T));
-    return @as(Storage, @intCast(mask)) & logical_bits;
+    const logical_bits: storage = @intCast(std.math.maxInt(T));
+    return @as(storage, @intCast(mask)) & logical_bits;
 }
 
-pub fn matchByte(comptime len: usize, v: Vec(len, u8), target: u8) Mask(len) {
-    const splatted: Vec(len, u8) = @splat(target);
-    const eq: Vec(len, bool) = v == splatted;
+// Explicit lane-to-bit masks for big-endian and sub-16-byte Hexagon vectors.
+// Widen each 0/1 result before shifting it into bit `lane`. Opaque scalar
+// predicates avoid the observed aarch64_be ReleaseSafe weighted-loop
+// divergence. The noinline walks take vectors directly: converting a width-64
+// vector to an array in a large inlined caller also corrupted lanes there.
+// Resolve target selection at comptime: no runtime Arch.endian call, and
+// other targets do not instantiate these walks.
+// Keep public matchers inline: out-of-line LoongArch Debug calls corrupt
+// width-256/512 mask results, while direct comparisons and bitcasts agree.
+
+// Both halves of the lane-walk selection are compilation-unit invariants.
+// Resolve each one once instead of re-reading `builtin.cpu.arch` inside every
+// matcher: callers instantiate one width at a time, and each repeat of that
+// `Arch.endian()` switch spent backwards branches of the calling function's
+// shared comptime budget.
+const target_is_big_endian: bool = builtin.cpu.arch.endian() == .big;
+const target_is_hexagon: bool = builtin.cpu.arch == .hexagon;
+
+noinline fn laneMatchByte(comptime len: usize, v: Vec(u8, len), target: u8) Mask(len) {
+    const storage = MaskStorage(len);
+    var result: storage = 0;
+    inline for (0..len) |lane| {
+        result |= @as(storage, @intFromBool(v[lane] == target)) << lane;
+    }
+    return @truncate(result);
+}
+
+noinline fn laneByteMatches2(byte: u8, c1: u8, c2: u8) u8 {
+    return @intCast(@intFromBool(byte == c1) | @intFromBool(byte == c2));
+}
+
+noinline fn laneByteMatches4(byte: u8, c1: u8, c2: u8, c3: u8, c4: u8) u8 {
+    return @intCast(
+        @intFromBool(byte == c1) | @intFromBool(byte == c2) |
+            @intFromBool(byte == c3) | @intFromBool(byte == c4),
+    );
+}
+
+noinline fn laneMatchAny2(
+    comptime len: usize,
+    v: Vec(u8, len),
+    c1: u8,
+    c2: u8,
+) Mask(len) {
+    const storage = MaskStorage(len);
+    var result: storage = 0;
+    inline for (0..len) |lane| {
+        const matches = laneByteMatches2(v[lane], c1, c2);
+        result |= @as(storage, matches) << lane;
+    }
+    return @truncate(result);
+}
+
+noinline fn laneMatchAny4(
+    comptime len: usize,
+    v: Vec(u8, len),
+    c1: u8,
+    c2: u8,
+    c3: u8,
+    c4: u8,
+) Mask(len) {
+    const storage = MaskStorage(len);
+    var result: storage = 0;
+    inline for (0..len) |lane| {
+        const matches = laneByteMatches4(v[lane], c1, c2, c3, c4);
+        result |= @as(storage, matches) << lane;
+    }
+    return @truncate(result);
+}
+
+noinline fn laneMatchRange(
+    comptime len: usize,
+    v: Vec(u8, len),
+    min: u8,
+    max: u8,
+) Mask(len) {
+    const storage = MaskStorage(len);
+    var result: storage = 0;
+    inline for (0..len) |lane| {
+        const matches = @intFromBool(v[lane] >= min) & @intFromBool(v[lane] <= max);
+        result |= @as(storage, matches) << lane;
+    }
+    return @truncate(result);
+}
+
+pub inline fn matchByte(comptime len: usize, v: Vec(u8, len), target: u8) Mask(len) {
+    if (comptime target_is_big_endian or (target_is_hexagon and len < 16)) {
+        return laneMatchByte(len, v, target);
+    }
+
+    const byte_vector = Vec(u8, len);
+    const eq: Vec(bool, len) = v == @as(byte_vector, @splat(target));
     return @bitCast(eq);
 }
 
-pub fn matchAny2(comptime len: usize, v: Vec(len, u8), c1: u8, c2: u8) Mask(len) {
-    const eq1: Vec(len, bool) = v == @as(Vec(len, u8), @splat(c1));
-    const eq2: Vec(len, bool) = v == @as(Vec(len, u8), @splat(c2));
-    const combined: Vec(len, bool) = eq1 | eq2;
+pub inline fn matchAny2(comptime len: usize, v: Vec(u8, len), c1: u8, c2: u8) Mask(len) {
+    if (comptime target_is_big_endian or (target_is_hexagon and len < 16)) {
+        return laneMatchAny2(len, v, c1, c2);
+    }
+
+    const byte_vector = Vec(u8, len);
+    const combined: Vec(bool, len) = (v == @as(byte_vector, @splat(c1))) |
+        (v == @as(byte_vector, @splat(c2)));
     return @bitCast(combined);
 }
 
-pub fn matchAny4(comptime len: usize, v: Vec(len, u8), c1: u8, c2: u8, c3: u8, c4: u8) Mask(len) {
-    const eq1: Vec(len, bool) = v == @as(Vec(len, u8), @splat(c1));
-    const eq2: Vec(len, bool) = v == @as(Vec(len, u8), @splat(c2));
-    const eq3: Vec(len, bool) = v == @as(Vec(len, u8), @splat(c3));
-    const eq4: Vec(len, bool) = v == @as(Vec(len, u8), @splat(c4));
-    const combined: Vec(len, bool) = eq1 | eq2 | eq3 | eq4;
+pub inline fn matchAny4(comptime len: usize, v: Vec(u8, len), c1: u8, c2: u8, c3: u8, c4: u8) Mask(len) {
+    if (comptime target_is_big_endian or (target_is_hexagon and len < 16)) {
+        return laneMatchAny4(len, v, c1, c2, c3, c4);
+    }
+
+    const byte_vector = Vec(u8, len);
+    const combined: Vec(bool, len) = (v == @as(byte_vector, @splat(c1))) |
+        (v == @as(byte_vector, @splat(c2))) |
+        (v == @as(byte_vector, @splat(c3))) |
+        (v == @as(byte_vector, @splat(c4)));
     return @bitCast(combined);
 }
 
-pub fn matchRange(comptime len: usize, v: Vec(len, u8), min: u8, max: u8) Mask(len) {
-    const ge_min: Vec(len, bool) = v >= @as(Vec(len, u8), @splat(min));
-    const le_max: Vec(len, bool) = v <= @as(Vec(len, u8), @splat(max));
-    const in_range: Vec(len, bool) = ge_min & le_max;
+pub inline fn matchRange(comptime len: usize, v: Vec(u8, len), min: u8, max: u8) Mask(len) {
+    if (comptime target_is_big_endian or (target_is_hexagon and len < 16)) {
+        return laneMatchRange(len, v, min, max);
+    }
+
+    const byte_vector = Vec(u8, len);
+    const in_range: Vec(bool, len) = (v >= @as(byte_vector, @splat(min))) &
+        (v <= @as(byte_vector, @splat(max)));
     return @bitCast(in_range);
 }
 
@@ -241,24 +343,28 @@ pub fn validMask(comptime bits: usize, valid_count: usize) Mask(bits) {
     comptime assert(bits > 0);
     assert(valid_count <= bits);
 
-    const Result = Mask(bits);
-    if (valid_count == bits) return std.math.maxInt(Result);
+    const result = Mask(bits);
+    if (valid_count == bits) return std.math.maxInt(result);
     if (valid_count == 0) return 0;
 
-    const Shift = std.math.Log2Int(Result);
-    return (@as(Result, 1) << @as(Shift, @intCast(valid_count))) - 1;
+    const shift = std.math.Log2Int(result);
+    return (@as(result, 1) << @as(shift, @intCast(valid_count))) - 1;
 }
 
-pub fn matchJsonWhitespace(comptime len: usize, v: Vec(len, u8)) Mask(len) {
+pub inline fn matchJsonWhitespace(comptime len: usize, v: Vec(u8, len)) Mask(len) {
     comptime assert(len > 0);
+    if (comptime target_is_big_endian or (target_is_hexagon and len < 16)) {
+        return matchAny4(len, v, ' ', '\t', '\n', '\r');
+    }
 
-    const tab: Vec(len, u8) = @splat(0x09);
+    const byte_vector = Vec(u8, len);
+    const tab: byte_vector = @splat(0x09);
     const distance_from_tab = v -% tab;
     const folded_distance = distance_from_tab |
-        ((distance_from_tab & @as(Vec(len, u8), @splat(0x02))) <<
-            @as(Vec(len, u8), @splat(1)));
-    const control_whitespace = folded_distance <= @as(Vec(len, u8), @splat(0x04));
-    const whitespace = control_whitespace | (v == @as(Vec(len, u8), @splat(0x20)));
+        ((distance_from_tab & @as(byte_vector, @splat(0x02))) <<
+            @as(byte_vector, @splat(1)));
+    const control_whitespace = folded_distance <= @as(byte_vector, @splat(0x04));
+    const whitespace = control_whitespace | (v == @as(byte_vector, @splat(0x20)));
     return @bitCast(whitespace);
 }
 
@@ -285,9 +391,9 @@ pub fn trailingRunOdd(
     // count names the trailing non-matching run at the width it is read from.
     // A logical-width alignment read through a widened `@clz` would add the
     // spare bits to the count and flip the parity at every odd spare width.
-    const Storage = MaskStorage(bits);
-    const Shift = std.math.Log2Int(Storage);
-    const alignment: Shift = @intCast(@bitSizeOf(Storage) - valid_count);
+    const storage = MaskStorage(bits);
+    const shift = std.math.Log2Int(storage);
+    const alignment: shift = @intCast(@bitSizeOf(storage) - valid_count);
     const trailing_count: usize = @intCast(@clz(non_matching << alignment));
     return trailing_count % 2 != 0;
 }
@@ -502,7 +608,7 @@ fn utf8ConstrainedContinuationValid(header: u8, continuation: u8) bool {
 
 fn utf8BlockIsValid(
     comptime len: usize,
-    bytes: Vec(len, u8),
+    bytes: Vec(u8, len),
     state: *Utf8BlockState,
 ) bool {
     const ascii = matchRange(len, bytes, 0x00, 0x7f);
@@ -587,7 +693,7 @@ fn utf8SuspectOffset(comptime len: usize, input: []const u8) ?usize {
     var state: Utf8BlockState = .{};
     var offset: usize = 0;
     while (input.len - offset >= len) : (offset += len) {
-        const bytes: Vec(len, u8) = input[offset..][0..len].*;
+        const bytes: Vec(u8, len) = input[offset..][0..len].*;
         if (!utf8BlockIsValid(len, bytes, &state)) return offset;
     }
 
@@ -682,7 +788,7 @@ fn expectUtf8InvalidSequenceAtBoundary(
 ) !void {
     var input: [68]u8 = [_]u8{'a'} ** 68;
     @memcpy(input[start..][0..sequence.len], sequence);
-    const expected = Utf8Result{ .invalid = .{
+    const expected: Utf8Result = .{ .invalid = .{
         .kind = kind,
         .offset = start + error_relative_offset,
     } };
@@ -754,7 +860,7 @@ test "UTF-8 reports exact scalar error classes and offsets" {
         .{ .bytes = &[_]u8{ 0xf0, 0x90 }, .kind = .truncated_sequence, .offset = 0 },
     };
     for (cases) |case| {
-        const expected = Utf8Result{ .invalid = .{
+        const expected: Utf8Result = .{ .invalid = .{
             .kind = case.kind,
             .offset = case.offset,
         } };
@@ -775,7 +881,7 @@ test "UTF-8 reports truncation at block edges and tails" {
                 if (start + prefix.len <= 68) {
                     var input: [68]u8 = [_]u8{'z'} ** 68;
                     @memcpy(input[start..][0..prefix.len], prefix);
-                    const expected = Utf8Result{ .invalid = .{
+                    const expected: Utf8Result = .{ .invalid = .{
                         .kind = .truncated_sequence,
                         .offset = start,
                     } };
@@ -1124,8 +1230,8 @@ test "computeBackslashRuns stays exact at padded and over-wide storage" {
     inline for (.{
         Mask(24),  Mask(48),  Mask(65),  Mask(100),
         Mask(128), Mask(129), Mask(257),
-    }) |T| {
-        try expectBackslashRunParity(T);
+    }) |t| {
+        try expectBackslashRunParity(t);
     }
 }
 
@@ -1155,8 +1261,8 @@ fn expectExhaustiveBackslashRunParity(comptime T: type) !void {
 }
 
 test "computeBackslashRuns matches scalar parity for every small mask" {
-    inline for (.{ u4, u5, u7 }) |T| {
-        try expectExhaustiveBackslashRunParity(T);
+    inline for (.{ u4, u5, u7 }) |t| {
+        try expectExhaustiveBackslashRunParity(t);
     }
 }
 
@@ -1183,19 +1289,61 @@ fn expectBitIndexExtraction(comptime T: type) !void {
 }
 
 test "extractBitIndexes handles arbitrary mask widths" {
-    inline for (.{ u4, u5, u7, u16, u32, u64 }) |T| {
-        try expectBitIndexExtraction(T);
+    inline for (.{ u4, u5, u7, u16, u32, u64 }) |t| {
+        try expectBitIndexExtraction(t);
     }
 }
 
 fn expectMatchedByteIndexExtraction(comptime len: usize) !void {
     const base_offset: usize = 500;
     var matching_lane: usize = 0;
+    errdefer std.log.err("width={d} matching_lane={d}", .{ len, matching_lane });
     while (matching_lane < len) : (matching_lane += 1) {
         var bytes: [len]u8 = @splat(0);
         bytes[matching_lane] = '<';
 
-        const vector: Vec(len, u8) = bytes;
+        const vector: Vec(u8, len) = bytes;
+        const storage = MaskStorage(len);
+        const expected = @as(storage, 1) <<
+            @as(std.math.Log2Int(storage), @intCast(matching_lane));
+        try testing.expectEqual(expected, exactMask(Mask(len), matchByte(len, vector, '<')));
+        try testing.expectEqual(expected, exactMask(Mask(len), matchAny2(len, vector, '<', '>')));
+        try testing.expectEqual(expected, exactMask(Mask(len), matchAny4(len, vector, '<', '>', '=', '"')));
+        try testing.expectEqual(expected, exactMask(Mask(len), matchRange(len, vector, '<', '>')));
+
+        // Candidate positions other than c1: the same lane must be found when
+        // the matching byte is the second, third, or fourth candidate.
+        try testing.expectEqual(expected, exactMask(Mask(len), matchAny2(len, vector, '>', '<')));
+        try testing.expectEqual(expected, exactMask(Mask(len), matchAny4(len, vector, '>', '=', '"', '<')));
+        try testing.expectEqual(expected, exactMask(Mask(len), matchAny4(len, vector, '>', '=', '<', '"')));
+        try testing.expectEqual(expected, exactMask(Mask(len), matchAny4(len, vector, '>', '<', '=', '"')));
+
+        // Two matching lanes. Every assertion above finds a single byte, so
+        // none of them can reach a mask that carries more than one bit.
+        const other_lane = (matching_lane + 1) % len;
+        var pair: [len]u8 = @splat(0);
+        pair[matching_lane] = '<';
+        pair[other_lane] = '<';
+        const pair_vector: Vec(u8, len) = pair;
+        const pair_expected = expected | (@as(storage, 1) <<
+            @as(std.math.Log2Int(storage), @intCast(other_lane)));
+        try testing.expectEqual(
+            pair_expected,
+            exactMask(Mask(len), matchByte(len, pair_vector, '<')),
+        );
+        try testing.expectEqual(
+            pair_expected,
+            exactMask(Mask(len), matchAny2(len, pair_vector, '<', '>')),
+        );
+        try testing.expectEqual(
+            pair_expected,
+            exactMask(Mask(len), matchAny4(len, pair_vector, '<', '>', '=', '"')),
+        );
+        try testing.expectEqual(
+            pair_expected,
+            exactMask(Mask(len), matchRange(len, pair_vector, '<', '>')),
+        );
+
         const punctuation_mask = matchAny4(len, vector, '<', '>', '=', '"') |
             matchByte(len, vector, '\'');
         var indexes: [len]u32 = undefined;
@@ -1210,15 +1358,15 @@ fn expectMatchedByteIndexExtraction(comptime len: usize) !void {
 }
 
 test "comparison masks extract only matching vector lanes" {
-    inline for (.{ 4, 5, 7, 16, 24, 32, 48, 64, 65 }) |len| {
+    inline for (.{ 4, 5, 7, 12, 16, 24, 32, 48, 64, 65, 257 }) |len| {
         try expectMatchedByteIndexExtraction(len);
     }
 }
 
 fn expectCtzResultType(comptime T: type) void {
     comptime validateMaskType(T);
-    const ctz_result_type = @TypeOf(@ctz(@as(T, 1)));
-    comptime assert(ctz_result_type == std.math.Log2IntCeil(T));
+    const CtzResultType = @TypeOf(@ctz(@as(T, 1)));
+    comptime assert(CtzResultType == std.math.Log2IntCeil(T));
 }
 
 test "@ctz returns Log2IntCeil for every mask width" {
@@ -1245,30 +1393,39 @@ fn scalarJsonWhitespace(byte: u8) bool {
     return byte == ' ' or byte == '\t' or byte == '\n' or byte == '\r';
 }
 
+/// The sweep's scalar oracle, kept out of line. Same classifier, same
+/// arithmetic, one lane walk over the array. The inlined form also diverged at
+/// width 64, so it is separated for the same reason the leaves above are.
+noinline fn whitespaceMaskBytes(comptime len: usize, bytes: [len]u8) Mask(len) {
+    var result: Mask(len) = 0;
+    for (bytes, 0..) |byte, lane| {
+        if (scalarJsonWhitespace(byte)) {
+            result |= @as(Mask(len), 1) <<
+                @as(std.math.Log2Int(Mask(len)), @intCast(lane));
+        }
+    }
+    return result;
+}
+
 fn expectJsonWhitespaceForWidth(comptime len: usize) !void {
     var bytes: [len]u8 = undefined;
     var byte_start: usize = 0;
+    errdefer std.log.err("width={d} byte_start={d}", .{ len, byte_start });
     while (byte_start < 256) : (byte_start += 1) {
         for (0..len) |lane| {
             bytes[lane] = @intCast((byte_start + lane) % 256);
         }
 
-        const vector: Vec(len, u8) = bytes;
+        const vector: Vec(u8, len) = bytes;
         // Compare the matcher and scalar oracle in the same representation.
         const actual = exactMask(Mask(len), matchJsonWhitespace(len, vector));
-        var expected: Mask(len) = 0;
-        for (bytes, 0..) |byte, lane| {
-            if (scalarJsonWhitespace(byte)) {
-                expected |= @as(Mask(len), 1) <<
-                    @as(std.math.Log2Int(Mask(len)), @intCast(lane));
-            }
-        }
+        const expected = whitespaceMaskBytes(len, bytes);
         try testing.expectEqual(exactMask(Mask(len), expected), actual);
     }
 }
 
 test "matchJsonWhitespace agrees with scalar classification for every byte" {
-    inline for (.{ 4, 5, 7, 16, 24, 32, 48, 64, 129, 257 }) |len| {
+    inline for (.{ 4, 5, 7, 12, 16, 24, 32, 48, 64, 129, 257 }) |len| {
         try expectJsonWhitespaceForWidth(len);
     }
 }
@@ -1352,7 +1509,7 @@ fn expectTrailingRunOddWide(comptime T: type) !void {
         0,
         std.math.maxInt(T),
         alternatingMask(T),
-        @as(T, 1),
+        1,
         std.math.maxInt(T) ^ @as(T, 1),
     };
     for (masks) |mask| {
@@ -1369,14 +1526,14 @@ fn expectTrailingRunOddWide(comptime T: type) !void {
 }
 
 test "trailingRunOdd agrees with scalar carry for all small masks" {
-    inline for (.{ u4, u5, u7 }) |T| {
-        try expectTrailingRunOddSmall(T);
+    inline for (.{ u4, u5, u7 }) |t| {
+        try expectTrailingRunOddSmall(t);
     }
 }
 
 test "trailingRunOdd agrees with scalar carry for wide masks" {
-    inline for (.{ u16, u32, u64 }) |T| {
-        try expectTrailingRunOddWide(T);
+    inline for (.{ u16, u32, u64 }) |t| {
+        try expectTrailingRunOddWide(t);
     }
 }
 
@@ -1387,8 +1544,8 @@ test "trailingRunOdd agrees with scalar carry at padded and over-wide storage" {
     inline for (.{
         Mask(24),  Mask(48),  Mask(65),  Mask(100),
         Mask(128), Mask(129), Mask(257),
-    }) |T| {
-        try expectTrailingRunOddWide(T);
+    }) |t| {
+        try expectTrailingRunOddWide(t);
     }
 }
 
@@ -1424,7 +1581,7 @@ fn expectCheckedBitIndexExtraction(comptime T: type) !void {
         extractBitIndexesChecked(
             T,
             bitmask,
-            @as(usize, std.math.maxInt(u32)),
+            std.math.maxInt(u32),
             &overflow_indexes,
         ),
     );
@@ -1440,7 +1597,7 @@ fn expectCheckedBitIndexExtraction(comptime T: type) !void {
         try extractBitIndexesChecked(
             T,
             one,
-            @as(usize, std.math.maxInt(u32)),
+            std.math.maxInt(u32),
             &boundary_index,
         ),
     );
@@ -1459,14 +1616,14 @@ fn expectCheckedBitIndexExtraction(comptime T: type) !void {
 }
 
 test "extractBitIndexesChecked emits complete output at all supported widths" {
-    inline for (.{ u4, u5, u7, u16, u32, u64 }) |T| {
-        try expectCheckedBitIndexExtraction(T);
+    inline for (.{ u4, u5, u7, u16, u32, u64 }) |t| {
+        try expectCheckedBitIndexExtraction(t);
     }
 }
 
 test "extractBitIndexes handles mask widths above 64 bits" {
-    inline for (.{ u65, u72, u100, u128 }) |T| {
-        try expectBitIndexExtraction(T);
-        try expectCheckedBitIndexExtraction(T);
+    inline for (.{ u65, u72, u100, u128 }) |t| {
+        try expectBitIndexExtraction(t);
+        try expectCheckedBitIndexExtraction(t);
     }
 }

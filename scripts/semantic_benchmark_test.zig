@@ -187,6 +187,7 @@ const Capture = struct {
         self.rows.deinit(self.allocator);
         self.declarations.deinit(self.allocator);
         self.cases.deinit(self.allocator);
+        self.* = undefined;
     }
 
     fn append(self: *Capture, comptime fmt: []const u8, args: anytype) !usize {
@@ -198,7 +199,7 @@ const Capture = struct {
     }
 
     /// Rewrites the tracked line `index` in place.
-    fn replaceLine(self: *Capture, index: usize, comptime fmt: []const u8, args: anytype) !void {
+    fn replaceLine(self: *Capture, comptime fmt: []const u8, index: usize, args: anytype) !void {
         const line = try std.fmt.allocPrint(self.allocator, fmt, args);
         self.allocator.free(self.lines.items[index]);
         self.lines.items[index] = line;
@@ -206,7 +207,7 @@ const Capture = struct {
 
     /// Rewrites the row of case `index` from `case` and keeps it addressable.
     fn replaceRow(self: *Capture, index: usize, case: Case) !void {
-        try self.replaceLine(self.rows.items[index], "{s},{s},{s},{s},{d},{d},{d},{d},{d},{d}", .{
+        try self.replaceLine("{s},{s},{s},{s},{d},{d},{d},{d},{d},{d}", self.rows.items[index], .{
             @tagName(case.format),
             @tagName(case.workload),
             @tagName(case.stage),
@@ -223,7 +224,7 @@ const Capture = struct {
 
     /// Inserts one line before the tracked line `index`; every tracked line at
     /// or after it moves down.
-    fn insertLine(self: *Capture, index: usize, comptime fmt: []const u8, args: anytype) !void {
+    fn insertLine(self: *Capture, comptime fmt: []const u8, index: usize, args: anytype) !void {
         const line = try std.fmt.allocPrint(self.allocator, fmt, args);
         errdefer self.allocator.free(line);
         try self.lines.insert(self.allocator, index, line);
@@ -355,7 +356,7 @@ test "a declaration may not split the rows of one fixture" {
 
     // The first fixture declares three rows. A second declaration between its
     // first and second row would measure one input under two identities.
-    try capture.insertLine(capture.rows.items[1], "{s}format=commonmark workload=cm_blocks input_hash={x}", .{
+    try capture.insertLine("{s}format=commonmark workload=cm_blocks input_hash={x}", capture.rows.items[1], .{
         report.input_declaration_prefix,
         contract.checksumBytes(cm_blocks_source),
     });
@@ -374,8 +375,8 @@ test "a declaration naming a foreign fixture or an unspellable hash is refused" 
         // YAML fixture in that declaration leaves the following row without
         // its own input, even though the hash it carries is a real one.
         try foreign.replaceLine(
-            foreign.declarations.items[2],
             "{s}format=yaml_extended workload=yaml_literal_clip input_hash={x}",
+            foreign.declarations.items[2],
             .{ report.input_declaration_prefix, contract.checksumBytes(yaml_literal_source) },
         );
         const text = try foreign.text();
@@ -388,8 +389,8 @@ test "a declaration naming a foreign fixture or an unspellable hash is refused" 
         var wide_hash = try buildCapture(testing.allocator, .declared);
         defer wide_hash.deinit();
         try wide_hash.replaceLine(
-            wide_hash.declarations.items[0],
             "{s}format=commonmark workload=cm_blocks input_hash=fffffffffffffffff",
+            wide_hash.declarations.items[0],
             .{report.input_declaration_prefix},
         );
         const text = try wide_hash.text();
@@ -494,12 +495,14 @@ fn mergeDriftingRecording(allocator: Allocator) !void {
     moved.checksum +%= 1;
     try second.replaceRow(0, moved);
 
-    const texts = try allocator.alloc([]u8, 2);
+    const first_text = try first.text();
+    defer allocator.free(first_text);
+    const second_text = try second.text();
+    defer allocator.free(second_text);
+    const texts = try allocator.alloc([]const u8, 2);
     defer allocator.free(texts);
-    texts[0] = try first.text();
-    defer allocator.free(texts[0]);
-    texts[1] = try second.text();
-    defer allocator.free(texts[1]);
+    texts[0] = first_text;
+    texts[1] = second_text;
 
     var analysis = report.analyzeSamples(allocator, texts, options, test_domain) catch |err| switch (err) {
         error.UnstableResults => return err,
@@ -540,7 +543,17 @@ fn decodeContradictoryCapture(allocator: Allocator) !void {
 /// with, so a decode that stops for the wrong reason still fails here.
 fn expectNoLeakAtAnyAllocation(path: anytype, accepted: []const anyerror) !void {
     var baseline = testing.FailingAllocator.init(testing.allocator, .{});
-    _ = path(baseline.allocator()) catch {};
+    // The baseline pass only counts what the path allocates. The path is
+    // expected to end in its own refusal, and with no fail index the allocator
+    // cannot stop it early, so that ending cannot propagate: it is what the
+    // enclosing test already asserts, and the sweep below re-derives it under
+    // injection. What the pass itself must guarantee is that it released
+    // everything it took.
+    _ = path(baseline.allocator()) catch |err| switch (err) {
+        error.OutOfMemory, error.UnstableResults, error.UnexpectedOutcome => {},
+        else => {},
+    };
+    try testing.expectEqual(baseline.allocated_bytes, baseline.freed_bytes);
     const total = baseline.alloc_index;
     // A path that allocates nothing would make the sweep below vacuous.
     try testing.expect(total > 0);

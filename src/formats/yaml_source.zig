@@ -6,11 +6,11 @@ pub fn failureOffset(input: []const u8) error{InputTooLarge}!?usize {
 }
 
 pub fn failureOffsetImpl(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     input: []const u8,
 ) error{InputTooLarge}!?usize {
     comptime {
-        if (VLEN < 4) {
+        if (vlen < 4) {
             @compileError("YAML validation vector width must be at least four bytes");
         }
     }
@@ -20,22 +20,22 @@ pub fn failureOffsetImpl(
     if (std.mem.startsWith(u8, input, "\xef\xbb\xbf")) index = 3;
 
     const printable_mask = simd.exactMask(
-        simd.Mask(VLEN),
-        std.math.maxInt(simd.Mask(VLEN)),
+        simd.Mask(vlen),
+        std.math.maxInt(simd.Mask(vlen)),
     );
     while (index < input.len) {
-        while (input.len - index >= VLEN) {
-            const bytes: simd.Vec(VLEN, u8) = input[index..][0..VLEN].*;
+        while (input.len - index >= vlen) {
+            const bytes: simd.Vec(u8, vlen) = input[index..][0..vlen].*;
             const printable = simd.exactMask(
-                simd.Mask(VLEN),
-                simd.matchRange(VLEN, bytes, 0x20, 0x7e),
+                simd.Mask(vlen),
+                simd.matchRange(vlen, bytes, 0x20, 0x7e),
             );
             if (printable != printable_mask) break;
-            index += VLEN;
+            index += vlen;
         }
         if (index >= input.len) break;
 
-        const scalar_end = index + @min(VLEN, input.len - index);
+        const scalar_end = index + @min(vlen, input.len - index);
         while (index < scalar_end) {
             const width = yamlCharacterWidth(input, index) orelse return index;
             index += width;

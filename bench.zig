@@ -4,15 +4,15 @@ const build_options = @import("build_options");
 const lib = @import("src/root.zig");
 
 const Allocator = std.mem.Allocator;
-const CHECKSUM_STRIDE: usize = 64;
-const CHECKSUM_BYTES: usize = 128;
-const STREAM_CHUNK_LEN: usize = 4096;
-const RESIDENT_PREFIX_EVENT_COUNT: usize = 8;
-const DEFAULT_ITERATIONS: usize = 3;
+const checksum_stride: usize = 64;
+const checksum_bytes: usize = 128;
+const default_stream_chunk_len: usize = 4096;
+const resident_prefix_event_count: usize = 8;
+const default_iterations: usize = 3;
 const workload_scale: usize = 64;
 const BenchOptions = struct {
-    iterations: usize = DEFAULT_ITERATIONS,
-    stream_chunk_len: usize = STREAM_CHUNK_LEN,
+    iterations: usize = default_iterations,
+    stream_chunk_len: usize = default_stream_chunk_len,
 };
 
 const Format = enum {
@@ -89,24 +89,24 @@ const ByteBuilder = struct {
     allocator: Allocator,
     bytes: std.ArrayList(u8) = .empty,
 
-    fn init(allocator: Allocator) @This() {
+    fn init(allocator: Allocator) ByteBuilder {
         return .{ .allocator = allocator };
     }
 
-    fn deinit(self: *@This()) void {
+    fn deinit(self: *ByteBuilder) void {
         self.bytes.deinit(self.allocator);
         self.* = undefined;
     }
 
-    fn append(self: *@This(), bytes: []const u8) !void {
+    fn append(self: *ByteBuilder, bytes: []const u8) !void {
         try self.bytes.appendSlice(self.allocator, bytes);
     }
 
-    fn appendByte(self: *@This(), byte: u8) !void {
+    fn appendByte(self: *ByteBuilder, byte: u8) !void {
         try self.bytes.append(self.allocator, byte);
     }
 
-    fn appendUsize(self: *@This(), value: usize) !void {
+    fn appendUsize(self: *ByteBuilder, value: usize) !void {
         var digits: [20]u8 = undefined;
         var length: usize = 0;
         var remaining = value;
@@ -131,7 +131,7 @@ const ByteBuilder = struct {
         try self.append(digits[0..length]);
     }
 
-    fn finish(self: *@This()) ![]const u8 {
+    fn finish(self: *ByteBuilder) ![]const u8 {
         return self.bytes.toOwnedSlice(self.allocator);
     }
 };
@@ -141,11 +141,11 @@ const CountingAllocator = struct {
     allocation_count: usize = 0,
     allocated_bytes: usize = 0,
 
-    fn allocator(self: *@This()) Allocator {
+    fn allocator(self: *CountingAllocator) Allocator {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    fn reset(self: *@This()) void {
+    fn reset(self: *CountingAllocator) void {
         self.allocation_count = 0;
         self.allocated_bytes = 0;
     }
@@ -163,7 +163,7 @@ const CountingAllocator = struct {
         alignment: std.mem.Alignment,
         return_address: usize,
     ) ?[*]u8 {
-        const self: *@This() = @ptrCast(@alignCast(context));
+        const self: *CountingAllocator = @ptrCast(@alignCast(context));
         const result = self.child.rawAlloc(length, alignment, return_address);
         if (result != null) {
             self.allocation_count +|= 1;
@@ -179,7 +179,7 @@ const CountingAllocator = struct {
         new_length: usize,
         return_address: usize,
     ) bool {
-        const self: *@This() = @ptrCast(@alignCast(context));
+        const self: *CountingAllocator = @ptrCast(@alignCast(context));
         const result = self.child.rawResize(memory, alignment, new_length, return_address);
         if (result and new_length > memory.len) {
             self.allocated_bytes +|= new_length - memory.len;
@@ -194,7 +194,7 @@ const CountingAllocator = struct {
         new_length: usize,
         return_address: usize,
     ) ?[*]u8 {
-        const self: *@This() = @ptrCast(@alignCast(context));
+        const self: *CountingAllocator = @ptrCast(@alignCast(context));
         const result = self.child.rawRemap(memory, alignment, new_length, return_address);
         if (result != null and new_length > memory.len) {
             self.allocated_bytes +|= new_length - memory.len;
@@ -208,7 +208,7 @@ const CountingAllocator = struct {
         alignment: std.mem.Alignment,
         return_address: usize,
     ) void {
-        const self: *@This() = @ptrCast(@alignCast(context));
+        const self: *CountingAllocator = @ptrCast(@alignCast(context));
         self.child.rawFree(memory, alignment, return_address);
     }
 };
@@ -260,17 +260,17 @@ fn mix(checksum: *u64, value: u64) void {
 
 fn mixBytes(checksum: *u64, bytes: []const u8) void {
     mix(checksum, @intCast(bytes.len));
-    if (bytes.len <= CHECKSUM_BYTES) {
+    if (bytes.len <= checksum_bytes) {
         mix(checksum, hashBytes(bytes));
     } else {
-        mix(checksum, hashBytes(bytes[0..CHECKSUM_BYTES]));
-        mix(checksum, hashBytes(bytes[bytes.len - CHECKSUM_BYTES ..]));
+        mix(checksum, hashBytes(bytes[0..checksum_bytes]));
+        mix(checksum, hashBytes(bytes[bytes.len - checksum_bytes ..]));
     }
 }
 
 fn sampleToken(index: usize, total: usize) bool {
     if (total == 0) return false;
-    return index < 4 or index == total - 1 or index % CHECKSUM_STRIDE == 0;
+    return index < 4 or index == total - 1 or index % checksum_stride == 0;
 }
 
 fn mixNativeValue(checksum: *u64, value: anytype) void {
@@ -282,16 +282,16 @@ fn mixNativeValue(checksum: *u64, value: anytype) void {
             if (info.bits > 64) {
                 @compileError("resident event integer payload exceeds 64 bits");
             }
-            const Unsigned = @Int(.unsigned, info.bits);
-            const bits: Unsigned = @bitCast(value);
+            const unsigned = @Int(.unsigned, info.bits);
+            const bits: unsigned = @bitCast(value);
             mix(checksum, @intCast(bits));
         },
         .float => |info| {
             if (info.bits > 64) {
                 @compileError("resident event float payload exceeds 64 bits");
             }
-            const Unsigned = @Int(.unsigned, info.bits);
-            const bits: Unsigned = @bitCast(value);
+            const unsigned = @Int(.unsigned, info.bits);
+            const bits: unsigned = @bitCast(value);
             mix(checksum, @intCast(bits));
         },
         .@"enum" => mixNativeValue(checksum, @intFromEnum(value)),
@@ -323,7 +323,7 @@ fn mixNativeValue(checksum: *u64, value: anytype) void {
             if (info.child == u8) {
                 mixBytes(checksum, value[0..]);
             } else {
-                mix(checksum, @intCast(info.len));
+                mix(checksum, info.len);
                 inline for (value) |element| mixNativeValue(checksum, element);
             }
         },
@@ -361,7 +361,7 @@ fn consumeResidentEvents(
         if (!limit_reached) following_event = try reader.next();
 
         const sample = event_count < 4 or
-            event_count % CHECKSUM_STRIDE == 0 or
+            event_count % checksum_stride == 0 or
             following_event == null;
         if (sample) mixNativeValue(checksum, event);
         std.mem.doNotOptimizeAway(&event);
@@ -827,8 +827,8 @@ fn runResidentOnce(
 
 fn runResidentStageFor(
     comptime Parser: type,
-    io: std.Io,
     allocator: Allocator,
+    io: std.Io,
     input: Input,
     stage: Stage,
     iterations: usize,
@@ -836,11 +836,11 @@ fn runResidentStageFor(
 ) !Sample {
     const event_limit: ?usize = switch (stage) {
         .traverse_all => null,
-        .traverse_prefix8 => RESIDENT_PREFIX_EVENT_COUNT,
+        .traverse_prefix8 => resident_prefix_event_count,
         else => unreachable,
     };
 
-    var counting = CountingAllocator{ .child = allocator };
+    var counting: CountingAllocator = .{ .child = allocator };
     const counted = counting.allocator();
     var parser = try Parser.init(counted, input.bytes.len);
     defer parser.deinit();
@@ -878,8 +878,8 @@ fn runResidentStageFor(
 }
 
 fn runResidentStage(
-    io: std.Io,
     allocator: Allocator,
+    io: std.Io,
     input: Input,
     stage: Stage,
     iterations: usize,
@@ -887,8 +887,8 @@ fn runResidentStage(
     return switch (input.format) {
         .json => runResidentStageFor(
             lib.ondemand.Parser,
-            io,
             allocator,
+            io,
             input,
             stage,
             iterations,
@@ -896,8 +896,8 @@ fn runResidentStage(
         ),
         .jsonl => runResidentStageFor(
             lib.formats.jsonl.Parser,
-            io,
             allocator,
+            io,
             input,
             stage,
             iterations,
@@ -905,8 +905,8 @@ fn runResidentStage(
         ),
         .jsonc => runResidentStageFor(
             lib.ondemand.Parser,
-            io,
             allocator,
+            io,
             input,
             stage,
             iterations,
@@ -914,8 +914,8 @@ fn runResidentStage(
         ),
         .json5 => runResidentStageFor(
             lib.ondemand.Parser,
-            io,
             allocator,
+            io,
             input,
             stage,
             iterations,
@@ -923,8 +923,8 @@ fn runResidentStage(
         ),
         .markdown => runResidentStageFor(
             lib.formats.markdown.Parser,
-            io,
             allocator,
+            io,
             input,
             stage,
             iterations,
@@ -932,8 +932,8 @@ fn runResidentStage(
         ),
         .xml => runResidentStageFor(
             lib.formats.xml.Parser,
-            io,
             allocator,
+            io,
             input,
             stage,
             iterations,
@@ -941,8 +941,8 @@ fn runResidentStage(
         ),
         .yaml => runResidentStageFor(
             lib.formats.yaml.Parser,
-            io,
             allocator,
+            io,
             input,
             stage,
             iterations,
@@ -959,21 +959,21 @@ fn elapsedNanoseconds(start: i96, end: i96) !u64 {
 }
 
 fn runStage(
-    io: std.Io,
     allocator: Allocator,
+    io: std.Io,
     input: Input,
     stage: Stage,
     iterations: usize,
-    stream_chunk_len: usize,
+    chunk_len: usize,
 ) !Sample {
     switch (stage) {
         .traverse_all, .traverse_prefix8 => {
-            return runResidentStage(io, allocator, input, stage, iterations);
+            return runResidentStage(allocator, io, input, stage, iterations);
         },
         .index, .validate, .tape, .stream => {},
     }
 
-    var counting = CountingAllocator{ .child = allocator };
+    var counting: CountingAllocator = .{ .child = allocator };
     counting.reset();
     const counted = counting.allocator();
     var checksum = stageSeed(input, stage);
@@ -988,7 +988,7 @@ fn runStage(
                 counted,
                 input.bytes,
                 &checksum,
-                stream_chunk_len,
+                chunk_len,
             ),
             .traverse_all, .traverse_prefix8 => unreachable,
         }
@@ -1457,8 +1457,8 @@ pub fn main(init: std.process.Init) !void {
         );
         for (stages) |stage| {
             const sample = try runStage(
-                init.io,
                 init.gpa,
+                init.io,
                 input,
                 stage,
                 options.iterations,

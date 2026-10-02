@@ -411,10 +411,10 @@ pub const Command = union(enum) {
 
 fn parseBoundedCount(
     comptime T: type,
-    text: []const u8,
     comptime low: u16,
     comptime high: u16,
     comptime out_of_range: OptionsError,
+    text: []const u8,
 ) CliError!T {
     const parsed = std.fmt.parseUnsigned(u32, text, 10) catch return error.NotANumber;
     if (parsed < low or parsed > high) return out_of_range;
@@ -442,20 +442,20 @@ fn parseRecordArguments(arguments: []const []const u8) CliError!RecordCommand {
             seen_samples = true;
             options.samples = try parseBoundedCount(
                 u16,
-                value,
                 min_samples,
                 max_samples,
                 error.SampleCountOutOfRange,
+                value,
             );
         } else if (std.mem.eql(u8, flag, "--iterations")) {
             if (seen_iterations) return error.DuplicateFlag;
             seen_iterations = true;
             options.iterations = try parseBoundedCount(
                 u16,
-                value,
                 min_iterations,
                 max_iterations,
                 error.IterationCountOutOfRange,
+                value,
             );
         } else {
             return error.UnknownFlag;
@@ -601,6 +601,8 @@ pub fn freeReport(allocator: Allocator, parsed: *Report) void {
     allocator.free(parsed.inputs);
     allocator.free(parsed.cases);
     freeHeaders(allocator, &parsed.headers);
+    // SAFETY: every owned field is released above; the poison only makes a later
+    // use of this value fail loudly instead of reading freed memory.
     parsed.* = undefined;
 }
 
@@ -752,20 +754,22 @@ fn materializeHeaders(
         if (value == null) return error.MissingHeader;
     }
     const slot = struct {
-        fn need(slots: *const [header_slot_count]?[]const u8, index: usize) []const u8 {
-            return slots[index].?;
+        fn need(slots: *const [header_slot_count]?[]const u8, index: usize) BenchReportError![]const u8 {
+            return slots[index] orelse return error.MissingHeader;
         }
     };
 
+    // SAFETY: `live` counts the leading `owned_headers` slots that are already
+    // owned, and each of them is assigned before it is read or released.
     var headers: BenchHeaders = undefined;
     var live: usize = 0;
     errdefer freeOwnedHeaders(allocator, &headers, live);
     inline for (owned_headers) |entry| {
-        @field(headers, entry.field) = try allocator.dupe(u8, slot.need(values, entry.slot));
+        @field(headers, entry.field) = try allocator.dupe(u8, try slot.need(values, entry.slot));
         live += 1;
     }
 
-    headers.vector_len = try parseDecimal(u64, slot.need(values, 3));
+    headers.vector_len = try parseDecimal(u64, try slot.need(values, 3));
     return headers;
 }
 
@@ -779,6 +783,8 @@ fn freeOwnedHeaders(allocator: Allocator, headers: *const BenchHeaders, live: us
 /// Releases every string `materializeHeaders` duplicated.
 pub fn freeHeaders(allocator: Allocator, headers: *BenchHeaders) void {
     freeOwnedHeaders(allocator, headers, owned_headers.len);
+    // SAFETY: every owned field is released above; the poison only makes a later
+    // use of this value fail loudly instead of reading freed memory.
     headers.* = undefined;
 }
 
@@ -903,6 +909,8 @@ pub fn freeAnalysis(allocator: Allocator, analysis: *Analysis) void {
     allocator.free(analysis.cases);
     allocator.free(analysis.inputs);
     freeHeaders(allocator, &analysis.headers);
+    // SAFETY: every owned field is released above; the poison only makes a later
+    // use of this value fail loudly instead of reading freed memory.
     analysis.* = undefined;
 }
 
@@ -942,6 +950,10 @@ pub fn parseReport(
     errdefer allocator.free(cases);
     var inputs_filled: usize = 0;
     var cases_filled: usize = 0;
+    // The one-element window over the slot the current row's input occupies. A
+    // stage-0 row fills a fresh slot and republishes the window; every later
+    // stage of that input re-reads the same window.
+    var current_input: []InputEntry = inputs[0..0];
 
     var it = std.mem.splitScalar(u8, stdout, '\n');
     var line_number: usize = 0;
@@ -1015,7 +1027,8 @@ pub fn parseReport(
         }
 
         if (declared.stage_index == 0) {
-            if (input_bytes != @as(u64, @intCast(fixture.source.len))) return error.InconsistentInputBytes;
+            const fixture_bytes: u64 = fixture.source.len;
+            if (input_bytes != fixture_bytes) return error.InconsistentInputBytes;
             const declared_hash = contract.checksumBytes(fixture.source);
             if (declaration.input_hash != declared_hash) return error.InconsistentInputHash;
             inputs[inputs_filled] = .{
@@ -1024,9 +1037,10 @@ pub fn parseReport(
                 .input_hash = declared_hash,
                 .input_bytes = input_bytes,
             };
+            current_input = inputs[inputs_filled .. inputs_filled + 1];
             inputs_filled += 1;
         } else {
-            const input = inputs[inputs_filled - 1];
+            const input = current_input[0];
             if (input_bytes != input.input_bytes) return error.InconsistentInputBytes;
             if (declaration.input_hash != input.input_hash) return error.InconsistentInputHash;
         }
@@ -1176,6 +1190,7 @@ fn synthReport(allocator: Allocator, options: Options) ![]u8 {
     var case_index: usize = 0;
     while (cursor.next()) |declared| {
         const fixture = declared.fixture;
+        const fixture_bytes: u64 = fixture.source.len;
         if (declared.stage_index == 0) {
             try writer.print("{s}format={s} workload={s} input_hash={x}\n", .{
                 input_declaration_prefix,
@@ -1189,7 +1204,7 @@ fn synthReport(allocator: Allocator, options: Options) ![]u8 {
             @tagName(fixture.workload),
             @tagName(declared.stage),
             fixture.outcome,
-            @as(u64, @intCast(fixture.source.len)),
+            fixture_bytes,
             @as(u64, options.iterations),
             1000 + case_index * 7,
             5000 + case_index,
@@ -1767,7 +1782,7 @@ test "work-profile, checksum, and allocation drift between samples is refused" {
 }
 
 test "a declared work domain that cannot produce the required rows is refused" {
-    const empty_segments = [_]DomainSegment{};
+    const empty_segments: [0]DomainSegment = .{};
     try expectDomainError(.{ .segments = &empty_segments }, error.DomainSegmentCount);
 
     const three_segments = [_]DomainSegment{
@@ -1784,7 +1799,7 @@ test "a declared work domain that cannot produce the required rows is refused" {
     };
     try expectDomainError(.{ .segments = &yaml_first }, error.DomainFormatOrder);
 
-    const no_fixtures = [_]Fixture{};
+    const no_fixtures: [0]Fixture = .{};
     const empty_fixtures = [_]DomainSegment{
         .{ .format = .commonmark, .fixtures = &no_fixtures },
     };
@@ -1799,7 +1814,7 @@ test "a declared work domain that cannot produce the required rows is refused" {
     };
     try expectDomainError(.{ .segments = &duplicate_segments }, error.DuplicateWorkload);
 
-    const no_stage_list = [_]Stage{};
+    const no_stage_list: [0]Stage = .{};
     const no_stages = [_]Fixture{
         .{
             .workload = .cm_blocks,
@@ -1924,7 +1939,10 @@ test "invalid operation lines are refused and no stream knob is accepted" {
     try testing.expectError(error.NotANumber, parseCommand(&.{ "record", "out", "--samples", "many" }));
     try testing.expectError(error.IterationCountOutOfRange, parseCommand(&.{ "record", "out", "--iterations", "0" }));
     try testing.expectError(error.IterationCountOutOfRange, parseCommand(&.{ "record", "out", "--iterations", "64" }));
-    try testing.expectError(error.DuplicateFlag, parseCommand(&.{ "record", "out", "--samples", "2", "--samples", "3" }));
+    try testing.expectError(
+        error.DuplicateFlag,
+        parseCommand(&.{ "record", "out", "--samples", "2", "--samples", "3" }),
+    );
     try testing.expectError(error.UnknownFlag, parseCommand(&.{ "record", "out", "--depth", "2" }));
     // There is no stream chunk knob, so the legacy flag is not a no-op here.
     try testing.expectError(error.UnknownFlag, parseCommand(&.{ "record", "out", "--stream-chunk-size", "4096" }));

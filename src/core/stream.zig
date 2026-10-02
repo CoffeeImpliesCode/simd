@@ -11,10 +11,10 @@ const lookahead_max: usize = 9;
 
 /// The resident padding after each input slot. It covers one SIMD load and the
 /// longest Stage 1 lookahead, so a later streaming format can reuse the buffer.
-pub const SAFE_PAD: usize = simd.default_vector_len + lookahead_max;
+pub const safe_pad: usize = simd.default_vector_len + lookahead_max;
 
 comptime {
-    assert(SAFE_PAD > simd.default_vector_len);
+    assert(safe_pad > simd.default_vector_len);
 }
 
 pub const Dialect = enum {
@@ -52,40 +52,7 @@ pub const StreamIndexer = struct {
     index: ?stage1.StructuralIndex,
     finished: bool = false,
 
-    const Self = @This();
-    const ScanSink = struct {
-        owner: *Self,
-
-        pub fn appendOffset(self: *@This(), offset: usize) lexical.Error!void {
-            if (offset > std.math.maxInt(u32)) return error.InputTooLarge;
-            const index = self.owner.indexPtr();
-            if (index.count >= index.indexes.len - sentinel_count) {
-                return error.CapacityExceeded;
-            }
-            index.indexes[index.count] = @intCast(offset);
-            index.count += 1;
-        }
-
-        pub fn appendMask(
-            self: *@This(),
-            comptime T: type,
-            mask: T,
-            base_offset: usize,
-        ) lexical.Error!void {
-            const index = self.owner.indexPtr();
-            if (index.count > index.indexes.len - sentinel_count) {
-                return error.CapacityExceeded;
-            }
-            const output = index.indexes[index.count .. index.indexes.len - sentinel_count];
-            const written = try simd.extractBitIndexesChecked(
-                T,
-                mask,
-                base_offset,
-                output,
-            );
-            index.count += written;
-        }
-    };
+    const Self = StreamIndexer;
 
     pub const InitError = stage1.StructuralIndex.InitError;
     pub const FeedError = std.mem.Allocator.Error || error{
@@ -109,7 +76,7 @@ pub const StreamIndexer = struct {
         allocator: std.mem.Allocator,
         chunk_len: usize,
         options: Options,
-    ) InitError!Self {
+    ) InitError!StreamIndexer {
         const requested_len = @max(chunk_len, simd.default_vector_len);
         const rounded_len = std.math.add(
             usize,
@@ -123,7 +90,7 @@ pub const StreamIndexer = struct {
         const slot_stride = std.math.add(
             usize,
             slot_len,
-            SAFE_PAD,
+            safe_pad,
         ) catch return error.CapacityOverflow;
         const buffer_len = std.math.mul(
             usize,
@@ -309,7 +276,7 @@ pub const StreamIndexer = struct {
         assert(self.index != null);
         assert(self.processed_len + data.len <= self.input_len);
 
-        var sink = ScanSink{ .owner = self };
+        var sink: ScanSink = .{ .owner = self };
         switch (self.lexicalMode()) {
             inline else => |mode| lexical.feed(
                 simd.default_vector_len,
@@ -328,7 +295,7 @@ pub const StreamIndexer = struct {
     }
 
     fn finishLexical(self: *Self) FinishError!void {
-        var sink = ScanSink{ .owner = self };
+        var sink: ScanSink = .{ .owner = self };
         switch (self.lexicalMode()) {
             inline else => |mode| lexical.finish(mode, &self.carry, &sink) catch |err| switch (err) {
                 error.NonContiguousInput => unreachable,
@@ -345,6 +312,40 @@ pub const StreamIndexer = struct {
             .jsonc => .jsonc,
             .json5 => .json5,
         };
+    }
+};
+
+const ScanSink = struct {
+    owner: *StreamIndexer,
+
+    pub fn appendOffset(self: *ScanSink, offset: usize) lexical.Error!void {
+        if (offset > std.math.maxInt(u32)) return error.InputTooLarge;
+        const index = self.owner.indexPtr();
+        if (index.count >= index.indexes.len - sentinel_count) {
+            return error.CapacityExceeded;
+        }
+        index.indexes[index.count] = @intCast(offset);
+        index.count += 1;
+    }
+
+    pub fn appendMask(
+        self: *ScanSink,
+        comptime T: type,
+        mask: T,
+        base_offset: usize,
+    ) lexical.Error!void {
+        const index = self.owner.indexPtr();
+        if (index.count > index.indexes.len - sentinel_count) {
+            return error.CapacityExceeded;
+        }
+        const output = index.indexes[index.count .. index.indexes.len - sentinel_count];
+        const written = try simd.extractBitIndexesChecked(
+            T,
+            mask,
+            base_offset,
+            output,
+        );
+        index.count += written;
     }
 };
 
@@ -564,7 +565,7 @@ const FaultingReader = struct {
         writer: *std.Io.Writer,
         limit: std.Io.Limit,
     ) std.Io.Reader.StreamError!usize {
-        const self: *@This() = @alignCast(@fieldParentPtr("reader", reader));
+        const self: *FaultingReader = @alignCast(@fieldParentPtr("reader", reader));
         if (self.offset >= self.fail_at) return error.ReadFailed;
 
         const available = self.fail_at - self.offset;

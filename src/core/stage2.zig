@@ -73,7 +73,7 @@ pub const Document = struct {
     /// document alive for as long as the returned cursor is used.
     pub fn root(self: *const Document, input: []const u8) NavigationError!TapeCursor {
         if (self.tape.len == 0) return error.TapeOutOfBounds;
-        const cursor = TapeCursor{
+        const cursor: TapeCursor = .{
             .tape = self.tape,
             .input = input,
             .dialect = self.dialect,
@@ -618,11 +618,13 @@ fn validateStructuralIndex(
         previous = offset;
     }
 
-    const sentinel: u32 = @intCast(input.len);
-    if (structural_index.indexes[structural_index.count] != sentinel) {
+    // Compared in the wider domain: a slice length is never narrowed to the
+    // stored u32 width, so an oversized input reports the same invalid index
+    // instead of trapping in the cast.
+    if (structural_index.indexes[structural_index.count] != input.len) {
         return error.InvalidStructuralIndex;
     }
-    if (structural_index.indexes[structural_index.count + 1] != sentinel) {
+    if (structural_index.indexes[structural_index.count + 1] != input.len) {
         return error.InvalidStructuralIndex;
     }
     if (structural_index.indexes[structural_index.count + 2] != 0) {
@@ -740,7 +742,7 @@ pub const TokenReader = struct {
         view: IndexView,
         dialect: Dialect,
     ) ReaderError!TokenReader {
-        var reader = TokenReader{
+        var reader: TokenReader = .{
             .input = &.{},
             .indexes = &.{},
             .dialect = dialect,
@@ -1351,26 +1353,26 @@ fn skipStringBody(
     dialect: Dialect,
 ) usize {
     std.debug.assert(start <= input.len);
-    const VLEN = simd.default_vector_len;
-    const Mask = simd.Mask(VLEN);
+    const vlen = simd.default_vector_len;
+    const mask = simd.Mask(vlen);
     var index = start;
-    while (input.len - index >= VLEN) {
-        const block: simd.Vec(VLEN, u8) = input[index..][0..VLEN].*;
+    while (input.len - index >= vlen) {
+        const block: simd.Vec(u8, vlen) = input[index..][0..vlen].*;
         const forbidden = if (dialect == .json5)
-            simd.matchAny2(VLEN, block, '\n', '\r')
+            simd.matchAny2(vlen, block, '\n', '\r')
         else
-            simd.matchRange(VLEN, block, 0, 0x1f);
+            simd.matchRange(vlen, block, 0, 0x1f);
         // Normalize the special lanes before scanning. A zero storage mask
         // has no matching lane: its trailing-zero count would be the storage
-        // width, not necessarily VLEN, so advance exactly one block instead.
-        const special: simd.MaskStorage(VLEN) = simd.exactMask(
-            Mask,
-            simd.matchAny2(VLEN, block, quote, '\\') | forbidden,
+        // width, not necessarily vlen, so advance exactly one block instead.
+        const special: simd.MaskStorage(vlen) = simd.exactMask(
+            mask,
+            simd.matchAny2(vlen, block, quote, '\\') | forbidden,
         );
         if (special != 0) {
             return index + @as(usize, @intCast(@ctz(special)));
         }
-        index += VLEN;
+        index += vlen;
     }
     return index;
 }
@@ -2035,7 +2037,13 @@ fn decodeJson5IdentifierCodepoint(
         failure_offset.* = byte_offset + invalid_offset;
         return error.InvalidUtf8;
     }
-    const codepoint = std.unicode.utf8Decode(sequence) catch {
+    const codepoint = switch (width) {
+        1 => sequence[0],
+        2 => std.unicode.utf8Decode2(sequence[0..2].*),
+        3 => std.unicode.utf8Decode3(sequence[0..3].*),
+        4 => std.unicode.utf8Decode4(sequence[0..4].*),
+        else => return error.InvalidUtf8,
+    } catch {
         failure_offset.* = byte_offset;
         return error.InvalidUtf8;
     };
@@ -2315,45 +2323,46 @@ test "JSONC and JSON5 reject malformed UTF-8 in comments" {
 }
 
 test "dialect comment scans preserve vector-boundary diagnostics" {
-    const VLEN = simd.default_vector_len;
+    const vlen = simd.default_vector_len;
 
-    var line_input: [VLEN + 4]u8 = @splat('a');
+    var line_input: [vlen + 4]u8 = @splat('a');
     line_input[0..2].* = "//".*;
-    line_input[VLEN - 1] = 0xe2;
-    line_input[VLEN] = '(';
-    line_input[VLEN + 1] = '\n';
-    line_input[VLEN + 2] = '{';
-    line_input[VLEN + 3] = '}';
+    line_input[vlen - 1] = 0xe2;
+    line_input[vlen] = '(';
+    line_input[vlen + 1] = '\n';
+    line_input[vlen + 2] = '{';
+    line_input[vlen + 3] = '}';
     const line_offsets = [_]u32{
-        @intCast(VLEN + 2),
-        @intCast(VLEN + 3),
+        @intCast(vlen + 2),
+        @intCast(vlen + 3),
     };
     const line_view = try IndexView.init(&line_input, &line_offsets, 0);
-    const line_diagnostic = (try validateView(&line_input, line_view, .jsonc)).?;
+    const line_diagnostic = (try validateView(&line_input, line_view, .jsonc)) orelse
+        return error.ExpectedDiagnostic;
     try testing.expectEqual(error.InvalidUtf8, line_diagnostic.err);
-    try testing.expectEqual(@as(usize, VLEN), line_diagnostic.byte_offset);
+    try testing.expectEqual(@as(usize, vlen), line_diagnostic.byte_offset);
 
-    var block_input: [VLEN + 3]u8 = @splat('a');
+    var block_input: [vlen + 3]u8 = @splat('a');
     block_input[0..2].* = "/*".*;
-    block_input[VLEN - 1] = '*';
-    block_input[VLEN] = '/';
-    block_input[VLEN + 1] = '{';
-    block_input[VLEN + 2] = '}';
+    block_input[vlen - 1] = '*';
+    block_input[vlen] = '/';
+    block_input[vlen + 1] = '{';
+    block_input[vlen + 2] = '}';
     const block_offsets = [_]u32{
-        @intCast(VLEN + 1),
-        @intCast(VLEN + 2),
+        @intCast(vlen + 1),
+        @intCast(vlen + 2),
     };
     const block_view = try IndexView.init(&block_input, &block_offsets, 0);
     try testing.expect((try validateView(&block_input, block_view, .jsonc)) == null);
 
-    var separator_input: [VLEN + 4]u8 = @splat('a');
+    var separator_input: [vlen + 4]u8 = @splat('a');
     separator_input[0..2].* = "//".*;
-    separator_input[VLEN - 1 .. VLEN + 2].* = "\xe2\x80\xa8".*;
-    separator_input[VLEN + 2] = '{';
-    separator_input[VLEN + 3] = '}';
+    separator_input[vlen - 1 .. vlen + 2].* = "\xe2\x80\xa8".*;
+    separator_input[vlen + 2] = '{';
+    separator_input[vlen + 3] = '}';
     const separator_offsets = [_]u32{
-        @intCast(VLEN + 2),
-        @intCast(VLEN + 3),
+        @intCast(vlen + 2),
+        @intCast(vlen + 3),
     };
     const separator_view = try IndexView.init(
         &separator_input,
@@ -2364,21 +2373,22 @@ test "dialect comment scans preserve vector-boundary diagnostics" {
         (try validateView(&separator_input, separator_view, .json5)) == null,
     );
 
-    var unterminated_input: [VLEN + 2]u8 = @splat('a');
+    var unterminated_input: [vlen + 2]u8 = @splat('a');
     unterminated_input[0..2].* = "/*".*;
-    unterminated_input[VLEN] = 0xe2;
-    unterminated_input[VLEN + 1] = '(';
-    const no_offsets = [_]u32{};
+    unterminated_input[vlen] = 0xe2;
+    unterminated_input[vlen + 1] = '(';
+    const no_offsets: []const u32 = &.{};
     const unterminated_view = try IndexView.init(
         &unterminated_input,
-        &no_offsets,
+        no_offsets,
         0,
     );
     const unterminated_diagnostic =
-        (try validateView(&unterminated_input, unterminated_view, .json5)).?;
+        (try validateView(&unterminated_input, unterminated_view, .json5)) orelse
+        return error.ExpectedDiagnostic;
     try testing.expectEqual(error.InvalidUtf8, unterminated_diagnostic.err);
     try testing.expectEqual(
-        @as(usize, VLEN + 1),
+        @as(usize, vlen + 1),
         unterminated_diagnostic.byte_offset,
     );
 }
@@ -2597,7 +2607,7 @@ test "TapeWord payload encoding never truncates u24 values" {
     const payload_max: usize = std.math.maxInt(u24);
     const payload_too_large = payload_max + 1;
 
-    const validating_parser = TokenReader{
+    const validating_parser: TokenReader = .{
         .input = &.{},
         .indexes = &.{},
         .dialect = .json,
@@ -2609,7 +2619,7 @@ test "TapeWord payload encoding never truncates u24 values" {
     );
 
     var tape: std.ArrayList(TapeWord) = .empty;
-    const building_parser = TokenReader{
+    const building_parser: TokenReader = .{
         .input = &.{},
         .indexes = &.{},
         .dialect = .json,
@@ -2828,7 +2838,7 @@ test "TapeCursor rejects unquoted source for forged JSON5 string words" {
         .payload = @intCast(input.len),
         .offset = 0,
     }};
-    const document = Document{ .tape = tape[0..], .dialect = .json5 };
+    const document: Document = .{ .tape = tape[0..], .dialect = .json5 };
     const cursor = try document.root(input);
     try testing.expectError(error.InvalidSource, cursor.rawValue());
 }
@@ -2959,7 +2969,7 @@ test "TapeCursor matchingStart validates only the local backlink" {
         .{ .kind = @intFromEnum(TapeKind.key), .payload = 0, .offset = 0 },
         .{ .kind = @intFromEnum(TapeKind.array_end), .payload = 0, .offset = 1 },
     };
-    const document = Document{ .tape = tape[0..], .dialect = .json };
+    const document: Document = .{ .tape = tape[0..], .dialect = .json };
     var cursor = try document.root("[]");
     try cursor.advance();
     try cursor.advance();
@@ -2986,7 +2996,7 @@ test "TapeCursor raw strings validate source and exact tape extent" {
             .payload = case.payload,
             .offset = 0,
         }};
-        const document = Document{ .tape = tape[0..], .dialect = .json };
+        const document: Document = .{ .tape = tape[0..], .dialect = .json };
         const cursor = try document.root(case.input);
         try testing.expectError(error.InvalidSource, cursor.rawValue());
     }
@@ -2998,21 +3008,21 @@ test "TapeCursor rejects malformed kinds order bounds counts and source ranges" 
         .payload = 0,
         .offset = 0,
     }};
-    const invalid_kind_document = Document{ .tape = invalid_kind_tape[0..], .dialect = .json };
+    const invalid_kind_document: Document = .{ .tape = invalid_kind_tape[0..], .dialect = .json };
     try testing.expectError(error.InvalidTapeKind, invalid_kind_document.root("0"));
 
     var wrong_end_tape = [_]TapeWord{
         .{ .kind = @intFromEnum(TapeKind.array_start), .payload = 0, .offset = 0 },
         .{ .kind = @intFromEnum(TapeKind.object_end), .payload = 0, .offset = 1 },
     };
-    const wrong_end_document = Document{ .tape = wrong_end_tape[0..], .dialect = .json };
+    const wrong_end_document: Document = .{ .tape = wrong_end_tape[0..], .dialect = .json };
     var wrong_end_cursor = try wrong_end_document.root("[]");
     try testing.expectError(error.InvalidTapeOrder, wrong_end_cursor.skipValue());
 
     var unclosed_tape = [_]TapeWord{
         .{ .kind = @intFromEnum(TapeKind.array_start), .payload = 0, .offset = 0 },
     };
-    const unclosed_document = Document{ .tape = unclosed_tape[0..], .dialect = .json };
+    const unclosed_document: Document = .{ .tape = unclosed_tape[0..], .dialect = .json };
     var unclosed_cursor = try unclosed_document.root("[");
     try testing.expectError(error.TapeOutOfBounds, unclosed_cursor.skipValue());
 
@@ -3021,7 +3031,7 @@ test "TapeCursor rejects malformed kinds order bounds counts and source ranges" 
         .{ .kind = @intFromEnum(TapeKind.number), .payload = 0, .offset = 1 },
         .{ .kind = @intFromEnum(TapeKind.array_end), .payload = 0, .offset = 2 },
     };
-    const wrong_count_document = Document{ .tape = wrong_count_tape[0..], .dialect = .json };
+    const wrong_count_document: Document = .{ .tape = wrong_count_tape[0..], .dialect = .json };
     var wrong_count_cursor = try wrong_count_document.root("[0]");
     try testing.expectError(error.InvalidTapeOrder, wrong_count_cursor.skipValue());
 
@@ -3029,7 +3039,7 @@ test "TapeCursor rejects malformed kinds order bounds counts and source ranges" 
         .{ .kind = @intFromEnum(TapeKind.array_start), .payload = 0, .offset = 0 },
         .{ .kind = @intFromEnum(TapeKind.array_end), .payload = 2, .offset = 1 },
     };
-    const bad_start_document = Document{ .tape = bad_start_tape[0..], .dialect = .json };
+    const bad_start_document: Document = .{ .tape = bad_start_tape[0..], .dialect = .json };
     var bad_start_cursor = try bad_start_document.root("[]");
     try bad_start_cursor.advance();
     try testing.expectError(error.TapeOutOfBounds, bad_start_cursor.matchingStart());
@@ -3039,7 +3049,7 @@ test "TapeCursor rejects malformed kinds order bounds counts and source ranges" 
         .payload = 4,
         .offset = 0,
     }};
-    const string_document = Document{ .tape = string_tape[0..], .dialect = .json };
+    const string_document: Document = .{ .tape = string_tape[0..], .dialect = .json };
     var string_cursor = try string_document.root("\"x\"");
     try testing.expectError(error.SourceOutOfBounds, string_cursor.rawValue());
 
@@ -3048,7 +3058,7 @@ test "TapeCursor rejects malformed kinds order bounds counts and source ranges" 
         .payload = 0,
         .offset = 0,
     }};
-    const number_document = Document{ .tape = number_tape[0..], .dialect = .json };
+    const number_document: Document = .{ .tape = number_tape[0..], .dialect = .json };
     var number_cursor = try number_document.root("0");
     try testing.expectError(error.TypeMismatch, number_cursor.containerCount());
 }
@@ -3105,18 +3115,18 @@ test "IndexView borrows and rebases checked global record offsets" {
     );
 
     var reader = try TokenReader.init(input, view, .json);
-    const open = (try reader.next()).?;
+    const open = (try reader.next()) orelse return error.ExpectedToken;
     try testing.expectEqual(TapeKind.array_start, open.word.tapeKind());
     try testing.expectEqual(@as(u32, 0), open.word.offset);
     try testing.expectEqualStrings("[", open.raw);
     try testing.expect(open.raw.ptr == input.ptr);
 
-    const number = (try reader.next()).?;
+    const number = (try reader.next()) orelse return error.ExpectedToken;
     try testing.expectEqual(TapeKind.number, number.word.tapeKind());
     try testing.expectEqualStrings("0", number.raw);
     try testing.expect(number.raw.ptr == input.ptr + 1);
 
-    const close = (try reader.next()).?;
+    const close = (try reader.next()) orelse return error.ExpectedToken;
     try testing.expectEqual(TapeKind.array_end, close.word.tapeKind());
     try testing.expectEqual(@as(u32, 2), close.word.offset);
     try testing.expect((try reader.next()) == null);

@@ -200,7 +200,8 @@ pub const Oracle = struct {
 /// per byte. Length prefixing keeps empty strings, embedded NUL bytes and
 /// concatenated fields unambiguous.
 fn mixString(checksum: *u64, bytes: []const u8) void {
-    contract.mix(checksum, @intCast(bytes.len));
+    const length: u64 = bytes.len;
+    contract.mix(checksum, length);
     for (bytes) |byte| contract.mix(checksum, byte);
 }
 
@@ -229,7 +230,8 @@ fn mixString(checksum: *u64, bytes: []const u8) void {
 /// list and code attributes.
 pub fn checksumRecords(records: []const Record) u64 {
     var checksum: u64 = 0;
-    contract.mix(&checksum, @intCast(records.len));
+    const record_count: u64 = records.len;
+    contract.mix(&checksum, record_count);
     for (records) |record| {
         contract.mix(&checksum, @intFromEnum(record.kind));
         contract.mix(&checksum, record.depth);
@@ -376,9 +378,21 @@ const cm_blocks_source: []const u8 =
 
 const cm_blocks_expected: []const Record = &.{
     .{ .kind = .document, .depth = 0, .child_index = 0, .child_count = 8, .attrs = .none },
-    .{ .kind = .heading, .depth = 1, .child_index = 0, .child_count = 1, .attrs = .{ .heading = .{ .level = 1, .text = "Report" } } },
+    .{
+        .kind = .heading,
+        .depth = 1,
+        .child_index = 0,
+        .child_count = 1,
+        .attrs = .{ .heading = .{ .level = 1, .text = "Report" } },
+    },
     .{ .kind = .text, .depth = 2, .child_index = 0, .child_count = 0, .attrs = .{ .raw = "Report" } },
-    .{ .kind = .paragraph, .depth = 1, .child_index = 1, .child_count = 3, .attrs = .{ .raw = "Summary line\ncontinues here" } },
+    .{
+        .kind = .paragraph,
+        .depth = 1,
+        .child_index = 1,
+        .child_count = 3,
+        .attrs = .{ .raw = "Summary line\ncontinues here" },
+    },
     .{ .kind = .text, .depth = 2, .child_index = 0, .child_count = 0, .attrs = .{ .raw = "Summary line" } },
     .{ .kind = .softbreak, .depth = 2, .child_index = 1, .child_count = 0, .attrs = .none },
     .{ .kind = .text, .depth = 2, .child_index = 2, .child_count = 0, .attrs = .{ .raw = "continues here" } },
@@ -386,14 +400,26 @@ const cm_blocks_expected: []const Record = &.{
     .{ .kind = .block_quote, .depth = 1, .child_index = 3, .child_count = 1, .attrs = .none },
     .{ .kind = .paragraph, .depth = 2, .child_index = 0, .child_count = 1, .attrs = .{ .raw = "quoted text" } },
     .{ .kind = .text, .depth = 3, .child_index = 0, .child_count = 0, .attrs = .{ .raw = "quoted text" } },
-    .{ .kind = .list, .depth = 1, .child_index = 4, .child_count = 2, .attrs = .{ .list = .{ .ordered = false, .start = 1, .delimiter = '-', .tight = true } } },
+    .{
+        .kind = .list,
+        .depth = 1,
+        .child_index = 4,
+        .child_count = 2,
+        .attrs = .{ .list = .{ .ordered = false, .start = 1, .delimiter = '-', .tight = true } },
+    },
     .{ .kind = .list_item, .depth = 2, .child_index = 0, .child_count = 1, .attrs = .none },
     .{ .kind = .paragraph, .depth = 3, .child_index = 0, .child_count = 1, .attrs = .{ .raw = "alpha" } },
     .{ .kind = .text, .depth = 4, .child_index = 0, .child_count = 0, .attrs = .{ .raw = "alpha" } },
     .{ .kind = .list_item, .depth = 2, .child_index = 1, .child_count = 1, .attrs = .none },
     .{ .kind = .paragraph, .depth = 3, .child_index = 0, .child_count = 1, .attrs = .{ .raw = "beta" } },
     .{ .kind = .text, .depth = 4, .child_index = 0, .child_count = 0, .attrs = .{ .raw = "beta" } },
-    .{ .kind = .list, .depth = 1, .child_index = 5, .child_count = 2, .attrs = .{ .list = .{ .ordered = true, .start = 3, .delimiter = '.', .tight = true } } },
+    .{
+        .kind = .list,
+        .depth = 1,
+        .child_index = 5,
+        .child_count = 2,
+        .attrs = .{ .list = .{ .ordered = true, .start = 3, .delimiter = '.', .tight = true } },
+    },
     .{ .kind = .list_item, .depth = 2, .child_index = 0, .child_count = 1, .attrs = .none },
     .{ .kind = .paragraph, .depth = 3, .child_index = 0, .child_count = 1, .attrs = .{ .raw = "gamma" } },
     .{ .kind = .text, .depth = 4, .child_index = 0, .child_count = 0, .attrs = .{ .raw = "gamma" } },
@@ -467,7 +493,13 @@ const cm_inline_source: []const u8 =
 
 const cm_inline_expected: []const Record = &.{
     .{ .kind = .document, .depth = 0, .child_index = 0, .child_count = 4, .attrs = .none },
-    .{ .kind = .paragraph, .depth = 1, .child_index = 0, .child_count = 5, .attrs = .{ .raw = "*emph* and **strong** and ***both***" } },
+    .{
+        .kind = .paragraph,
+        .depth = 1,
+        .child_index = 0,
+        .child_count = 5,
+        .attrs = .{ .raw = "*emph* and **strong** and ***both***" },
+    },
     .{ .kind = .emph, .depth = 2, .child_index = 0, .child_count = 1, .attrs = .none },
     .{ .kind = .text, .depth = 3, .child_index = 0, .child_count = 0, .attrs = .{ .raw = "emph" } },
     .{ .kind = .text, .depth = 2, .child_index = 1, .child_count = 0, .attrs = .{ .raw = " and " } },
@@ -477,7 +509,13 @@ const cm_inline_expected: []const Record = &.{
     .{ .kind = .emph, .depth = 2, .child_index = 4, .child_count = 1, .attrs = .none },
     .{ .kind = .strong, .depth = 3, .child_index = 0, .child_count = 1, .attrs = .none },
     .{ .kind = .text, .depth = 4, .child_index = 0, .child_count = 0, .attrs = .{ .raw = "both" } },
-    .{ .kind = .paragraph, .depth = 1, .child_index = 1, .child_count = 3, .attrs = .{ .raw = "`code span` plus ``tick ` inside``" } },
+    .{
+        .kind = .paragraph,
+        .depth = 1,
+        .child_index = 1,
+        .child_count = 3,
+        .attrs = .{ .raw = "`code span` plus ``tick ` inside``" },
+    },
     .{ .kind = .code_span, .depth = 2, .child_index = 0, .child_count = 0, .attrs = .{ .raw = "code span" } },
     .{ .kind = .text, .depth = 2, .child_index = 1, .child_count = 0, .attrs = .{ .raw = " plus " } },
     .{ .kind = .code_span, .depth = 2, .child_index = 2, .child_count = 0, .attrs = .{ .raw = "tick ` inside" } },
@@ -485,7 +523,13 @@ const cm_inline_expected: []const Record = &.{
     .{ .kind = .text, .depth = 2, .child_index = 0, .child_count = 0, .attrs = .{ .raw = "hard" } },
     .{ .kind = .linebreak, .depth = 2, .child_index = 1, .child_count = 0, .attrs = .none },
     .{ .kind = .text, .depth = 2, .child_index = 2, .child_count = 0, .attrs = .{ .raw = "break here" } },
-    .{ .kind = .paragraph, .depth = 1, .child_index = 3, .child_count = 6, .attrs = .{ .raw = "\\*escaped\\* and \\[not a link](/foo)" } },
+    .{
+        .kind = .paragraph,
+        .depth = 1,
+        .child_index = 3,
+        .child_count = 6,
+        .attrs = .{ .raw = "\\*escaped\\* and \\[not a link](/foo)" },
+    },
     .{ .kind = .text, .depth = 2, .child_index = 0, .child_count = 0, .attrs = .{ .raw = "*" } },
     .{ .kind = .text, .depth = 2, .child_index = 1, .child_count = 0, .attrs = .{ .raw = "escaped" } },
     .{ .kind = .text, .depth = 2, .child_index = 2, .child_count = 0, .attrs = .{ .raw = "*" } },
@@ -518,54 +562,118 @@ const cm_links_source: []const u8 =
 
 const cm_links_expected: []const Record = &.{
     .{ .kind = .document, .depth = 0, .child_index = 0, .child_count = 4, .attrs = .none },
-    .{ .kind = .paragraph, .depth = 1, .child_index = 0, .child_count = 3, .attrs = .{ .raw = "[inline](/url \"title\") and ![img](/pic \"cap\")" } },
-    .{ .kind = .link, .depth = 2, .child_index = 0, .child_count = 1, .attrs = .{ .destination = .{ .destination = "/url", .title = "title" } } },
+    .{
+        .kind = .paragraph,
+        .depth = 1,
+        .child_index = 0,
+        .child_count = 3,
+        .attrs = .{ .raw = "[inline](/url \"title\") and ![img](/pic \"cap\")" },
+    },
+    .{
+        .kind = .link,
+        .depth = 2,
+        .child_index = 0,
+        .child_count = 1,
+        .attrs = .{ .destination = .{ .destination = "/url", .title = "title" } },
+    },
     .{ .kind = .text, .depth = 3, .child_index = 0, .child_count = 0, .attrs = .{ .raw = "inline" } },
     .{ .kind = .text, .depth = 2, .child_index = 1, .child_count = 0, .attrs = .{ .raw = " and " } },
-    .{ .kind = .image, .depth = 2, .child_index = 2, .child_count = 1, .attrs = .{ .destination = .{ .destination = "/pic", .title = "cap" } } },
+    .{
+        .kind = .image,
+        .depth = 2,
+        .child_index = 2,
+        .child_count = 1,
+        .attrs = .{ .destination = .{ .destination = "/pic", .title = "cap" } },
+    },
     .{ .kind = .text, .depth = 3, .child_index = 0, .child_count = 0, .attrs = .{ .raw = "img" } },
-    .{ .kind = .paragraph, .depth = 1, .child_index = 1, .child_count = 3, .attrs = .{ .raw = "[ref][label] and ![alt][label]" } },
-    .{ .kind = .link, .depth = 2, .child_index = 0, .child_count = 1, .attrs = .{ .destination = .{ .destination = "/target", .title = "Ref Title" } } },
+    .{
+        .kind = .paragraph,
+        .depth = 1,
+        .child_index = 1,
+        .child_count = 3,
+        .attrs = .{ .raw = "[ref][label] and ![alt][label]" },
+    },
+    .{
+        .kind = .link,
+        .depth = 2,
+        .child_index = 0,
+        .child_count = 1,
+        .attrs = .{ .destination = .{ .destination = "/target", .title = "Ref Title" } },
+    },
     .{ .kind = .text, .depth = 3, .child_index = 0, .child_count = 0, .attrs = .{ .raw = "ref" } },
     .{ .kind = .text, .depth = 2, .child_index = 1, .child_count = 0, .attrs = .{ .raw = " and " } },
-    .{ .kind = .image, .depth = 2, .child_index = 2, .child_count = 1, .attrs = .{ .destination = .{ .destination = "/target", .title = "Ref Title" } } },
+    .{
+        .kind = .image,
+        .depth = 2,
+        .child_index = 2,
+        .child_count = 1,
+        .attrs = .{ .destination = .{ .destination = "/target", .title = "Ref Title" } },
+    },
     .{ .kind = .text, .depth = 3, .child_index = 0, .child_count = 0, .attrs = .{ .raw = "alt" } },
-    .{ .kind = .paragraph, .depth = 1, .child_index = 2, .child_count = 3, .attrs = .{ .raw = "<https://example.com/a?b=c> and <mail@example.org>" } },
-    .{ .kind = .autolink, .depth = 2, .child_index = 0, .child_count = 0, .attrs = .{ .autolink = "https://example.com/a?b=c" } },
+    .{
+        .kind = .paragraph,
+        .depth = 1,
+        .child_index = 2,
+        .child_count = 3,
+        .attrs = .{ .raw = "<https://example.com/a?b=c> and <mail@example.org>" },
+    },
+    .{
+        .kind = .autolink,
+        .depth = 2,
+        .child_index = 0,
+        .child_count = 0,
+        .attrs = .{ .autolink = "https://example.com/a?b=c" },
+    },
     .{ .kind = .text, .depth = 2, .child_index = 1, .child_count = 0, .attrs = .{ .raw = " and " } },
-    .{ .kind = .autolink, .depth = 2, .child_index = 2, .child_count = 0, .attrs = .{ .autolink = "mail@example.org" } },
+    .{
+        .kind = .autolink,
+        .depth = 2,
+        .child_index = 2,
+        .child_count = 0,
+        .attrs = .{ .autolink = "mail@example.org" },
+    },
     .{ .kind = .reference_definition, .depth = 1, .child_index = 3, .child_count = 0, .attrs = .none },
 };
 
 const cm_links_html: []const u8 =
-    \\<p><a href="/url" title="title">inline</a> and <img src="/pic" alt="img" title="cap" /></p>
-    \\<p><a href="/target" title="Ref Title">ref</a> and <img src="/target" alt="alt" title="Ref Title" /></p>
-    \\<p><a href="https://example.com/a?b=c">https://example.com/a?b=c</a> and <a href="mailto:mail@example.org">mail@example.org</a></p>
-++ "\n";
+    "<p><a href=\"/url\" title=\"title\">inline</a> and <img src=\"/pic\" alt=\"img\" title=\"cap\" /></p>\n" ++
+    "<p><a href=\"/target\" title=\"Ref Title\">ref</a> and " ++
+    "<img src=\"/target\" alt=\"alt\" title=\"Ref Title\" /></p>\n" ++
+    "<p><a href=\"https://example.com/a?b=c\">https://example.com/a?b=c</a>" ++
+    " and <a href=\"mailto:mail@example.org\">mail@example.org</a></p>\n";
 
 // ---------------------------------------------------------------------------
 // cm_unicode: Unicode text, named entities and numeric references
 // ---------------------------------------------------------------------------
 
 const cm_unicode_source: []const u8 =
-    "Foo \u{03C7}\u{03C1}\u{1F74}\u{03BD} \u{2014} na\u{00EF}ve \u{00FC}n\u{00EF}c\u{00F6}d\u{00E9} \u{2713} \u{4E2D}\u{6587}\n" ++
+    "Foo \u{03C7}\u{03C1}\u{1F74}\u{03BD} \u{2014} na\u{00EF}ve \u{00FC}n\u{00EF}c\u{00F6}d\u{00E9} " ++
+    "\u{2713} \u{4E2D}\u{6587}\n" ++
     "&nbsp; &amp; &copy; &AElig; &Dcaron;\n" ++
     "&#X22; &#XD06; &#xcab;\n";
 
 const cm_unicode_line1: []const u8 =
-    "Foo \u{03C7}\u{03C1}\u{1F74}\u{03BD} \u{2014} na\u{00EF}ve \u{00FC}n\u{00EF}c\u{00F6}d\u{00E9} \u{2713} \u{4E2D}\u{6587}";
+    "Foo \u{03C7}\u{03C1}\u{1F74}\u{03BD} \u{2014} na\u{00EF}ve \u{00FC}n\u{00EF}c\u{00F6}d\u{00E9} " ++
+    "\u{2713} \u{4E2D}\u{6587}";
 
 /// The three source lines are one lazy paragraph, not three: only soft breaks
 /// separate them. Its raw text keeps the entity and reference source spellings
 /// exactly as written, without the document's trailing line ending.
 const cm_unicode_paragraph_raw: []const u8 =
-    "Foo \u{03C7}\u{03C1}\u{1F74}\u{03BD} \u{2014} na\u{00EF}ve \u{00FC}n\u{00EF}c\u{00F6}d\u{00E9} \u{2713} \u{4E2D}\u{6587}\n" ++
+    "Foo \u{03C7}\u{03C1}\u{1F74}\u{03BD} \u{2014} na\u{00EF}ve \u{00FC}n\u{00EF}c\u{00F6}d\u{00E9} " ++
+    "\u{2713} \u{4E2D}\u{6587}\n" ++
     "&nbsp; &amp; &copy; &AElig; &Dcaron;\n" ++
     "&#X22; &#XD06; &#xcab;";
 
 const cm_unicode_expected: []const Record = &.{
     .{ .kind = .document, .depth = 0, .child_index = 0, .child_count = 1, .attrs = .none },
-    .{ .kind = .paragraph, .depth = 1, .child_index = 0, .child_count = 17, .attrs = .{ .raw = cm_unicode_paragraph_raw } },
+    .{
+        .kind = .paragraph,
+        .depth = 1,
+        .child_index = 0,
+        .child_count = 17,
+        .attrs = .{ .raw = cm_unicode_paragraph_raw },
+    },
     .{ .kind = .text, .depth = 2, .child_index = 0, .child_count = 0, .attrs = .{ .raw = cm_unicode_line1 } },
     .{ .kind = .softbreak, .depth = 2, .child_index = 1, .child_count = 0, .attrs = .none },
     .{ .kind = .text, .depth = 2, .child_index = 2, .child_count = 0, .attrs = .{ .raw = "\u{00A0}" } },
@@ -586,7 +694,8 @@ const cm_unicode_expected: []const Record = &.{
 };
 
 const cm_unicode_html: []const u8 =
-    "<p>Foo \u{03C7}\u{03C1}\u{1F74}\u{03BD} \u{2014} na\u{00EF}ve \u{00FC}n\u{00EF}c\u{00F6}d\u{00E9} \u{2713} \u{4E2D}\u{6587}\n" ++
+    "<p>Foo \u{03C7}\u{03C1}\u{1F74}\u{03BD} \u{2014} na\u{00EF}ve \u{00FC}n\u{00EF}c\u{00F6}d\u{00E9} " ++
+    "\u{2713} \u{4E2D}\u{6587}\n" ++
     "\u{00A0} &amp; \u{00A9} \u{00C6} \u{010E}\n" ++
     "&quot; \u{0D06} \u{0CAB}</p>\n";
 
@@ -608,21 +717,63 @@ const cm_raw_html_source: []const u8 =
 
 const cm_raw_html_expected: []const Record = &.{
     .{ .kind = .document, .depth = 0, .child_index = 0, .child_count = 4, .attrs = .none },
-    .{ .kind = .html_block, .depth = 1, .child_index = 0, .child_count = 0, .attrs = .{ .raw = "<div class=\"raw\">\nblock html\n</div>" } },
-    .{ .kind = .paragraph, .depth = 1, .child_index = 1, .child_count = 5, .attrs = .{ .raw = "inline <b>bold</b> text" } },
+    .{
+        .kind = .html_block,
+        .depth = 1,
+        .child_index = 0,
+        .child_count = 0,
+        .attrs = .{ .raw = "<div class=\"raw\">\nblock html\n</div>" },
+    },
+    .{
+        .kind = .paragraph,
+        .depth = 1,
+        .child_index = 1,
+        .child_count = 5,
+        .attrs = .{ .raw = "inline <b>bold</b> text" },
+    },
     .{ .kind = .text, .depth = 2, .child_index = 0, .child_count = 0, .attrs = .{ .raw = "inline " } },
     .{ .kind = .html_inline, .depth = 2, .child_index = 1, .child_count = 0, .attrs = .{ .raw = "<b>" } },
     .{ .kind = .text, .depth = 2, .child_index = 2, .child_count = 0, .attrs = .{ .raw = "bold" } },
     .{ .kind = .html_inline, .depth = 2, .child_index = 3, .child_count = 0, .attrs = .{ .raw = "</b>" } },
     .{ .kind = .text, .depth = 2, .child_index = 4, .child_count = 0, .attrs = .{ .raw = " text" } },
-    .{ .kind = .paragraph, .depth = 1, .child_index = 2, .child_count = 3, .attrs = .{ .raw = "[xss](javascript:alert(1)) and [ok](https://example.com/a)" } },
-    .{ .kind = .link, .depth = 2, .child_index = 0, .child_count = 1, .attrs = .{ .destination = .{ .destination = "javascript:alert(1)", .title = "" } } },
+    .{
+        .kind = .paragraph,
+        .depth = 1,
+        .child_index = 2,
+        .child_count = 3,
+        .attrs = .{ .raw = "[xss](javascript:alert(1)) and [ok](https://example.com/a)" },
+    },
+    .{
+        .kind = .link,
+        .depth = 2,
+        .child_index = 0,
+        .child_count = 1,
+        .attrs = .{ .destination = .{ .destination = "javascript:alert(1)", .title = "" } },
+    },
     .{ .kind = .text, .depth = 3, .child_index = 0, .child_count = 0, .attrs = .{ .raw = "xss" } },
     .{ .kind = .text, .depth = 2, .child_index = 1, .child_count = 0, .attrs = .{ .raw = " and " } },
-    .{ .kind = .link, .depth = 2, .child_index = 2, .child_count = 1, .attrs = .{ .destination = .{ .destination = "https://example.com/a", .title = "" } } },
+    .{
+        .kind = .link,
+        .depth = 2,
+        .child_index = 2,
+        .child_count = 1,
+        .attrs = .{ .destination = .{ .destination = "https://example.com/a", .title = "" } },
+    },
     .{ .kind = .text, .depth = 3, .child_index = 0, .child_count = 0, .attrs = .{ .raw = "ok" } },
-    .{ .kind = .paragraph, .depth = 1, .child_index = 3, .child_count = 1, .attrs = .{ .raw = "![data](data:text/html;base64,AAA)" } },
-    .{ .kind = .image, .depth = 2, .child_index = 0, .child_count = 1, .attrs = .{ .destination = .{ .destination = "data:text/html;base64,AAA", .title = "" } } },
+    .{
+        .kind = .paragraph,
+        .depth = 1,
+        .child_index = 3,
+        .child_count = 1,
+        .attrs = .{ .raw = "![data](data:text/html;base64,AAA)" },
+    },
+    .{
+        .kind = .image,
+        .depth = 2,
+        .child_index = 0,
+        .child_count = 1,
+        .attrs = .{ .destination = .{ .destination = "data:text/html;base64,AAA", .title = "" } },
+    },
     .{ .kind = .text, .depth = 3, .child_index = 0, .child_count = 0, .attrs = .{ .raw = "data" } },
 };
 

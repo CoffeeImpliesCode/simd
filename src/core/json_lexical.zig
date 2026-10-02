@@ -57,14 +57,14 @@ const max_offset: usize = std.math.maxInt(u32);
 /// zero and later calls must start at the prior end offset. The sink receives
 /// either a checked mask with absolute base or one checked absolute offset.
 pub fn feed(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     comptime mode: Mode,
     state: *State,
     input: []const u8,
     base_offset: usize,
     sink: anytype,
 ) Error!void {
-    comptime std.debug.assert(VLEN >= 4);
+    comptime std.debug.assert(vlen >= 4);
 
     if (base_offset != state.next_offset) return error.NonContiguousInput;
     if (base_offset > max_offset) return error.InputTooLarge;
@@ -72,14 +72,14 @@ pub fn feed(
 
     var local_offset: usize = 0;
     while (local_offset < input.len) {
-        const valid_count = @min(VLEN, input.len - local_offset);
-        var bytes: [VLEN]u8 = @splat(0);
+        const valid_count = @min(vlen, input.len - local_offset);
+        var bytes: [vlen]u8 = @splat(0);
         @memcpy(bytes[0..valid_count], input[local_offset..][0..valid_count]);
         const absolute_offset = base_offset + local_offset;
 
         switch (mode) {
             .json, .jsonl => try processStrictBlock(
-                VLEN,
+                vlen,
                 mode,
                 state,
                 bytes,
@@ -88,7 +88,7 @@ pub fn feed(
                 sink,
             ),
             .jsonc, .json5 => try processDialectBlock(
-                VLEN,
+                vlen,
                 mode,
                 state,
                 bytes,
@@ -132,124 +132,124 @@ pub fn finish(comptime mode: Mode, state: *State, sink: anytype) Error!void {
 }
 
 fn processStrictBlock(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     comptime mode: Mode,
     state: *State,
-    bytes: [VLEN]u8,
+    bytes: [vlen]u8,
     valid_count: usize,
     base_offset: usize,
     sink: anytype,
 ) Error!void {
-    const Mask = simd.Mask(VLEN);
-    const Shift = std.math.Log2Int(Mask);
-    const chunk: simd.Vec(VLEN, u8) = bytes;
-    const valid = simd.validMask(VLEN, valid_count);
+    const mask = simd.Mask(vlen);
+    const shift = std.math.Log2Int(mask);
+    const chunk: simd.Vec(u8, vlen) = bytes;
+    const valid = simd.validMask(vlen, valid_count);
 
-    const backslashes = simd.matchByte(VLEN, chunk, '\\') & valid;
+    const backslashes = simd.matchByte(vlen, chunk, '\\') & valid;
     var odd_backslash_ends = simd.computeBackslashRuns(
-        Mask,
+        mask,
         backslashes,
         state.ends_in_backslash,
     ).odd_length_ends & valid;
     if (state.ends_in_backslash) {
-        if (simd.exactMask(Mask, backslashes & @as(Mask, 1)) == 0) {
+        if (simd.exactMask(mask, backslashes & @as(mask, 1)) == 0) {
             if (state.backslash_run_odd) {
                 odd_backslash_ends |= 1;
             } else {
-                odd_backslash_ends &= ~@as(Mask, 1);
+                odd_backslash_ends &= ~@as(mask, 1);
             }
         } else if (state.backslash_run_odd) {
-            odd_backslash_ends ^= leadingRunEndMask(VLEN, backslashes, valid_count);
+            odd_backslash_ends ^= leadingRunEndMask(vlen, backslashes, valid_count);
         }
     }
 
-    const quotes = simd.matchByte(VLEN, chunk, '"') & valid;
+    const quotes = simd.matchByte(vlen, chunk, '"') & valid;
     const unescaped_quotes = quotes & ~odd_backslash_ends;
-    const inside_without_closing = simd.prefixXor(Mask, unescaped_quotes) ^
-        if (state.in_string) ~@as(Mask, 0) else 0;
+    const inside_without_closing = simd.prefixXor(mask, unescaped_quotes) ^
+        if (state.in_string) ~@as(mask, 0) else 0;
     const opening_quotes = unescaped_quotes & inside_without_closing;
     const string_mask = inside_without_closing | unescaped_quotes;
     const outside_string = ~string_mask & valid;
 
-    const structural = (simd.matchAny4(VLEN, chunk, '{', '}', '[', ']') |
-        simd.matchAny2(VLEN, chunk, ':', ',')) & valid;
-    const whitespace = simd.matchJsonWhitespace(VLEN, chunk) & valid;
-    const atom_candidates = (simd.matchRange(VLEN, chunk, '0', '9') |
-        simd.matchAny4(VLEN, chunk, '-', 't', 'f', 'n')) & valid;
+    const structural = (simd.matchAny4(vlen, chunk, '{', '}', '[', ']') |
+        simd.matchAny2(vlen, chunk, ':', ',')) & valid;
+    const whitespace = simd.matchJsonWhitespace(vlen, chunk) & valid;
+    const atom_candidates = (simd.matchRange(vlen, chunk, '0', '9') |
+        simd.matchAny4(vlen, chunk, '-', 't', 'f', 'n')) & valid;
     const atom_active = outside_string & ~(structural | whitespace | quotes);
     const atom_starts = atom_candidates & atom_active &
-        ~((atom_active << @as(Shift, 1)) |
-            if (state.in_atom) @as(Mask, 1) else 0);
-    const record_boundaries: Mask = if (mode == .jsonl)
-        simd.matchByte(VLEN, chunk, '\n') & valid
+        ~((atom_active << @as(shift, 1)) |
+            if (state.in_atom) @as(mask, 1) else 0);
+    const record_boundaries: mask = if (mode == .jsonl)
+        simd.matchByte(vlen, chunk, '\n') & valid
     else
         0;
     const indexes = ((structural | atom_starts | record_boundaries) & outside_string) |
         opening_quotes;
 
-    try sink.appendMask(Mask, indexes, base_offset);
+    try sink.appendMask(mask, indexes, base_offset);
 
-    const last_bit: Mask = @as(Mask, 1) <<
-        @as(Shift, @intCast(valid_count - 1));
+    const last_bit: mask = @as(mask, 1) <<
+        @as(shift, @intCast(valid_count - 1));
     // Widen the logical lane probe to a bounded storage-width value.
-    state.in_string = simd.exactMask(Mask, inside_without_closing & last_bit) != 0;
+    state.in_string = simd.exactMask(mask, inside_without_closing & last_bit) != 0;
     state.quote_delimiter = if (state.in_string) '"' else 0;
-    state.ends_in_backslash = bytes[valid_count - 1] == '\\';
+    state.ends_in_backslash = simd.exactMask(mask, backslashes & last_bit) != 0;
     state.backslash_run_odd = simd.trailingRunOdd(
-        VLEN,
+        vlen,
         backslashes,
         valid_count,
         state.backslash_run_odd,
     );
-    state.in_atom = simd.exactMask(Mask, atom_active & last_bit) != 0;
+    state.in_atom = simd.exactMask(mask, atom_active & last_bit) != 0;
 }
 
 fn processDialectBlock(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     comptime mode: Mode,
     state: *State,
-    bytes: [VLEN]u8,
+    bytes: [vlen]u8,
     valid_count: usize,
     base_offset: usize,
     sink: anytype,
 ) Error!void {
-    const Mask = simd.Mask(VLEN);
-    const Shift = std.math.Log2Int(Mask);
-    const chunk: simd.Vec(VLEN, u8) = bytes;
-    const valid = simd.validMask(VLEN, valid_count);
-    const backslashes = simd.matchByte(VLEN, chunk, '\\') & valid;
+    const mask = simd.Mask(vlen);
+    const shift = std.math.Log2Int(mask);
+    const chunk: simd.Vec(u8, vlen) = bytes;
+    const valid = simd.validMask(vlen, valid_count);
+    const backslashes = simd.matchByte(vlen, chunk, '\\') & valid;
     var odd_backslash_ends = simd.computeBackslashRuns(
-        Mask,
+        mask,
         backslashes,
         state.ends_in_backslash,
     ).odd_length_ends & valid;
     if (state.ends_in_backslash) {
-        if (simd.exactMask(Mask, backslashes & @as(Mask, 1)) == 0) {
+        if (simd.exactMask(mask, backslashes & @as(mask, 1)) == 0) {
             if (state.backslash_run_odd) {
                 odd_backslash_ends |= 1;
             } else {
-                odd_backslash_ends &= ~@as(Mask, 1);
+                odd_backslash_ends &= ~@as(mask, 1);
             }
         } else if (state.backslash_run_odd) {
-            odd_backslash_ends ^= leadingRunEndMask(VLEN, backslashes, valid_count);
+            odd_backslash_ends ^= leadingRunEndMask(vlen, backslashes, valid_count);
         }
     }
 
     const unescaped_double_quotes =
-        simd.matchByte(VLEN, chunk, '"') & valid & ~odd_backslash_ends;
+        simd.matchByte(vlen, chunk, '"') & valid & ~odd_backslash_ends;
     const unescaped_single_quotes = if (mode == .json5)
-        simd.matchByte(VLEN, chunk, '\'') & valid & ~odd_backslash_ends
+        simd.matchByte(vlen, chunk, '\'') & valid & ~odd_backslash_ends
     else
         0;
-    const structural = (simd.matchAny4(VLEN, chunk, '{', '}', '[', ']') |
-        simd.matchAny2(VLEN, chunk, ':', ',')) & valid;
-    const slash = simd.matchByte(VLEN, chunk, '/') & valid;
-    const star = simd.matchByte(VLEN, chunk, '*') & valid;
-    const line_end = simd.matchAny2(VLEN, chunk, '\n', '\r') & valid;
+    const structural = (simd.matchAny4(vlen, chunk, '{', '}', '[', ']') |
+        simd.matchAny2(vlen, chunk, ':', ',')) & valid;
+    const slash = simd.matchByte(vlen, chunk, '/') & valid;
+    const star = simd.matchByte(vlen, chunk, '*') & valid;
+    const line_end = simd.matchAny2(vlen, chunk, '\n', '\r') & valid;
     const atom_mask = switch (mode) {
-        .jsonc => (simd.matchRange(VLEN, chunk, '0', '9') |
-            simd.matchAny4(VLEN, chunk, '-', 't', 'f', 'n')) & valid,
-        .json5 => json5AtomMask(VLEN, chunk, valid),
+        .jsonc => (simd.matchRange(vlen, chunk, '0', '9') |
+            simd.matchAny4(vlen, chunk, '-', 't', 'f', 'n')) & valid,
+        .json5 => json5AtomMask(vlen, chunk, valid),
         else => unreachable,
     };
 
@@ -257,19 +257,19 @@ fn processDialectBlock(
     // inside those regions are discarded by processDialectByte, while this
     // keeps opposite quote delimiters from hiding a real atom start.
     const atom_starts = atom_mask &
-        ~((atom_mask << @as(Shift, 1)) |
-            if (state.in_atom) @as(Mask, 1) else 0);
+        ~((atom_mask << @as(shift, 1)) |
+            if (state.in_atom) @as(mask, 1) else 0);
     var candidates = structural | slash | star |
         unescaped_double_quotes | unescaped_single_quotes | atom_starts;
     if (mode == .json5) {
-        candidates |= simd.matchRange(VLEN, chunk, 0x80, 0xff) & valid;
-        candidates |= simd.matchByte(VLEN, chunk, '\\') & valid;
+        candidates |= simd.matchRange(vlen, chunk, 0x80, 0xff) & valid;
+        candidates |= simd.matchByte(vlen, chunk, '\\') & valid;
         candidates |= line_end;
     } else {
         candidates |= line_end;
     }
 
-    var visible: Mask = 0;
+    var visible: mask = 0;
     var cursor: usize = 0;
     while (cursor < valid_count) {
         const force = state.pending_unicode_len != 0 or
@@ -279,7 +279,7 @@ fn processDialectBlock(
         const candidate_offset = if (force)
             cursor
         else
-            nextSetBit(Mask, candidates, cursor, valid_count) orelse {
+            nextSetBit(mask, candidates, cursor, valid_count) orelse {
                 updateOrdinarySpan(mode, state, &bytes, cursor, valid_count);
                 break;
             };
@@ -289,7 +289,7 @@ fn processDialectBlock(
         }
 
         const consumed = try processDialectByte(
-            VLEN,
+            vlen,
             mode,
             state,
             &bytes,
@@ -302,7 +302,7 @@ fn processDialectBlock(
         );
         if (!consumed) {
             _ = try processDialectByte(
-                VLEN,
+                vlen,
                 mode,
                 state,
                 &bytes,
@@ -317,10 +317,12 @@ fn processDialectBlock(
         cursor = candidate_offset + 1;
     }
 
-    try sink.appendMask(Mask, visible, base_offset);
-    state.ends_in_backslash = bytes[valid_count - 1] == '\\';
+    try sink.appendMask(mask, visible, base_offset);
+    const last_bit: mask = @as(mask, 1) <<
+        @as(shift, @intCast(valid_count - 1));
+    state.ends_in_backslash = simd.exactMask(mask, backslashes & last_bit) != 0;
     state.backslash_run_odd = simd.trailingRunOdd(
-        VLEN,
+        vlen,
         backslashes,
         valid_count,
         state.backslash_run_odd,
@@ -328,15 +330,15 @@ fn processDialectBlock(
 }
 
 fn processDialectByte(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     comptime mode: Mode,
     state: *State,
     bytes: []const u8,
     local_offset: usize,
     base_offset: usize,
-    unescaped_double_quotes: simd.Mask(VLEN),
-    unescaped_single_quotes: simd.Mask(VLEN),
-    visible: *simd.Mask(VLEN),
+    unescaped_double_quotes: simd.Mask(vlen),
+    unescaped_single_quotes: simd.Mask(vlen),
+    visible: *simd.Mask(vlen),
     sink: anytype,
 ) Error!bool {
     const byte = bytes[local_offset];
@@ -347,7 +349,7 @@ fn processDialectByte(
     }
     if (state.pending_unicode_len != 0) {
         const consumed = try appendPendingUnicode(
-            VLEN,
+            vlen,
             mode,
             state,
             byte,
@@ -387,14 +389,14 @@ fn processDialectByte(
     }
 
     if (state.in_string) {
-        const bit = @as(simd.Mask(VLEN), 1) <<
-            @as(std.math.Log2Int(simd.Mask(VLEN)), @intCast(local_offset));
+        const bit = @as(simd.Mask(vlen), 1) <<
+            @as(std.math.Log2Int(simd.Mask(vlen)), @intCast(local_offset));
         const quote_mask = if (state.quote_delimiter == '\'')
             unescaped_single_quotes
         else
             unescaped_double_quotes;
         // Widen the logical lane probe to a bounded storage-width value.
-        if (simd.exactMask(simd.Mask(VLEN), quote_mask & bit) != 0) {
+        if (simd.exactMask(simd.Mask(vlen), quote_mask & bit) != 0) {
             state.in_string = false;
             state.quote_delimiter = 0;
             state.in_atom = false;
@@ -422,7 +424,7 @@ fn processDialectByte(
         if (byte == 'u') {
             if (!state.in_atom) {
                 try recordOffset(
-                    VLEN,
+                    vlen,
                     visible,
                     base_offset,
                     state.pending_escape_offset,
@@ -442,12 +444,12 @@ fn processDialectByte(
         return true;
     }
 
-    const bit = @as(simd.Mask(VLEN), 1) <<
-        @as(std.math.Log2Int(simd.Mask(VLEN)), @intCast(local_offset));
+    const bit = @as(simd.Mask(vlen), 1) <<
+        @as(std.math.Log2Int(simd.Mask(vlen)), @intCast(local_offset));
     const is_quote =
-        simd.exactMask(simd.Mask(VLEN), unescaped_double_quotes & bit) != 0 or
+        simd.exactMask(simd.Mask(vlen), unescaped_double_quotes & bit) != 0 or
         (mode == .json5 and
-            simd.exactMask(simd.Mask(VLEN), unescaped_single_quotes & bit) != 0);
+            simd.exactMask(simd.Mask(vlen), unescaped_single_quotes & bit) != 0);
     if (is_quote) {
         state.in_string = true;
         state.quote_delimiter = byte;
@@ -461,7 +463,7 @@ fn processDialectByte(
     }
 
     if (isStructuralByte(byte)) {
-        try recordOffset(VLEN, visible, base_offset, base_offset + local_offset, sink);
+        try recordOffset(vlen, visible, base_offset, base_offset + local_offset, sink);
         state.in_atom = false;
         return true;
     }
@@ -480,7 +482,7 @@ fn processDialectByte(
     };
     if (atom) {
         if (!state.in_atom) {
-            try recordOffset(VLEN, visible, base_offset, base_offset + local_offset, sink);
+            try recordOffset(vlen, visible, base_offset, base_offset + local_offset, sink);
         }
         state.in_atom = true;
         return true;
@@ -495,11 +497,11 @@ fn processDialectByte(
 }
 
 fn appendPendingUnicode(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     comptime mode: Mode,
     state: *State,
     byte: u8,
-    visible: *simd.Mask(VLEN),
+    visible: *simd.Mask(vlen),
     base_offset: usize,
     sink: anytype,
 ) Error!bool {
@@ -520,7 +522,7 @@ fn appendPendingUnicode(
         if (!expected and !continuation) {
             if (!state.in_atom) {
                 try recordOffset(
-                    VLEN,
+                    vlen,
                     visible,
                     base_offset,
                     state.pending_unicode_offset,
@@ -534,7 +536,7 @@ fn appendPendingUnicode(
     } else if (length == 2 and (byte < 0x80 or byte > 0xbf)) {
         if (!state.in_atom) {
             try recordOffset(
-                VLEN,
+                vlen,
                 visible,
                 base_offset,
                 state.pending_unicode_offset,
@@ -574,7 +576,7 @@ fn appendPendingUnicode(
     } else {
         if (!state.in_atom) {
             try recordOffset(
-                VLEN,
+                vlen,
                 visible,
                 base_offset,
                 state.pending_unicode_offset,
@@ -615,7 +617,7 @@ fn updateOrdinarySpan(
     start: usize,
     end: usize,
 ) void {
-    if (start >= end) return;
+    if (end <= start) return;
     if (state.in_string) return;
     if (state.comment != .none) return;
 
@@ -628,16 +630,16 @@ fn updateOrdinarySpan(
 }
 
 fn recordOffset(
-    comptime VLEN: usize,
-    visible: *simd.Mask(VLEN),
+    comptime vlen: usize,
+    visible: *simd.Mask(vlen),
     base_offset: usize,
     offset: usize,
     sink: anytype,
 ) Error!void {
-    if (offset >= base_offset and offset - base_offset < VLEN) {
-        const Shift = std.math.Log2Int(simd.Mask(VLEN));
-        visible.* |= @as(simd.Mask(VLEN), 1) <<
-            @as(Shift, @intCast(offset - base_offset));
+    if (offset >= base_offset and offset - base_offset < vlen) {
+        const shift = std.math.Log2Int(simd.Mask(vlen));
+        visible.* |= @as(simd.Mask(vlen), 1) <<
+            @as(shift, @intCast(offset - base_offset));
         return;
     }
     try sink.appendOffset(offset);
@@ -660,35 +662,35 @@ fn nextSetBit(
 }
 
 fn leadingRunEndMask(
-    comptime VLEN: usize,
-    backslashes: simd.Mask(VLEN),
+    comptime vlen: usize,
+    backslashes: simd.Mask(vlen),
     valid_count: usize,
-) simd.Mask(VLEN) {
-    const Mask = simd.Mask(VLEN);
-    const Shift = std.math.Log2Int(Mask);
-    const valid = simd.validMask(VLEN, valid_count);
+) simd.Mask(vlen) {
+    const mask = simd.Mask(vlen);
+    const shift = std.math.Log2Int(mask);
+    const valid = simd.validMask(vlen, valid_count);
     // Complement at the logical width, then normalize the union for the
     // storage-width zero test and bit scan.
-    const non_backslashes = simd.exactMask(Mask, ~backslashes | ~valid);
+    const non_backslashes = simd.exactMask(mask, ~backslashes | ~valid);
     if (non_backslashes == 0) return 0;
     const run_length: usize = @intCast(@ctz(non_backslashes));
     if (run_length >= valid_count) return 0;
-    return @as(Mask, 1) << @as(Shift, @intCast(run_length));
+    return @as(mask, 1) << @as(shift, @intCast(run_length));
 }
 
 fn json5AtomMask(
-    comptime VLEN: usize,
-    chunk: simd.Vec(VLEN, u8),
-    valid: simd.Mask(VLEN),
-) simd.Mask(VLEN) {
-    const prefixes = simd.matchAny4(VLEN, chunk, 0xc2, 0xe1, 0xe2, 0xe3) |
-        simd.matchByte(VLEN, chunk, 0xef);
-    const ascii = simd.matchRange(VLEN, chunk, '0', '9') |
-        simd.matchRange(VLEN, chunk, 'a', 'z') |
-        simd.matchRange(VLEN, chunk, 'A', 'Z') |
-        simd.matchAny4(VLEN, chunk, '-', '+', '.', '_') |
-        simd.matchByte(VLEN, chunk, '$');
-    const high_leading = simd.matchRange(VLEN, chunk, 0xc0, 0xff) & ~prefixes;
+    comptime vlen: usize,
+    chunk: simd.Vec(u8, vlen),
+    valid: simd.Mask(vlen),
+) simd.Mask(vlen) {
+    const prefixes = simd.matchAny4(vlen, chunk, 0xc2, 0xe1, 0xe2, 0xe3) |
+        simd.matchByte(vlen, chunk, 0xef);
+    const ascii = simd.matchRange(vlen, chunk, '0', '9') |
+        simd.matchRange(vlen, chunk, 'a', 'z') |
+        simd.matchRange(vlen, chunk, 'A', 'Z') |
+        simd.matchAny4(vlen, chunk, '-', '+', '.', '_') |
+        simd.matchByte(vlen, chunk, '$');
+    const high_leading = simd.matchRange(vlen, chunk, 0xc0, 0xff) & ~prefixes;
     return (ascii | high_leading) & valid;
 }
 

@@ -396,7 +396,7 @@ const FaultingReader = struct {
         writer: *std.Io.Writer,
         limit: std.Io.Limit,
     ) std.Io.Reader.StreamError!usize {
-        const self: *@This() = @alignCast(@fieldParentPtr("reader", reader));
+        const self: *FaultingReader = @alignCast(@fieldParentPtr("reader", reader));
         if (self.offset >= self.fail_at) return error.ReadFailed;
 
         const available = self.fail_at - self.offset;

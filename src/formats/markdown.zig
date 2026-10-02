@@ -51,7 +51,7 @@ const MarkdownIndexSink = struct {
     indexes: *stage1.StructuralIndex,
     kinds: []MarkdownTokenKind,
 
-    fn append(self: *@This(), offset: usize, kind: MarkdownTokenKind) void {
+    fn append(self: *MarkdownIndexSink, offset: usize, kind: MarkdownTokenKind) void {
         appendToken(self.indexes, self.kinds, offset, kind);
     }
 };
@@ -66,7 +66,7 @@ const MarkdownTapeSink = struct {
     capacity_max: usize,
     failure: ?MarkdownTapeSinkError = null,
 
-    fn append(self: *@This(), offset: usize, kind: MarkdownTokenKind) void {
+    fn append(self: *MarkdownTapeSink, offset: usize, kind: MarkdownTokenKind) void {
         if (self.failure != null) return;
         const length = markdownMarkerLength(self.input, offset, kind);
         if (length > std.math.maxInt(u24)) {
@@ -90,7 +90,7 @@ const MarkdownTapeSink = struct {
         });
     }
 
-    fn grow(self: *@This()) std.mem.Allocator.Error!void {
+    fn grow(self: *MarkdownTapeSink) std.mem.Allocator.Error!void {
         assert(self.tape.items.len == self.tape.capacity);
         assert(self.tape.capacity < self.capacity_max);
         const doubled_capacity = std.math.mul(
@@ -113,7 +113,7 @@ const MarkdownResidentSink = struct {
     kinds: []MarkdownTokenKind,
     count: *usize,
 
-    fn append(self: *@This(), offset: usize, kind: MarkdownTokenKind) void {
+    fn append(self: *MarkdownResidentSink, offset: usize, kind: MarkdownTokenKind) void {
         assert(self.count.* < self.indexes.len);
         assert(self.count.* < self.kinds.len);
         self.indexes[self.count.*] = @intCast(offset);
@@ -128,7 +128,7 @@ const MarkdownValidationSink = struct {
     token_index: usize = 0,
     diagnostic: ?MarkdownDiagnostic = null,
 
-    fn append(self: *@This(), offset: usize, kind: MarkdownTokenKind) void {
+    fn append(self: *MarkdownValidationSink, offset: usize, kind: MarkdownTokenKind) void {
         if (self.diagnostic != null) return;
         if (self.token_index >= self.structural_index.count) {
             self.diagnostic = markdownDiagnosticAt(self.input, error.InvalidTokenIndex, offset);
@@ -147,7 +147,7 @@ const MarkdownValidationSink = struct {
         self.token_index += 1;
     }
 
-    fn finish(self: *@This()) void {
+    fn finish(self: *MarkdownValidationSink) void {
         if (self.diagnostic != null or self.token_index >= self.structural_index.count) return;
         const offset: usize = @intCast(self.structural_index.indexes[self.token_index]);
         self.diagnostic = markdownDiagnosticAt(self.input, error.InvalidTokenKind, offset);
@@ -158,7 +158,7 @@ const MarkdownTapeValidationSink = struct {
     count: usize = 0,
     diagnostic: ?MarkdownNavigationError = null,
 
-    fn append(self: *@This(), offset: usize, kind: MarkdownTokenKind) void {
+    fn append(self: *MarkdownTapeValidationSink, offset: usize, kind: MarkdownTokenKind) void {
         if (self.diagnostic != null) return;
         if (self.count >= self.tape.len) {
             self.diagnostic = error.InvalidTapeOrder;
@@ -172,7 +172,7 @@ const MarkdownTapeValidationSink = struct {
         self.count += 1;
     }
 
-    fn finish(self: *@This()) MarkdownNavigationError!void {
+    fn finish(self: *MarkdownTapeValidationSink) MarkdownNavigationError!void {
         if (self.diagnostic) |diagnostic| return diagnostic;
         if (self.count != self.tape.len) return error.InvalidTapeOrder;
     }
@@ -186,7 +186,7 @@ pub fn indexMarkdown(
 }
 
 pub fn indexMarkdownImpl(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     allocator: std.mem.Allocator,
     input: []const u8,
 ) !MarkdownStructuralIndex {
@@ -196,11 +196,11 @@ pub fn indexMarkdownImpl(
     const kinds = try allocator.alloc(MarkdownTokenKind, input.len);
     errdefer allocator.free(kinds);
 
-    var sink = MarkdownIndexSink{
+    var sink: MarkdownIndexSink = .{
         .indexes = &indexes,
         .kinds = kinds,
     };
-    scanMarkdown(VLEN, input, &sink);
+    scanMarkdown(vlen, input, &sink);
     try indexes.finish(input.len);
 
     return .{
@@ -230,7 +230,7 @@ pub const MarkdownStreamIndexer = struct {
     kinds: ?[]MarkdownTokenKind = null,
     finished: bool = false,
 
-    const Self = @This();
+    const Self = MarkdownStreamIndexer;
     const initial_output_capacity: usize = 1;
     pub const max_retained_line_length: usize = std.math.maxInt(u32);
 
@@ -258,7 +258,7 @@ pub const MarkdownStreamIndexer = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         chunk_len: usize,
-    ) InitError!Self {
+    ) InitError!MarkdownStreamIndexer {
         const output_capacity = @max(chunk_len, initial_output_capacity);
         var index = try stage1.StructuralIndex.init(allocator, output_capacity);
         errdefer index.deinit(allocator);
@@ -485,14 +485,14 @@ pub const MarkdownStreamIndexer = struct {
     }
 
     fn processLineContents(self: *Self, line: []const u8) void {
-        var state = MarkdownScanState{
+        var state: MarkdownScanState = .{
             .in_code_fence = self.in_code_fence,
             .in_inline_code = self.in_inline_code,
             .inline_code_length = self.inline_code_length,
             .fence_character = self.fence_character,
             .fence_length = self.fence_length,
         };
-        var sink = MarkdownStreamSink{ .stream = self };
+        var sink: MarkdownStreamSink = .{ .stream = self };
         scanMarkdownLine(
             simd.default_vector_len,
             line,
@@ -515,8 +515,8 @@ pub fn initStreamIndexer(
     return MarkdownStreamIndexer.init(allocator, chunk_len);
 }
 
-fn scanMarkdown(comptime VLEN: usize, input: []const u8, sink: anytype) void {
-    var state = MarkdownScanState{
+fn scanMarkdown(comptime vlen: usize, input: []const u8, sink: anytype) void {
+    var state: MarkdownScanState = .{
         .in_code_fence = false,
         .in_inline_code = false,
         .inline_code_length = 0,
@@ -525,12 +525,12 @@ fn scanMarkdown(comptime VLEN: usize, input: []const u8, sink: anytype) void {
     };
     var line_start: usize = 0;
     while (line_start < input.len) {
-        line_start = scanMarkdownLineFused(VLEN, input, line_start, &state, sink);
+        line_start = scanMarkdownLineFused(vlen, input, line_start, &state, sink);
     }
 }
 
 fn scanMarkdownLineFused(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     input: []const u8,
     line_start: usize,
     state: *MarkdownScanState,
@@ -542,24 +542,24 @@ fn scanMarkdownLineFused(
     var line_end = input.len;
     var chunk_offset = line_start;
 
-    while (chunk_offset + VLEN <= input.len) : (chunk_offset += VLEN) {
-        const vector: simd.Vec(VLEN, u8) = input[chunk_offset..][0..VLEN].*;
+    while (chunk_offset + vlen <= input.len) : (chunk_offset += vlen) {
+        const vector: simd.Vec(u8, vlen) = input[chunk_offset..][0..vlen].*;
         // Zero tests and bit scans below share an explicitly bounded
         // storage-width representation.
-        const newline_mask: simd.MaskStorage(VLEN) = simd.exactMask(
-            simd.Mask(VLEN),
-            simd.matchAny2(VLEN, vector, '\r', '\n'),
+        const newline_mask: simd.MaskStorage(vlen) = simd.exactMask(
+            simd.Mask(vlen),
+            simd.matchAny2(vlen, vector, '\r', '\n'),
         );
         if (newline_mask != 0) {
-            const relative_line_end = @as(usize, @intCast(@ctz(newline_mask)));
+            const relative_line_end: usize = @intCast(@ctz(newline_mask));
             line_end = chunk_offset + relative_line_end;
-            const valid_candidate_mask: simd.MaskStorage(VLEN) = simd.exactMask(
-                simd.Mask(VLEN),
-                markdownInlineCandidateMask(VLEN, vector) &
-                    simd.validMask(VLEN, relative_line_end),
+            const valid_candidate_mask: simd.MaskStorage(vlen) = simd.exactMask(
+                simd.Mask(vlen),
+                markdownInlineCandidateMask(vlen, vector) &
+                    simd.validMask(vlen, relative_line_end),
             );
             if (valid_candidate_mask != 0) {
-                if (candidate_count + VLEN <= max_buffered_candidates) {
+                if (candidate_count + vlen <= max_buffered_candidates) {
                     candidate_count += simd.extractBitIndexes(
                         @TypeOf(valid_candidate_mask),
                         valid_candidate_mask,
@@ -572,12 +572,12 @@ fn scanMarkdownLineFused(
             }
             break;
         }
-        const candidate_mask: simd.MaskStorage(VLEN) = simd.exactMask(
-            simd.Mask(VLEN),
-            markdownInlineCandidateMask(VLEN, vector),
+        const candidate_mask: simd.MaskStorage(vlen) = simd.exactMask(
+            simd.Mask(vlen),
+            markdownInlineCandidateMask(vlen, vector),
         );
         if (candidate_mask != 0) {
-            if (candidate_count + VLEN <= max_buffered_candidates) {
+            if (candidate_count + vlen <= max_buffered_candidates) {
                 candidate_count += simd.extractBitIndexes(
                     @TypeOf(candidate_mask),
                     candidate_mask,
@@ -610,7 +610,7 @@ fn scanMarkdownLineFused(
     }
 
     scanMarkdownLineContent(
-        VLEN,
+        vlen,
         input,
         line_start,
         line_end,
@@ -627,41 +627,19 @@ fn scanMarkdownLineFused(
     return line_end + 1;
 }
 
-fn findMarkdownLineEnd(
-    comptime VLEN: usize,
-    input: []const u8,
-    start: usize,
-) usize {
-    var chunk_offset = start;
-    while (chunk_offset + VLEN <= input.len) : (chunk_offset += VLEN) {
-        const vector: simd.Vec(VLEN, u8) = input[chunk_offset..][0..VLEN].*;
-        const newline_mask: simd.MaskStorage(VLEN) = simd.exactMask(
-            simd.Mask(VLEN),
-            simd.matchAny2(VLEN, vector, '\r', '\n'),
-        );
-        if (newline_mask != 0) {
-            return chunk_offset + @as(usize, @intCast(@ctz(newline_mask)));
-        }
-    }
-    while (chunk_offset < input.len) : (chunk_offset += 1) {
-        const c = input[chunk_offset];
-        if (c == '\r' or c == '\n') return chunk_offset;
-    }
-    return input.len;
-}
 fn scanMarkdownLine(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     input: []const u8,
     line_start: usize,
     line_end: usize,
     state: *MarkdownScanState,
     sink: anytype,
 ) void {
-    scanMarkdownLineContent(VLEN, input, line_start, line_end, null, false, state, sink);
+    scanMarkdownLineContent(vlen, input, line_start, line_end, null, false, state, sink);
 }
 
 fn scanMarkdownLineContent(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     input: []const u8,
     line_start: usize,
     line_end: usize,
@@ -775,14 +753,14 @@ fn scanMarkdownLineContent(
 
     var chunk_offset = line_start;
     var skipped_until = line_start;
-    while (chunk_offset + VLEN <= line_end) : (chunk_offset += VLEN) {
-        const vector: simd.Vec(VLEN, u8) = input[chunk_offset..][0..VLEN].*;
-        const candidate_mask: simd.MaskStorage(VLEN) = simd.exactMask(
-            simd.Mask(VLEN),
-            markdownInlineCandidateMask(VLEN, vector),
+    while (chunk_offset + vlen <= line_end) : (chunk_offset += vlen) {
+        const vector: simd.Vec(u8, vlen) = input[chunk_offset..][0..vlen].*;
+        const candidate_mask: simd.MaskStorage(vlen) = simd.exactMask(
+            simd.Mask(vlen),
+            markdownInlineCandidateMask(vlen, vector),
         );
         if (candidate_mask == 0) continue;
-        var candidate_indexes: [VLEN]u32 = undefined;
+        var candidate_indexes: [vlen]u32 = undefined;
         const candidate_count = simd.extractBitIndexes(
             @TypeOf(candidate_mask),
             candidate_mask,
@@ -1040,7 +1018,7 @@ fn validateMarkdownTape(
         previous_offset = offset;
     }
 
-    var sink = MarkdownTapeValidationSink{ .tape = tape };
+    var sink: MarkdownTapeValidationSink = .{ .tape = tape };
     scanMarkdown(simd.default_vector_len, input, &sink);
     try sink.finish();
 }
@@ -1055,7 +1033,7 @@ pub fn buildMarkdownTape(
     }
     var tape: std.ArrayList(MarkdownTapeWord) = .empty;
     errdefer tape.deinit(allocator);
-    var sink = MarkdownTapeSink{
+    var sink: MarkdownTapeSink = .{
         .allocator = allocator,
         .tape = &tape,
         .input = input,
@@ -1131,7 +1109,7 @@ pub fn validateMarkdownIndex(
         has_previous = true;
     }
 
-    var sink = MarkdownValidationSink{
+    var sink: MarkdownValidationSink = .{
         .input = input,
         .structural_index = structural_index,
     };
@@ -1220,17 +1198,17 @@ const MarkdownScanState = struct {
 const MarkdownStreamSink = struct {
     stream: *MarkdownStreamIndexer,
 
-    fn append(self: *@This(), offset: usize, kind: MarkdownTokenKind) void {
+    fn append(self: *MarkdownStreamSink, offset: usize, kind: MarkdownTokenKind) void {
         self.stream.appendStreamToken(self.stream.line_start_offset + offset, kind);
     }
 };
 
 fn markdownInlineCandidateMask(
-    comptime VLEN: usize,
-    vector: simd.Vec(VLEN, u8),
-) simd.Mask(VLEN) {
-    const inline_chars = simd.matchAny4(VLEN, vector, '`', '[', ']', '(');
-    const paren_close = simd.matchByte(VLEN, vector, ')');
+    comptime vlen: usize,
+    vector: simd.Vec(u8, vlen),
+) simd.Mask(vlen) {
+    const inline_chars = simd.matchAny4(vlen, vector, '`', '[', ']', '(');
+    const paren_close = simd.matchByte(vlen, vector, ')');
     return inline_chars | paren_close;
 }
 
@@ -1338,7 +1316,7 @@ pub const Parser = struct {
         try self.prepare(input);
 
         var count: usize = 0;
-        var sink = MarkdownResidentSink{
+        var sink: MarkdownResidentSink = .{
             .indexes = self.candidates.indexes,
             .kinds = self.candidates.kinds,
             .count = &count,
@@ -1406,7 +1384,7 @@ const MarkdownReaderBase = struct {
     count: usize,
     guard: resident.Guard,
 
-    fn event(self: *const @This()) MarkdownOnDemandError!?Event {
+    fn event(self: *const MarkdownReaderBase) MarkdownOnDemandError!?Event {
         try self.guard.check();
         const position = self.guard.expected_position;
         if (position >= self.count) return null;
@@ -1433,7 +1411,7 @@ pub const EventReader = struct {
     guard: resident.Guard,
 
     pub fn peek(self: *const EventReader) MarkdownOnDemandError!?Event {
-        var base = MarkdownReaderBase{
+        var base: MarkdownReaderBase = .{
             .parser = self.parser,
             .input = self.input,
             .count = self.count,
@@ -1464,7 +1442,7 @@ pub const TokenCursor = struct {
     guard: resident.Guard,
 
     pub fn peek(self: *const TokenCursor) MarkdownOnDemandError!?Token {
-        var base = MarkdownReaderBase{
+        var base: MarkdownReaderBase = .{
             .parser = self.parser,
             .input = self.input,
             .count = self.count,
@@ -1718,10 +1696,10 @@ fn expectMatchesScalarOracle(input: []const u8) !void {
     return expectMatchesScalarOracleAtWidth(simd.default_vector_len, input);
 }
 
-fn expectMatchesScalarOracleAtWidth(comptime VLEN: usize, input: []const u8) !void {
+fn expectMatchesScalarOracleAtWidth(comptime vlen: usize, input: []const u8) !void {
     var expected = try scalarIndexMarkdown(testing.allocator, input);
     defer expected.deinit(testing.allocator);
-    var actual = try indexMarkdownImpl(VLEN, testing.allocator, input);
+    var actual = try indexMarkdownImpl(vlen, testing.allocator, input);
     defer actual.deinit(testing.allocator);
 
     try expectIndexInvariants(input, &expected);
@@ -2013,14 +1991,14 @@ test "Markdown scanning preserves CRLF at SIMD edges" {
     }
 }
 
-fn expectMarkdownLineTerminatorsAtWidth(comptime VLEN: usize) !void {
+fn expectMarkdownLineTerminatorsAtWidth(comptime vlen: usize) !void {
     // A block that holds no terminator must extend the current line instead of
     // ending it, so every terminator position inside, on, and just past a block
     // boundary has to resolve to the same line split as the scalar oracle.
     const terminators = [_][]const u8{ "\n", "\r", "\r\n" };
     for (terminators) |terminator| {
-        for ([_]usize{ VLEN - 1, VLEN, VLEN + 1, 2 * VLEN }) |terminator_offset| {
-            var input: [3 * VLEN + 8]u8 = @splat('x');
+        for ([_]usize{ vlen - 1, vlen, vlen + 1, 2 * vlen }) |terminator_offset| {
+            var input: [3 * vlen + 8]u8 = @splat('x');
             input[0] = '#';
             @memcpy(input[terminator_offset..][0..terminator.len], terminator);
 
@@ -2031,7 +2009,7 @@ fn expectMarkdownLineTerminatorsAtWidth(comptime VLEN: usize) !void {
             input[next_line + 4] = ']';
             input[next_line + 5] = '\n';
 
-            try expectMatchesScalarOracleAtWidth(VLEN, input[0 .. next_line + 6]);
+            try expectMatchesScalarOracleAtWidth(vlen, input[0 .. next_line + 6]);
         }
     }
 }
@@ -2374,7 +2352,7 @@ test "Markdown Stage2 rejects forged index count and tape size" {
         @as(usize, std.math.maxInt(u32)) + 1
     else
         std.math.maxInt(usize);
-    const oversized_tape = MarkdownStructuralIndex{
+    const oversized_tape: MarkdownStructuralIndex = .{
         .indexes = &indexes,
         .kinds = &kinds,
         .count = oversized_count,
@@ -2384,12 +2362,13 @@ test "Markdown Stage2 rejects forged index count and tape size" {
         validateMarkdownIndex("#", &oversized_tape),
     );
 
-    const invalid_count = MarkdownStructuralIndex{
+    const invalid_count: MarkdownStructuralIndex = .{
         .indexes = &indexes,
         .kinds = &kinds,
         .count = 2,
     };
-    const diagnostic = (try validateMarkdownIndex("#", &invalid_count)).?;
+    const diagnostic = (try validateMarkdownIndex("#", &invalid_count)) orelse
+        return error.TestUnexpectedResult;
     try testing.expectEqual(error.InvalidIndexCount, diagnostic.err);
     try testing.expectEqual(@as(usize, 1), diagnostic.byte_offset);
 }
@@ -2398,13 +2377,14 @@ test "Markdown Stage2 rejects forged out-of-range offsets" {
     const input = "# heading";
     var indexes = [_]u32{@intCast(input.len)};
     var kinds = [_]MarkdownTokenKind{.heading};
-    const forged = MarkdownStructuralIndex{
+    const forged: MarkdownStructuralIndex = .{
         .indexes = &indexes,
         .kinds = &kinds,
         .count = 1,
     };
 
-    const diagnostic = (try validateMarkdownIndex(input, &forged)).?;
+    const diagnostic = (try validateMarkdownIndex(input, &forged)) orelse
+        return error.TestUnexpectedResult;
     try testing.expectEqual(error.InvalidTokenIndex, diagnostic.err);
     try testing.expectEqual(input.len, diagnostic.byte_offset);
     try testing.expectEqual(@as(u32, 1), diagnostic.line);
@@ -2418,13 +2398,14 @@ test "Markdown Stage2 rejects forged non-increasing offsets" {
     const input = "# >";
     var indexes = [_]u32{ 2, 0 };
     var kinds = [_]MarkdownTokenKind{ .blockquote, .heading };
-    const forged = MarkdownStructuralIndex{
+    const forged: MarkdownStructuralIndex = .{
         .indexes = &indexes,
         .kinds = &kinds,
         .count = 2,
     };
 
-    const diagnostic = (try validateMarkdownIndex(input, &forged)).?;
+    const diagnostic = (try validateMarkdownIndex(input, &forged)) orelse
+        return error.TestUnexpectedResult;
     try testing.expectEqual(error.InvalidTokenOrder, diagnostic.err);
     try testing.expectEqual(@as(usize, 0), diagnostic.byte_offset);
 }
@@ -2433,13 +2414,14 @@ test "Markdown Stage2 rejects forged kind and source mismatches" {
     const input = "\n  # heading";
     var indexes = [_]u32{3};
     var kinds = [_]MarkdownTokenKind{.blockquote};
-    const forged = MarkdownStructuralIndex{
+    const forged: MarkdownStructuralIndex = .{
         .indexes = &indexes,
         .kinds = &kinds,
         .count = 1,
     };
 
-    const diagnostic = (try validateMarkdownIndex(input, &forged)).?;
+    const diagnostic = (try validateMarkdownIndex(input, &forged)) orelse
+        return error.TestUnexpectedResult;
     try testing.expectEqual(error.InvalidTokenKind, diagnostic.err);
     try testing.expectEqual(@as(usize, 3), diagnostic.byte_offset);
     try testing.expectEqual(@as(u32, 2), diagnostic.line);
@@ -2453,13 +2435,14 @@ test "Markdown Stage2 rejects forged thematic break at list marker" {
     const input = "- item\n";
     var indexes = [_]u32{0};
     var kinds = [_]MarkdownTokenKind{.thematic_break};
-    const forged = MarkdownStructuralIndex{
+    const forged: MarkdownStructuralIndex = .{
         .indexes = &indexes,
         .kinds = &kinds,
         .count = 1,
     };
 
-    const diagnostic = (try validateMarkdownIndex(input, &forged)).?;
+    const diagnostic = (try validateMarkdownIndex(input, &forged)) orelse
+        return error.TestUnexpectedResult;
     try testing.expectEqual(error.InvalidTokenKind, diagnostic.err);
     try testing.expectEqual(@as(usize, 0), diagnostic.byte_offset);
 }
@@ -2468,13 +2451,14 @@ test "Markdown Stage2 rejects forged mid-line heading" {
     const input = "text # heading\n";
     var indexes = [_]u32{5};
     var kinds = [_]MarkdownTokenKind{.heading};
-    const forged = MarkdownStructuralIndex{
+    const forged: MarkdownStructuralIndex = .{
         .indexes = &indexes,
         .kinds = &kinds,
         .count = 1,
     };
 
-    const diagnostic = (try validateMarkdownIndex(input, &forged)).?;
+    const diagnostic = (try validateMarkdownIndex(input, &forged)) orelse
+        return error.TestUnexpectedResult;
     try testing.expectEqual(error.InvalidTokenKind, diagnostic.err);
     try testing.expectEqual(@as(usize, 5), diagnostic.byte_offset);
 }
@@ -2486,10 +2470,10 @@ test "Markdown marker source spans preserve fences and ordered markers" {
     defer index.deinit(testing.allocator);
 
     try testing.expectEqualSlices(u32, &.{ 0, 13, 22, 33 }, index.indexes[0..index.count]);
-    try testing.expectEqualStrings("#", index.sourceSpan(0, input).?);
-    try testing.expectEqualStrings("12.", index.sourceSpan(1, input).?);
-    try testing.expectEqualStrings("````", index.sourceSpan(2, input).?);
-    try testing.expectEqualStrings("````", index.sourceSpan(3, input).?);
+    try testing.expectEqualStrings("#", index.sourceSpan(0, input) orelse return error.TestUnexpectedResult);
+    try testing.expectEqualStrings("12.", index.sourceSpan(1, input) orelse return error.TestUnexpectedResult);
+    try testing.expectEqualStrings("````", index.sourceSpan(2, input) orelse return error.TestUnexpectedResult);
+    try testing.expectEqualStrings("````", index.sourceSpan(3, input) orelse return error.TestUnexpectedResult);
 }
 
 test "Markdown tape root and cursor validate source bounds and raw spans" {
@@ -2521,7 +2505,7 @@ test "Markdown resident traversal is lazy focused and generation guarded" {
     var reader = try document.eventReader();
     try testing.expectError(error.FocusAlreadyClaimed, document.tokenCursor());
 
-    const first = (try reader.peek()).?;
+    const first = (try reader.peek()) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(MarkdownTokenKind.heading, first.kind);
     try testing.expectEqual(@as(u32, 0), first.offset);
     try testing.expectEqualStrings("#", first.raw);

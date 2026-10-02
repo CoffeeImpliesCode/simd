@@ -152,6 +152,9 @@ fn collectRecords(
     while (stack.pop()) |frame| {
         const node = document.node(frame.id) orelse return error.InvalidDocument;
         children.clearRetainingCapacity();
+        // A valid `ChildIterator` yields at most one child per node, and
+        // `Builder.appendNode` refuses the index reserved for `NodeId.none`, so
+        // the count is bounded by `document.nodes.len` and fits `u32`.
         var iterator = document.nodeChildren(frame.id);
         while (iterator.nextChild()) |child| {
             try children.append(allocator, child);
@@ -193,7 +196,8 @@ fn consumeSmall(document: *const commonmark.CommonMarkDocument) u64 {
 
 /// Complete consumption of a safely rendered document: the full output bytes.
 fn consumeBytes(checksum: *u64, bytes: []const u8) void {
-    contract.mix(checksum, @intCast(bytes.len));
+    const length: u64 = bytes.len;
+    contract.mix(checksum, length);
     for (bytes) |byte| contract.mix(checksum, byte);
 }
 
@@ -257,7 +261,8 @@ fn reportRecords(
 ) void {
     const difference = firstDifference(expected, actual);
     std.log.err(
-        "commonmark oracle mismatch: fixture {d} ({s}) semantic tree: {d} expected records, {d} observed records, first structural difference at record {d}",
+        "commonmark oracle mismatch: fixture {d} ({s}) semantic tree: {d} expected records, " ++
+            "{d} observed records, first structural difference at record {d}",
         .{ index, @tagName(workload), expected.len, actual.len, difference },
     );
     if (difference < expected.len) reportRecord("expected", difference, expected[difference]);

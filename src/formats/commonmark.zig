@@ -192,8 +192,8 @@ pub const CommonMarkDocument = struct {
         const index = @intFromEnum(id);
         if (index >= self.texts.len) return null;
         const record = self.texts[index];
-        const start = @as(usize, record.start);
-        const len = @as(usize, record.len);
+        const start: usize = record.start;
+        const len: usize = record.len;
         if (start > self.text_bytes.len or len > self.text_bytes.len - start) return null;
         return self.text_bytes[start .. start + len];
     }
@@ -252,6 +252,8 @@ const Prefix = struct {
 };
 
 const Prefixes = struct {
+    // SAFETY: every write fills `items[len]` before `len` is incremented, and
+    // every read is guarded by `len`, so an entry past `len` is never read.
     items: [64]Prefix = undefined,
     len: u32 = 0,
     content_start: usize = 0,
@@ -262,7 +264,7 @@ const Prefixes = struct {
     }
 };
 
-const PrefixDepth = 128;
+const prefix_depth = 128;
 
 const ActiveBlock = struct {
     node: NodeId,
@@ -295,25 +297,31 @@ const Builder = struct {
             return error.TextTooLarge;
         }
         if (bytes.len > self.text_bytes.capacity -| self.text_bytes.items.len) return error.TextTooLarge;
+        // `TextId.none` is `maxInt(u32)`, so that index is reserved.
+        if (@as(usize, max_u32) <= self.texts.items.len) return error.TextTooLarge;
         const start = self.text_bytes.items.len;
+        const index = self.texts.items.len;
         self.text_bytes.appendSlice(self.gpa, bytes) catch return error.OutOfMemory;
         self.texts.append(self.gpa, .{
             .start = @intCast(start),
             .len = @intCast(bytes.len),
         }) catch return error.OutOfMemory;
-        return @enumFromInt(@as(u32, @intCast(self.texts.items.len - 1)));
+        return @enumFromInt(@as(u32, @intCast(index)));
     }
 
     fn appendTextNormalized(self: *Builder, bytes: []const u8) ParseError!TextId {
         const start = self.text_bytes.items.len;
         try self.appendNormalizedBytes(bytes);
-        if (self.text_bytes.items.len - start > self.options.max_text_bytes) return error.TextTooLarge;
-        if (self.texts.items.len >= @as(usize, max_u32)) return error.TextTooLarge;
+        const grown = self.text_bytes.items.len - start;
+        if (grown > self.options.max_text_bytes) return error.TextTooLarge;
+        // `TextId.none` is `maxInt(u32)`, so that index is reserved.
+        if (@as(usize, max_u32) <= self.texts.items.len) return error.TextTooLarge;
+        const index = self.texts.items.len;
         self.texts.append(self.gpa, .{
             .start = @intCast(start),
-            .len = @intCast(self.text_bytes.items.len - start),
+            .len = @intCast(grown),
         }) catch return error.OutOfMemory;
-        return @enumFromInt(@as(u32, @intCast(self.texts.items.len - 1)));
+        return @enumFromInt(@as(u32, @intCast(index)));
     }
 
     fn appendNormalizedBytes(self: *Builder, bytes: []const u8) ParseError!void {
@@ -337,8 +345,17 @@ const Builder = struct {
                 continue;
             }
             if (self.options.invalid_utf8 == .replace and byte >= 0x80) {
-                const width: usize = if ((byte & 0xE0) == 0xC0) 2 else if ((byte & 0xF0) == 0xE0) 3 else if ((byte & 0xF8) == 0xF0) 4 else 0;
-                if (width != 0 and index + width <= bytes.len and std.unicode.utf8ValidateSlice(bytes[index .. index + width])) {
+                const width: usize = if ((byte & 0xE0) == 0xC0)
+                    2
+                else if ((byte & 0xF0) == 0xE0)
+                    3
+                else if ((byte & 0xF8) == 0xF0)
+                    4
+                else
+                    0;
+                if (width != 0 and index + width <= bytes.len and
+                    std.unicode.utf8ValidateSlice(bytes[index .. index + width]))
+                {
                     try self.appendBytesToCurrent(bytes[index .. index + width]);
                     index += width;
                     continue;
@@ -368,7 +385,7 @@ const Builder = struct {
         data: NodeData,
     ) ParseError!NodeId {
         if (self.nodes.items.len >= self.options.max_nodes) return error.TooManyNodes;
-        if (self.nodes.items.len >= @as(usize, max_u32)) return error.TooManyNodes;
+        if (@as(usize, std.math.maxInt(u32)) <= self.nodes.items.len) return error.TooManyNodes;
         const id: NodeId = @enumFromInt(@as(u32, @intCast(self.nodes.items.len)));
         self.nodes.append(self.gpa, .{
             .kind = kind,
@@ -400,7 +417,10 @@ const Builder = struct {
         const parent_index = @intFromEnum(parent);
         const after_index = @intFromEnum(after);
         const child_index = @intFromEnum(child);
-        if (parent_index >= self.nodes.items.len or after_index >= self.nodes.items.len or child_index >= self.nodes.items.len) {
+        if (parent_index >= self.nodes.items.len or
+            after_index >= self.nodes.items.len or
+            child_index >= self.nodes.items.len)
+        {
             return error.InvalidDocument;
         }
         if (self.nodes.items[after_index].parent != parent) return error.InvalidDocument;
@@ -422,13 +442,14 @@ const Builder = struct {
         return self.text_bytes.items[record.start .. record.start + record.len];
     }
 };
+
 fn validateTreeDepth(builder: *const Builder) ParseError!void {
     if (builder.nodes.items.len == 0 or builder.nodes.items[0].kind != .document) {
         return error.InvalidDocument;
     }
     for (1..builder.nodes.items.len) |index| {
         if (builder.nodes.items[index].parent == .none) continue;
-        var current = @as(NodeId, @enumFromInt(@as(u32, @intCast(index))));
+        var current: NodeId = @enumFromInt(@as(u32, @intCast(index)));
         var depth: usize = 0;
         while (current != .root) {
             if (depth >= builder.options.max_depth) return error.NestingTooDeep;
@@ -449,10 +470,16 @@ pub fn parseCommonMark(
     options: CommonMarkOptions,
 ) ParseError!CommonMarkDocument {
     if (source.len > options.max_input_bytes) return error.InputTooLarge;
-    if (source.len > @as(usize, max_u32)) return error.InputTooLarge;
+    if (@as(usize, std.math.maxInt(u32)) < source.len) return error.InputTooLarge;
     if (options.invalid_utf8 == .reject and !std.unicode.utf8ValidateSlice(source)) return error.InvalidUtf8;
 
-    var builder = Builder{ .gpa = gpa, .source = source, .options = options };
+    var builder: Builder = .{ .gpa = gpa, .source = source, .options = options };
+    // `TextRecord.start`/`.len` are `u32`, so the text arena has an inherent
+    // 4 GiB ceiling. A larger configured budget cannot be honoured, so it is
+    // capped once here instead of rejecting the caller: `appendText` and
+    // `appendBytesToCurrent` already refuse to grow the arena past
+    // `max_text_bytes`, which now bounds every recorded start, length and end.
+    builder.options.max_text_bytes = @min(builder.options.max_text_bytes, @as(usize, max_u32));
     errdefer {
         builder.references.deinit(gpa);
         builder.lines.deinit(gpa);
@@ -589,7 +616,9 @@ fn parsePrefixes(builder: *Builder, line: Line, result: *Prefixes) ParseError!vo
         }
         if (result.len > 0 and isThematicBreak(builder.source[cursor..line.end])) break;
         const marker_start = cursor;
-        if (cursor < line.end and (builder.source[cursor] == '-' or builder.source[cursor] == '+' or builder.source[cursor] == '*')) {
+        if (cursor < line.end and (builder.source[cursor] == '-' or
+            builder.source[cursor] == '+' or builder.source[cursor] == '*'))
+        {
             const marker = builder.source[cursor];
             cursor += 1;
             if (cursor < line.end and builder.source[cursor] != ' ' and builder.source[cursor] != '\t') {
@@ -708,7 +737,7 @@ fn leadingIndentColumns(source: []const u8, start: usize, end: usize) usize {
 }
 
 fn retainedListDepthForIndent(
-    prefixes: *const [PrefixDepth]Prefix,
+    prefixes: *const [prefix_depth]Prefix,
     len: u32,
     indent: usize,
 ) u32 {
@@ -731,15 +760,15 @@ fn retainedListDepthForIndent(
 
 fn parseBlocks(builder: *Builder) ParseError!void {
     const root = NodeId.root;
-    var container_nodes: [PrefixDepth]NodeId = .{.none} ** PrefixDepth;
-    var container_prefixes: [PrefixDepth]Prefix = undefined;
+    var container_nodes: [prefix_depth]NodeId = .{.none} ** prefix_depth;
+    var container_prefixes: [prefix_depth]Prefix = undefined;
     var container_len: u32 = 0;
     var active: ?ActiveBlock = null;
     var line_index: usize = 0;
     var blank_line_pending = false;
     while (line_index < builder.lines.items.len) : (line_index += 1) {
         const line = builder.lines.items[line_index];
-        var prefixes = Prefixes{};
+        var prefixes: Prefixes = .{};
         if (active) |block| {
             const block_node = builder.nodes.items[@intFromEnum(block.node)];
             if (block_node.kind == .html_block or
@@ -757,7 +786,9 @@ fn parseBlocks(builder: *Builder) ParseError!void {
         } else {
             try parsePrefixes(builder, line, &prefixes);
         }
-        if (container_len == 0 and prefixes.len != 0 and prefixes.items[0].kind == .list and prefixes.items[0].ordered and
+        if (container_len == 0 and prefixes.len != 0 and
+            prefixes.items[0].kind == .list and
+            prefixes.items[0].ordered and
             prefixes.items[0].list_start != 1 and
             active != null and builder.nodes.items[@intFromEnum(active.?.node)].kind == .paragraph)
         {
@@ -782,8 +813,10 @@ fn parseBlocks(builder: *Builder) ParseError!void {
                     builder.nodes.items[@intFromEnum(b.node)].kind == .paragraph
                 else
                     false;
-                const is_setext = line.indent >= last_prefix.continuation_indent and isSetextUnderline(builder.source[line.content_start..line.end]) != null;
-                const interrupts = !line.blank and (!is_setext or !active_is_paragraph) and isInterruptingBlock(builder.source[line.content_start..line.end]);
+                const is_setext = line.indent >= last_prefix.continuation_indent and
+                    isSetextUnderline(builder.source[line.content_start..line.end]) != null;
+                const interrupts = !line.blank and (!is_setext or !active_is_paragraph) and
+                    isInterruptingBlock(builder.source[line.content_start..line.end]);
                 if (line.blank) {
                     if (last_prefix.kind == .quote) {
                         next_len = 0;
@@ -841,7 +874,9 @@ fn parseBlocks(builder: *Builder) ParseError!void {
                         active = null;
                         depth += 2;
                         prefix_index += 1;
-                    } else if (prefix_index < prefixes.len and prefixes.items[prefix_index].indent >= old.continuation_indent) {
+                    } else if (prefix_index < prefixes.len and
+                        prefixes.items[prefix_index].indent >= old.continuation_indent)
+                    {
                         // The prefix belongs to a child/inner container inside this list item!
                         depth += 2;
                     } else if (prefix_index < prefixes.len and prefixes.items[prefix_index].kind == .list and
@@ -885,7 +920,7 @@ fn parseBlocks(builder: *Builder) ParseError!void {
                     if (depth < container_len and container_prefixes[depth].kind == .quote) {
                         depth += 1;
                     } else {
-                        if (depth >= PrefixDepth) return error.NestingTooDeep;
+                        if (depth >= prefix_depth) return error.NestingTooDeep;
                         const parent = if (depth == 0) root else container_nodes[depth - 1];
                         const quote = try builder.appendNode(.block_quote, parent, lineSpan(line), .none);
                         container_nodes[depth] = quote;
@@ -914,14 +949,14 @@ fn parseBlocks(builder: *Builder) ParseError!void {
                             active = null;
                         } else {
                             const item = try builder.appendNode(.list_item, list, lineSpan(line), .none);
-                            if (depth + 1 >= PrefixDepth) return error.NestingTooDeep;
+                            if (depth + 1 >= prefix_depth) return error.NestingTooDeep;
                             container_nodes[depth + 1] = item;
                             container_prefixes[depth + 1] = prefix;
                             active = null;
                         }
                         depth += 2;
                     } else {
-                        if (depth >= PrefixDepth - 1) return error.NestingTooDeep;
+                        if (depth >= prefix_depth - 1) return error.NestingTooDeep;
                         const parent = if (depth == 0) root else container_nodes[depth - 1];
                         const list = try builder.appendNode(.list, parent, lineSpan(line), .{ .list = .{
                             .ordered = prefix.ordered,
@@ -1006,7 +1041,12 @@ fn parseBlocks(builder: *Builder) ParseError!void {
         if (prefixes.len == 0 and container_len > 0) {
             const last_prefix = container_prefixes[container_len - 1];
             if (last_prefix.kind == .list and line.indent >= last_prefix.continuation_indent) {
-                content_start = skipIndentColumns(builder.source, line.start, line.end, last_prefix.continuation_indent);
+                content_start = skipIndentColumns(
+                    builder.source,
+                    line.start,
+                    line.end,
+                    last_prefix.continuation_indent,
+                );
                 is_lazy = false;
             }
         }
@@ -1034,21 +1074,6 @@ fn parseBlocks(builder: *Builder) ParseError!void {
     }
 }
 
-fn prefix_index_for_depth(prefixes: Prefixes, depth: u32) ?Prefix {
-    var index: u32 = 0;
-    var current_depth: u32 = 0;
-    while (index < prefixes.len) : (index += 1) {
-        if (prefixes.items[index].kind == .quote) {
-            if (current_depth == depth) return prefixes.items[index];
-            current_depth += 1;
-        } else {
-            if (current_depth == depth) return prefixes.items[index];
-            current_depth += 2;
-        }
-    }
-    return null;
-}
-
 fn lineSpan(line: Line) SourceSpan {
     return .{ .start = @intCast(line.start), .end = @intCast(line.end) };
 }
@@ -1061,8 +1086,8 @@ fn processBlockLine(
     content_start: usize,
     is_lazy: bool,
 ) ParseError!void {
-    const start = @as(usize, content_start);
-    const end = @as(usize, line.end);
+    const start: usize = content_start;
+    const end: usize = line.end;
     const content = if (start <= end) builder.source[start..end] else "";
     var content_indent_columns: usize = 0;
     for (content) |byte| {
@@ -1089,7 +1114,12 @@ fn processBlockLine(
                     const code_content = if (block.code_fence == 0)
                         builder.source[skipIndentColumns(builder.source, start, end, block.code_indent)..end]
                     else if (block.container == NodeId.root)
-                        builder.source[skipIndentColumns(builder.source, line.start, line.end, block.code_indent)..line.end]
+                        builder.source[skipIndentColumns(
+                            builder.source,
+                            line.start,
+                            line.end,
+                            block.code_indent,
+                        )..line.end]
                     else
                         content;
                     try appendBlockLine(builder, block.node, code_content, true);
@@ -1131,8 +1161,10 @@ fn processBlockLine(
                         };
                         const raw_index = @intFromEnum(raw_id);
                         while (builder.texts.items[raw_index].len > 0) {
-                            const text_end = builder.texts.items[raw_index].start + builder.texts.items[raw_index].len - 1;
-                            if (builder.text_bytes.items[text_end] != ' ' and builder.text_bytes.items[text_end] != '\t') break;
+                            const text_end = builder.texts.items[raw_index].start +
+                                builder.texts.items[raw_index].len - 1;
+                            if (builder.text_bytes.items[text_end] != ' ' and
+                                builder.text_bytes.items[text_end] != '\t') break;
                             builder.texts.items[raw_index].len -= 1;
                         }
                         node.data = .{ .heading = .{ .level = level, .raw = raw_id } };
@@ -1167,7 +1199,10 @@ fn processBlockLine(
                     // CommonMark lazy or container paragraph continuation trims indentation.
                     const max_strip: usize = if (container == NodeId.root) 3 else 4;
                     var stripped: usize = 0;
-                    while (stripped < max_strip and stripped < continuation.len and continuation[stripped] == ' ') : (stripped += 1) {}
+                    while (stripped < max_strip and
+                        stripped < continuation.len and
+                        continuation[stripped] == ' ') : (stripped += 1)
+                    {}
                     continuation = continuation[stripped..];
                     try appendRawToNode(builder, block.node, continuation);
                     builder.updateSpan(block.node, @intCast(line.end));
@@ -1222,11 +1257,16 @@ fn processBlockLine(
     const trimmed_content = if (trimmed_start <= end) builder.source[trimmed_start..end] else "";
     if (isAtxHeading(trimmed_content)) |heading| {
         const raw = try builder.appendTextNormalized(heading.text);
-        _ = try builder.appendNode(.heading, container, lineSpan(line), .{ .heading = .{ .level = heading.level, .raw = raw } });
+        _ = try builder.appendNode(
+            .heading,
+            container,
+            lineSpan(line),
+            .{ .heading = .{ .level = heading.level, .raw = raw } },
+        );
         return;
     }
     if (isFenceOpen(trimmed_content)) |fence| {
-        const info = try cleanDestination(builder, fence.info, .link);
+        const info = try cleanDestination(.link, builder, fence.info);
         const raw = try builder.appendText("");
         const node = try builder.appendNode(.code_block, container, lineSpan(line), .{ .code_block = .{
             .fenced = true,
@@ -1384,20 +1424,6 @@ fn appendRawToNode(builder: *Builder, node: NodeId, content: []const u8) ParseEr
     builder.texts.items[raw_index].len += @intCast(builder.text_bytes.items.len - start);
 }
 
-fn appendRawToNodeNoNewline(builder: *Builder, node: NodeId, content: []const u8) ParseError!void {
-    const index = @intFromEnum(node);
-    if (index >= builder.nodes.items.len) return error.InvalidDocument;
-    const raw_id = switch (builder.nodes.items[index].data) {
-        .raw => |raw| raw,
-        else => return error.InvalidDocument,
-    };
-    const raw_index = @intFromEnum(raw_id);
-    if (raw_index >= builder.texts.items.len) return error.InvalidDocument;
-    const start = builder.text_bytes.items.len;
-    try builder.appendNormalizedBytes(content);
-    builder.texts.items[raw_index].len += @intCast(builder.text_bytes.items.len - start);
-}
-
 fn skipIndentColumns(source: []const u8, start: usize, end: usize, columns: usize) usize {
     var index = start;
     var column: usize = 0;
@@ -1471,7 +1497,7 @@ fn isAtxHeading(content: []const u8) ?Heading {
     if (end > index and content[end - 1] == '#') {
         var hash_start = end;
         while (hash_start > index and content[hash_start - 1] == '#') : (hash_start -= 1) {}
-        if (hash_start == index or content[hash_start - 1] == ' ' or content[hash_start - 1] == '\t') {
+        if (hash_start <= index or content[hash_start - 1] == ' ' or content[hash_start - 1] == '\t') {
             end = hash_start;
             while (end > index and (content[end - 1] == ' ' or content[end - 1] == '\t')) : (end -= 1) {}
         }
@@ -1565,7 +1591,8 @@ fn htmlBlockCloses(tag: u8, content: []const u8) bool {
         5 => std.mem.indexOf(u8, content, "</script>") != null or std.mem.indexOf(u8, content, "</SCRIPT>") != null,
         6 => std.mem.indexOf(u8, content, "</pre>") != null or std.mem.indexOf(u8, content, "</PRE>") != null,
         7 => std.mem.indexOf(u8, content, "</style>") != null or std.mem.indexOf(u8, content, "</STYLE>") != null,
-        10 => std.mem.indexOf(u8, content, "</textarea>") != null or std.mem.indexOf(u8, content, "</TEXTAREA>") != null,
+        10 => std.mem.indexOf(u8, content, "</textarea>") != null or
+            std.mem.indexOf(u8, content, "</TEXTAREA>") != null,
         8 => content.len == 0,
         9 => content.len == 0,
         else => true,
@@ -1641,7 +1668,8 @@ fn parseReferenceDefinitionAt(raw: []const u8, start: usize) ?ParsedReference {
         if (raw[close] != ' ' and raw[close] != '\t' and raw[close] != '\n' and raw[close] != '\r') has_non_ws = true;
         close += 1;
     }
-    if (!has_non_ws or close >= raw.len or close == label_start or close + 1 >= raw.len or raw[close + 1] != ':') return null;
+    if (!has_non_ws or close >= raw.len or close == label_start or
+        close + 1 >= raw.len or raw[close + 1] != ':') return null;
     index = close + 2;
     while (index < raw.len and (raw[index] == ' ' or raw[index] == '\t' or raw[index] == '\n')) : (index += 1) {}
     if (index >= raw.len) return null;
@@ -1649,7 +1677,9 @@ fn parseReferenceDefinitionAt(raw: []const u8, start: usize) ?ParsedReference {
     const destination_start: usize = if (raw[index] == '<') index + 1 else index;
     var destination_end = destination_start;
     if (raw[index] == '<') {
-        while (destination_end < raw.len and raw[destination_end] != '>' and raw[destination_end] != '\n') : (destination_end += 1) {}
+        while (destination_end < raw.len and raw[destination_end] != '>' and
+            raw[destination_end] != '\n') : (destination_end += 1)
+        {}
         if (destination_end >= raw.len or raw[destination_end] != '>') return null;
         index = destination_end + 1;
     } else {
@@ -1707,7 +1737,14 @@ fn parseReferenceDefinitionAt(raw: []const u8, start: usize) ?ParsedReference {
             index += 1;
         }
         if (index >= raw.len) {
-            if (separated_by_newline) return referenceResult(raw, label_start, close, destination_start, destination_end, first_line_end);
+            if (separated_by_newline) return referenceResult(
+                raw,
+                label_start,
+                close,
+                destination_start,
+                destination_end,
+                first_line_end,
+            );
             return null;
         }
         title = raw[title_start..index];
@@ -1717,7 +1754,14 @@ fn parseReferenceDefinitionAt(raw: []const u8, start: usize) ?ParsedReference {
     if (index < raw.len and raw[index] == '\n') {
         index += 1;
     } else if (index < raw.len) {
-        if (separated_by_newline) return referenceResult(raw, label_start, close, destination_start, destination_end, first_line_end);
+        if (separated_by_newline) return referenceResult(
+            raw,
+            label_start,
+            close,
+            destination_start,
+            destination_end,
+            first_line_end,
+        );
         return null;
     }
     return .{
@@ -1744,8 +1788,8 @@ fn extractReferences(builder: *Builder) ParseError!void {
         while (parseReferenceDefinitionAt(raw, cursor)) |parsed| {
             const label = try normalizeLabel(builder, parsed.parts.label) orelse break;
             if (builder.references.items.len >= builder.options.max_reference_count) return error.TooManyReferences;
-            const destination = try cleanDestination(builder, parsed.parts.destination, .link);
-            const title = if (parsed.parts.title) |value| try cleanDestination(builder, value, .link) else .none;
+            const destination = try cleanDestination(.link, builder, parsed.parts.destination);
+            const title = if (parsed.parts.title) |value| try cleanDestination(.link, builder, value) else .none;
             builder.references.append(builder.gpa, .{
                 .label = label,
                 .destination = destination,
@@ -1773,7 +1817,10 @@ fn extractReferences(builder: *Builder) ParseError!void {
                 if (scan > 0) {
                     if (isSetextUnderline(std.mem.trim(u8, line, " \t\n"))) |level| {
                         var candidate_end = scan - 1;
-                        while (candidate_end > 0 and (remainder_bytes[candidate_end - 1] == ' ' or remainder_bytes[candidate_end - 1] == '\t')) : (candidate_end -= 1) {}
+                        while (candidate_end > 0 and
+                            (remainder_bytes[candidate_end - 1] == ' ' or
+                                remainder_bytes[candidate_end - 1] == '\t')) : (candidate_end -= 1)
+                        {}
                         if (candidate_end > 0) {
                             heading_level = level;
                             heading_end = candidate_end;
@@ -1790,10 +1837,17 @@ fn extractReferences(builder: *Builder) ParseError!void {
                 builder.texts.items[@intFromEnum(remainder)].len = @intCast(heading_end);
                 builder.nodes.items[index].kind = .heading;
                 builder.nodes.items[index].data = .{ .heading = .{ .level = heading_level, .raw = remainder } };
-                if (tail_start < remainder_bytes.len and std.mem.trim(u8, remainder_bytes[tail_start..], " \t\n").len != 0) {
+                if (tail_start < remainder_bytes.len and
+                    std.mem.trim(u8, remainder_bytes[tail_start..], " \t\n").len != 0)
+                {
                     const tail = try builder.appendTextNormalized(remainder_bytes[tail_start..]);
                     const parent = builder.nodes.items[index].parent;
-                    const tail_node = try builder.appendNode(.paragraph, .none, builder.nodes.items[index].source, .{ .raw = tail });
+                    const tail_node = try builder.appendNode(
+                        .paragraph,
+                        .none,
+                        builder.nodes.items[index].source,
+                        .{ .raw = tail },
+                    );
                     try builder.insertAfter(parent, @enumFromInt(@as(u32, @intCast(index))), tail_node);
                 }
             } else {
@@ -1801,48 +1855,6 @@ fn extractReferences(builder: *Builder) ParseError!void {
             }
         }
     }
-}
-
-fn parseReferenceDefinition(line: []const u8) ?ReferenceParts {
-    var index: usize = 0;
-    while (index < line.len and (line[index] == ' ' or line[index] == '\t')) : (index += 1) {}
-    if (index >= line.len or line[index] != '[') return null;
-    const label_start = index + 1;
-    const close = std.mem.indexOfScalarPos(u8, line, label_start, ']') orelse return null;
-    if (close + 1 >= line.len or line[close + 1] != ':') return null;
-    if (close == label_start) return null;
-    index = close + 2;
-    while (index < line.len and (line[index] == ' ' or line[index] == '\t')) : (index += 1) {}
-    var destination_start = index;
-    var destination_end = index;
-    if (index < line.len and line[index] == '<') {
-        destination_start += 1;
-        destination_end = std.mem.indexOfScalarPos(u8, line, destination_start, '>') orelse return null;
-        index = destination_end + 1;
-    } else {
-        while (destination_end < line.len and line[destination_end] != ' ' and line[destination_end] != '\t') : (destination_end += 1) {}
-        if (destination_end == destination_start) return null;
-        index = destination_end;
-    }
-    while (index < line.len and (line[index] == ' ' or line[index] == '\t')) : (index += 1) {}
-    var title: ?[]const u8 = null;
-    if (index < line.len) {
-        const opener = line[index];
-        const closer = if (opener == '(') ')' else opener;
-        if (opener != '"' and opener != '\'' and opener != '(') return null;
-        index += 1;
-        const title_start = index;
-        const title_end = std.mem.indexOfScalarPos(u8, line, title_start, closer) orelse return null;
-        title = line[title_start..title_end];
-        index = title_end + 1;
-        while (index < line.len and (line[index] == ' ' or line[index] == '\t')) : (index += 1) {}
-        if (index != line.len) return null;
-    }
-    return .{
-        .label = line[label_start..close],
-        .destination = line[destination_start..destination_end],
-        .title = title,
-    };
 }
 
 const InlineFrame = struct {
@@ -1915,7 +1927,7 @@ fn parseInlineText(builder: *Builder, block: NodeId, raw: []const u8) ParseError
         if (byte == '<') {
             if (parseAutolink(raw[index..])) |link| {
                 if (index > text_start) try appendTextNode(builder, parent, raw[text_start..index]);
-                const destination = try cleanDestination(builder, link.destination, .autolink);
+                const destination = try cleanDestination(.autolink, builder, link.destination);
                 _ = try builder.appendNode(.autolink, parent, .{ .start = 0, .end = 0 }, .{ .autolink = destination });
                 index += link.consumed;
                 text_start = index;
@@ -1938,10 +1950,20 @@ fn parseInlineText(builder: *Builder, block: NodeId, raw: []const u8) ParseError
             const image = byte == '!';
             const marker_start = index;
             const link_node = if (image)
-                try builder.appendNode(.image, parent, .{ .start = 0, .end = 0 }, .{ .image = .{ .destination = .none, .title = .none } })
+                try builder.appendNode(
+                    .image,
+                    parent,
+                    .{ .start = 0, .end = 0 },
+                    .{ .image = .{ .destination = .none, .title = .none } },
+                )
             else
-                try builder.appendNode(.link, parent, .{ .start = 0, .end = 0 }, .{ .link = .{ .destination = .none, .title = .none } });
-            const frame = BracketFrame{
+                try builder.appendNode(
+                    .link,
+                    parent,
+                    .{ .start = 0, .end = 0 },
+                    .{ .link = .{ .destination = .none, .title = .none } },
+                );
+            const frame: BracketFrame = .{
                 .node = link_node,
                 .parent = parent,
                 .image = image,
@@ -1960,7 +1982,7 @@ fn parseInlineText(builder: *Builder, block: NodeId, raw: []const u8) ParseError
             if (index > text_start) try appendTextNode(builder, parent, raw[text_start..index]);
             if (frame.active) {
                 if (try parseLinkAfterClose(raw, index + 1, builder, frame)) |link| {
-                    const data = LinkData{ .destination = link.destination, .title = link.title };
+                    const data: LinkData = .{ .destination = link.destination, .title = link.title };
                     try processEmphasis(builder, &delimiters, frame.delimiter_position);
                     if (frame.image) {
                         builder.nodes.items[@intFromEnum(frame.node)].data = .{ .image = data };
@@ -2081,7 +2103,8 @@ fn insertTextNodeBefore(builder: *Builder, parent: NodeId, target: NodeId, bytes
     const inserted = try builder.appendNode(.text, .none, .{ .start = 0, .end = 0 }, .{ .raw = text });
     const parent_index = @intFromEnum(parent);
     const target_index = @intFromEnum(target);
-    if (parent_index >= builder.nodes.items.len or target_index >= builder.nodes.items.len) return error.InvalidDocument;
+    if (parent_index >= builder.nodes.items.len or
+        target_index >= builder.nodes.items.len) return error.InvalidDocument;
     var previous: NodeId = .none;
     var current = builder.nodes.items[parent_index].first_child;
     while (current != .none and current != target) {
@@ -2139,7 +2162,12 @@ fn wrapEmphasis(builder: *Builder, opener: *InlineFrame, closer: *InlineFrame) P
     const parent = builder.nodes.items[open_index].parent;
     const first = builder.nodes.items[open_index].next_sibling;
     if (first == .none or first == closer.node) return error.InvalidDocument;
-    const wrapper = try builder.appendNode(if (consumed == 2) .strong else .emph, .none, .{ .start = 0, .end = 0 }, .none);
+    const wrapper = try builder.appendNode(
+        if (consumed == 2) .strong else .emph,
+        .none,
+        .{ .start = 0, .end = 0 },
+        .none,
+    );
     const wrapper_index = @intFromEnum(wrapper);
     var current = first;
     var last: NodeId = .none;
@@ -2260,8 +2288,21 @@ fn isDelimiterCloser(raw: []const u8, index: usize, length: usize) bool {
     return right_flanking and (!left_flanking or after_punct);
 }
 
+/// Size of `Entity.value`. The named-entity table is validated against it at
+/// compile time and `utf8Encode` writes at most four bytes, so nothing ever
+/// runs past the buffer.
+const entity_value_max = 16;
+comptime {
+    @setEvalBranchQuota(entity_table.entries.len * 2);
+    for (entity_table.entries) |entry| {
+        if (entity_value_max < entry.value.len) {
+            @compileError("entity_table entry does not fit Entity.value: " ++ entry.name);
+        }
+    }
+}
+
 const Entity = struct {
-    value: [16]u8,
+    value: [entity_value_max]u8,
     len: u8,
     consumed: usize,
 };
@@ -2288,7 +2329,11 @@ fn parseEntity(raw: []const u8) ?Entity {
         }
         var encoded: [4]u8 = undefined;
         const encoded_len = std.unicode.utf8Encode(@intCast(codepoint), &encoded) catch return null;
-        var result = Entity{ .value = .{0} ** 16, .len = @intCast(encoded_len), .consumed = index + 1 };
+        var result: Entity = .{
+            .value = .{0} ** entity_value_max,
+            .len = @intCast(encoded_len),
+            .consumed = index + 1,
+        };
         for (encoded[0..encoded_len], 0..) |byte, encoded_index| result.value[encoded_index] = byte;
         return result;
     }
@@ -2309,8 +2354,9 @@ fn parseEntity(raw: []const u8) ?Entity {
         } else if (order == .gt) {
             left = middle + 1;
         } else {
-            var result = Entity{ .value = .{0} ** 16, .len = @intCast(entry.value.len), .consumed = index + 1 };
+            var result: Entity = .{ .value = .{0} ** entity_value_max, .len = 0, .consumed = index + 1 };
             for (entry.value, 0..) |byte, value_index| result.value[value_index] = byte;
+            result.len = @intCast(entry.value.len);
             return result;
         }
     }
@@ -2342,7 +2388,7 @@ fn parseAutolink(raw: []const u8) ?AutoLink {
     for (inside) |byte| {
         if (byte <= 0x20 or byte == '<') return null;
     }
-    if (std.mem.indexOfScalar(u8, inside, ':')) |colon| {
+    if (std.mem.findScalar(u8, inside, ':')) |colon| {
         if (colon < 2 or colon > 32 or !std.ascii.isAlphabetic(inside[0])) return null;
         for (inside[1..colon]) |byte| {
             if (!std.ascii.isAlphanumeric(byte) and byte != '+' and byte != '-' and byte != '.') return null;
@@ -2356,8 +2402,9 @@ fn parseAutolink(raw: []const u8) ?AutoLink {
         }
         var labels = std.mem.splitScalar(u8, inside[at + 1 ..], '.');
         while (labels.next()) |label| {
-            if (label.len == 0 or label.len > 63 or
-                !std.ascii.isAlphanumeric(label[0]) or !std.ascii.isAlphanumeric(label[label.len - 1])) return null;
+            if (label.len == 0 or label.len > 63) return null;
+            if (!std.ascii.isAlphanumeric(label[0])) return null;
+            if (!std.ascii.isAlphanumeric(label[label.len - 1])) return null;
             for (label) |byte| {
                 if (!std.ascii.isAlphanumeric(byte) and byte != '-') return null;
             }
@@ -2370,15 +2417,15 @@ fn findTagEnd(raw: []const u8, start: usize) ?usize {
     if (start >= raw.len or raw[start] != '<') return null;
     const rest = raw[start..];
     if (std.mem.startsWith(u8, rest, "<!--")) {
-        if (std.mem.indexOf(u8, rest, "-->")) |offset| return start + offset + 2;
+        if (std.mem.find(u8, rest, "-->")) |offset| return start + offset + 2;
         return null;
     }
     if (std.mem.startsWith(u8, rest, "<![CDATA[")) {
-        if (std.mem.indexOf(u8, rest, "]]>")) |offset| return start + offset + 2;
+        if (std.mem.find(u8, rest, "]]>")) |offset| return start + offset + 2;
         return null;
     }
     if (std.mem.startsWith(u8, rest, "<?")) {
-        if (std.mem.indexOf(u8, rest, "?>")) |offset| return start + offset + 1;
+        if (std.mem.find(u8, rest, "?>")) |offset| return start + offset + 1;
         return null;
     }
     var index = start + 1;
@@ -2484,7 +2531,7 @@ fn parseLinkAfterClose(raw: []const u8, start: usize, builder: *Builder, frame: 
                 index += 1;
             }
             if (index >= raw.len or raw[index] != '>') break :inline_check;
-            destination = try cleanDestination(builder, raw[destination_start..index], .link);
+            destination = try cleanDestination(.link, builder, raw[destination_start..index]);
             index += 1;
         } else {
             const destination_start = index;
@@ -2503,7 +2550,7 @@ fn parseLinkAfterClose(raw: []const u8, start: usize, builder: *Builder, frame: 
                 index += 1;
             }
             if (index >= raw.len or depth != 0) break :inline_check;
-            destination = try cleanDestination(builder, raw[destination_start..index], .link);
+            destination = try cleanDestination(.link, builder, raw[destination_start..index]);
         }
         while (index < raw.len and (raw[index] == ' ' or raw[index] == '\t' or raw[index] == '\n')) index += 1;
         var title: TextId = .none;
@@ -2521,7 +2568,7 @@ fn parseLinkAfterClose(raw: []const u8, start: usize, builder: *Builder, frame: 
                 index += 1;
             }
             if (index >= raw.len or raw[index] != closer) break :inline_check;
-            title = try cleanDestination(builder, raw[title_start..index], .link);
+            title = try cleanDestination(.link, builder, raw[title_start..index]);
             index += 1;
         }
         while (index < raw.len and (raw[index] == ' ' or raw[index] == '\t' or raw[index] == '\n')) index += 1;
@@ -2552,12 +2599,19 @@ fn parseLinkAfterClose(raw: []const u8, start: usize, builder: *Builder, frame: 
         return null;
     }
     const label_start_width: usize = if (frame.image) 2 else 1;
-    const label = try normalizeLabel(builder, raw[frame.source_start + label_start_width .. start - 1]) orelse return null;
-    if (lookupReference(builder, label)) |reference| return .{ .destination = reference.destination, .title = reference.title, .end = start };
+    const label = try normalizeLabel(
+        builder,
+        raw[frame.source_start + label_start_width .. start - 1],
+    ) orelse return null;
+    if (lookupReference(builder, label)) |reference| return .{
+        .destination = reference.destination,
+        .title = reference.title,
+        .end = start,
+    };
     return null;
 }
 
-fn cleanDestination(builder: *Builder, raw: []const u8, comptime mode: enum { link, autolink }) ParseError!TextId {
+fn cleanDestination(comptime mode: enum { link, autolink }, builder: *Builder, raw: []const u8) ParseError!TextId {
     var result: std.ArrayList(u8) = .empty;
     defer result.deinit(builder.gpa);
     var index: usize = 0;
@@ -2585,7 +2639,13 @@ fn normalizeLabel(builder: *Builder, raw: []const u8) ParseError!?TextId {
         try builder.charge(1);
         const sequence = std.unicode.utf8ByteSequenceLength(raw[index]) catch 1;
         const end = @min(raw.len, index + sequence);
-        const cp = std.unicode.utf8Decode(raw[index..end]) catch @as(u21, raw[index]);
+        const cp: u21 = switch (end - index) {
+            1 => raw[index],
+            2 => std.unicode.utf8Decode2(raw[index..][0..2].*) catch @as(u21, raw[index]),
+            3 => std.unicode.utf8Decode3(raw[index..][0..3].*) catch @as(u21, raw[index]),
+            4 => std.unicode.utf8Decode4(raw[index..][0..4].*) catch @as(u21, raw[index]),
+            else => raw[index],
+        };
         codepoints += 1;
         if (codepoints > 999) return null;
         if (cp == ' ' or cp == '\t' or cp == '\n' or cp == '\r') {
@@ -2603,7 +2663,8 @@ fn normalizeLabel(builder: *Builder, raw: []const u8) ParseError!?TextId {
         }
         index = end;
     }
-    return try builder.appendTextNormalized(result.items);
+    const text_id = try builder.appendTextNormalized(result.items);
+    return text_id;
 }
 
 fn lookupReference(builder: *Builder, label: TextId) ?Reference {
@@ -2668,7 +2729,7 @@ fn blocksHaveBlankBetween(builder: *Builder, previous: NodeId, next: NodeId) Par
     const gap = builder.source[end..next_start];
     try builder.charge(@intCast(gap.len));
     var line_start = (std.mem.indexOfScalar(u8, gap, '\n') orelse return false) + 1;
-    while (std.mem.indexOfScalarPos(u8, gap, line_start, '\n')) |line_end| {
+    while (std.mem.findScalarPos(u8, gap, line_start, '\n')) |line_end| {
         var content = std.mem.trim(u8, gap[line_start..line_end], " \t\r");
         var ancestor = builder.nodes.items[@intFromEnum(previous)].parent;
         while (ancestor != .none) {
@@ -2707,18 +2768,21 @@ pub fn renderCommonMarkHtml(
         const frame = stack.pop() orelse return error.InvalidDocument;
         const node = document.node(frame.node) orelse return error.InvalidDocument;
         if (frame.exit) {
-            try renderExit(document, &output, gpa, options, frame.node);
+            try renderExit(gpa, document, &output, options, frame.node);
             continue;
         }
 
-        try renderEnter(document, &output, gpa, options, frame.node);
+        try renderEnter(gpa, document, &output, options, frame.node);
         stack.append(gpa, .{ .node = frame.node, .exit = true }) catch return error.OutOfMemory;
         if (node.kind != .image) {
-            try collectRenderChildren(document, frame.node, &children, gpa);
+            try collectRenderChildren(gpa, document, frame.node, &children);
             var child_index = children.items.len;
             while (child_index > 0) {
                 child_index -= 1;
-                stack.append(gpa, .{ .node = children.items[child_index], .exit = false }) catch return error.OutOfMemory;
+                stack.append(gpa, .{
+                    .node = children.items[child_index],
+                    .exit = false,
+                }) catch return error.OutOfMemory;
             }
         }
     }
@@ -2740,13 +2804,23 @@ const RenderOutput = struct {
         try self.appendSlice(gpa, &.{value});
     }
 
-    fn print(self: *RenderOutput, gpa: std.mem.Allocator, comptime format: []const u8, args: anytype) RenderError!void {
+    fn print(
+        self: *RenderOutput,
+        comptime format: []const u8,
+        gpa: std.mem.Allocator,
+        args: anytype,
+    ) RenderError!void {
         if (std.fmt.count(format, args) > self.limit -| self.bytes.items.len) return error.OutputTooLarge;
         self.bytes.print(gpa, format, args) catch return error.OutOfMemory;
     }
 };
 
-fn collectRenderChildren(document: *const CommonMarkDocument, parent: NodeId, children: *std.ArrayList(NodeId), gpa: std.mem.Allocator) RenderError!void {
+fn collectRenderChildren(
+    gpa: std.mem.Allocator,
+    document: *const CommonMarkDocument,
+    parent: NodeId,
+    children: *std.ArrayList(NodeId),
+) RenderError!void {
     if (document.node(parent) == null) return error.InvalidDocument;
     children.items.len = 0;
     var iterator = document.nodeChildren(parent);
@@ -2769,19 +2843,25 @@ fn listItemNeedsLeadingNewline(document: *const CommonMarkDocument, id: NodeId) 
         if (child == id) {
             if (previous == .none) {
                 return switch (node.kind) {
-                    .paragraph => !isTightParagraph(document, id),
+                    .paragraph => !isTightParagraph(document, node),
                     else => true,
                 };
             }
             const previous_node = document.node(previous) orelse return error.InvalidDocument;
-            return previous_node.kind == .paragraph and isTightParagraph(document, previous);
+            return previous_node.kind == .paragraph and isTightParagraph(document, previous_node);
         }
         previous = child;
     }
     return error.InvalidDocument;
 }
 
-fn renderEnter(document: *const CommonMarkDocument, output: *RenderOutput, gpa: std.mem.Allocator, options: HtmlRenderOptions, id: NodeId) RenderError!void {
+fn renderEnter(
+    gpa: std.mem.Allocator,
+    document: *const CommonMarkDocument,
+    output: *RenderOutput,
+    options: HtmlRenderOptions,
+    id: NodeId,
+) RenderError!void {
     const node = document.node(id) orelse return error.InvalidDocument;
     if (try listItemNeedsLeadingNewline(document, id)) try appendLiteral(output, gpa, "\n");
     switch (node.kind) {
@@ -2794,19 +2874,24 @@ fn renderEnter(document: *const CommonMarkDocument, output: *RenderOutput, gpa: 
                 else => return error.InvalidDocument,
             };
             if (data.ordered) {
-                if (data.start == 1) try appendLiteral(output, gpa, "<ol>\n") else try appendFmt(output, gpa, "<ol start=\"{d}\">\n", .{data.start});
+                if (data.start == 1) try appendLiteral(output, gpa, "<ol>\n") else try appendFmt(
+                    "<ol start=\"{d}\">\n",
+                    gpa,
+                    output,
+                    .{data.start},
+                );
             } else try appendLiteral(output, gpa, "<ul>\n");
         },
         .list_item => try appendLiteral(output, gpa, "<li>"),
         .paragraph => {
-            if (!isTightParagraph(document, id)) try appendLiteral(output, gpa, "<p>");
+            if (!isTightParagraph(document, node)) try appendLiteral(output, gpa, "<p>");
         },
         .heading => {
             const data = switch (node.data) {
                 .heading => |value| value,
                 else => return error.InvalidDocument,
             };
-            try appendFmt(output, gpa, "<h{d}>", .{data.level});
+            try appendFmt("<h{d}>", gpa, output, .{data.level});
         },
         .thematic_break => try appendLiteral(output, gpa, "<hr />\n"),
         .code_block => {
@@ -2827,7 +2912,7 @@ fn renderEnter(document: *const CommonMarkDocument, output: *RenderOutput, gpa: 
             if (document.text(data.raw)) |raw| {
                 if (raw.len > 0) {
                     try appendEscaped(output, gpa, raw, .text);
-                    if (raw[raw.len - 1] != '\n') try appendLiteral(output, gpa, "\n");
+                    if (!std.mem.endsWith(u8, raw, "\n")) try appendLiteral(output, gpa, "\n");
                 }
             }
         },
@@ -2837,7 +2922,8 @@ fn renderEnter(document: *const CommonMarkDocument, output: *RenderOutput, gpa: 
             } else try appendLiteral(output, gpa, "<!-- raw HTML omitted -->");
             try appendLiteral(output, gpa, "\n");
         },
-        .text => if (node.data == .raw) if (document.text(node.data.raw)) |text| try appendEscaped(output, gpa, text, .text),
+        .text => if (node.data == .raw) if (document.text(node.data.raw)) |text|
+            try appendEscaped(output, gpa, text, .text),
         .softbreak => try appendLiteral(output, gpa, "\n"),
         .linebreak => try appendLiteral(output, gpa, "<br />\n"),
         .code_span => {
@@ -2853,7 +2939,8 @@ fn renderEnter(document: *const CommonMarkDocument, output: *RenderOutput, gpa: 
             };
             try appendLiteral(output, gpa, "<a href=\"");
             if (document.text(data.destination)) |destination| {
-                if (options.mode == .conformance or !isDangerousUrl(destination)) try appendHref(output, gpa, destination);
+                if (options.mode == .conformance or !isDangerousUrl(destination))
+                    try appendHref(output, gpa, destination);
             }
             if (data.title != .none) {
                 try appendLiteral(output, gpa, "\" title=\"");
@@ -2868,10 +2955,11 @@ fn renderEnter(document: *const CommonMarkDocument, output: *RenderOutput, gpa: 
             };
             try appendLiteral(output, gpa, "<img src=\"");
             if (document.text(data.destination)) |destination| {
-                if (options.mode == .conformance or !isDangerousUrl(destination)) try appendHref(output, gpa, destination);
+                if (options.mode == .conformance or !isDangerousUrl(destination))
+                    try appendHref(output, gpa, destination);
             }
             try appendLiteral(output, gpa, "\" alt=\"");
-            renderPlainChildren(document, output, gpa, options, id) catch |err| return err;
+            try renderPlainChildren(gpa, document, output, options, id);
             if (data.title != .none) {
                 try appendLiteral(output, gpa, "\" title=\"");
                 if (document.text(data.title)) |title| try appendEscaped(output, gpa, title, .attribute);
@@ -2902,7 +2990,13 @@ fn renderEnter(document: *const CommonMarkDocument, output: *RenderOutput, gpa: 
     }
 }
 
-fn renderExit(document: *const CommonMarkDocument, output: *RenderOutput, gpa: std.mem.Allocator, _: HtmlRenderOptions, id: NodeId) RenderError!void {
+fn renderExit(
+    gpa: std.mem.Allocator,
+    document: *const CommonMarkDocument,
+    output: *RenderOutput,
+    _: HtmlRenderOptions,
+    id: NodeId,
+) RenderError!void {
     const node = document.node(id) orelse return error.InvalidDocument;
     switch (node.kind) {
         .document => {},
@@ -2915,13 +3009,13 @@ fn renderExit(document: *const CommonMarkDocument, output: *RenderOutput, gpa: s
             try appendLiteral(output, gpa, if (data.ordered) "</ol>\n" else "</ul>\n");
         },
         .list_item => try appendLiteral(output, gpa, "</li>\n"),
-        .paragraph => if (!isTightParagraph(document, id)) try appendLiteral(output, gpa, "</p>\n"),
+        .paragraph => if (!isTightParagraph(document, node)) try appendLiteral(output, gpa, "</p>\n"),
         .heading => {
             const data = switch (node.data) {
                 .heading => |value| value,
                 else => return error.InvalidDocument,
             };
-            try appendFmt(output, gpa, "</h{d}>\n", .{data.level});
+            try appendFmt("</h{d}>\n", gpa, output, .{data.level});
         },
         .code_block => try appendLiteral(output, gpa, "</code></pre>\n"),
         .code_span => try appendLiteral(output, gpa, "</code>"),
@@ -2932,9 +3026,8 @@ fn renderExit(document: *const CommonMarkDocument, output: *RenderOutput, gpa: s
     }
 }
 
-fn isTightParagraph(document: *const CommonMarkDocument, id: NodeId) bool {
-    const parent = document.node(id).?.parent;
-    const item = document.node(parent) orelse return false;
+fn isTightParagraph(document: *const CommonMarkDocument, node: *const Node) bool {
+    const item = document.node(node.parent) orelse return false;
     if (item.kind != .list_item) return false;
     const list = document.node(item.parent) orelse return false;
     if (list.kind != .list) return false;
@@ -2944,13 +3037,19 @@ fn isTightParagraph(document: *const CommonMarkDocument, id: NodeId) bool {
     };
 }
 
-fn renderPlainChildren(document: *const CommonMarkDocument, output: *RenderOutput, gpa: std.mem.Allocator, _: HtmlRenderOptions, id: NodeId) RenderError!void {
+fn renderPlainChildren(
+    gpa: std.mem.Allocator,
+    document: *const CommonMarkDocument,
+    output: *RenderOutput,
+    _: HtmlRenderOptions,
+    id: NodeId,
+) RenderError!void {
     var stack: std.ArrayList(NodeId) = .empty;
     defer stack.deinit(gpa);
     var children: std.ArrayList(NodeId) = .empty;
     defer children.deinit(gpa);
 
-    try collectRenderChildren(document, id, &children, gpa);
+    try collectRenderChildren(gpa, document, id, &children);
     var child_index = children.items.len;
     while (child_index > 0) {
         child_index -= 1;
@@ -2964,10 +3063,11 @@ fn renderPlainChildren(document: *const CommonMarkDocument, output: *RenderOutpu
         const current = stack.pop() orelse return error.InvalidDocument;
         const node = document.node(current) orelse return error.InvalidDocument;
         switch (node.kind) {
-            .text, .code_span => if (node.data == .raw) if (document.text(node.data.raw)) |text| try appendEscaped(output, gpa, text, .attribute),
+            .text, .code_span => if (node.data == .raw) if (document.text(node.data.raw)) |text|
+                try appendEscaped(output, gpa, text, .attribute),
             .softbreak, .linebreak => try appendLiteral(output, gpa, " "),
             else => {
-                try collectRenderChildren(document, current, &children, gpa);
+                try collectRenderChildren(gpa, document, current, &children);
                 child_index = children.items.len;
                 while (child_index > 0) {
                     child_index -= 1;
@@ -2988,18 +3088,31 @@ fn appendBytes(output: *RenderOutput, gpa: std.mem.Allocator, bytes: []const u8)
     try output.appendSlice(gpa, bytes);
 }
 
-fn appendFmt(output: *RenderOutput, gpa: std.mem.Allocator, comptime format: []const u8, args: anytype) RenderError!void {
-    try output.print(gpa, format, args);
+fn appendFmt(
+    comptime format: []const u8,
+    gpa: std.mem.Allocator,
+    output: *RenderOutput,
+    args: anytype,
+) RenderError!void {
+    try output.print(format, gpa, args);
 }
 
-fn appendEscaped(output: *RenderOutput, gpa: std.mem.Allocator, bytes: []const u8, context: EscapeContext) RenderError!void {
+fn appendEscaped(
+    output: *RenderOutput,
+    gpa: std.mem.Allocator,
+    bytes: []const u8,
+    context: EscapeContext,
+) RenderError!void {
     for (bytes) |byte| {
         switch (byte) {
             '&' => try appendLiteral(output, gpa, "&amp;"),
             '<' => try appendLiteral(output, gpa, "&lt;"),
             '>' => try appendLiteral(output, gpa, "&gt;"),
             '"' => try appendLiteral(output, gpa, "&quot;"),
-            '\'' => if (context == .attribute) try appendLiteral(output, gpa, "&#39;") else try appendLiteral(output, gpa, "'"),
+            '\'' => if (context == .attribute)
+                try appendLiteral(output, gpa, "&#39;")
+            else
+                try appendLiteral(output, gpa, "'"),
             else => try output.append(gpa, byte),
         }
     }
@@ -3008,7 +3121,9 @@ fn appendEscaped(output: *RenderOutput, gpa: std.mem.Allocator, bytes: []const u
 fn appendHref(output: *RenderOutput, gpa: std.mem.Allocator, bytes: []const u8) RenderError!void {
     const hex = "0123456789ABCDEF";
     for (bytes) |byte| {
-        if (byte >= 0x80 or byte == '"' or byte == '<' or byte == '>' or byte == '\\' or byte == ' ' or byte == '`' or byte == '[' or byte == ']') {
+        if (byte >= 0x80 or byte == '"' or byte == '<' or byte == '>' or
+            byte == '\\' or byte == ' ' or byte == '`' or byte == '[' or byte == ']')
+        {
             try output.appendSlice(gpa, &.{ '%', hex[byte >> 4], hex[byte & 0x0F] });
         } else if (byte == '&') {
             try appendLiteral(output, gpa, "&amp;");

@@ -433,7 +433,7 @@ pub const TokenCursor = struct {
     }
 
     pub fn skipChild(self: *TokenCursor) ResidentError!void {
-        var reader = EventReader{
+        var reader: EventReader = .{
             .engine = self.engine,
             .input = self.input,
             .guard = self.guard,
@@ -450,18 +450,18 @@ const YamlLexicalMetadata = struct {
     allocator: std.mem.Allocator,
     newline_offsets: []u32,
 
-    fn init(comptime VLEN: usize, allocator: std.mem.Allocator, input: []const u8) !YamlLexicalMetadata {
+    fn init(comptime vlen: usize, allocator: std.mem.Allocator, input: []const u8) !YamlLexicalMetadata {
         var newlines = std.ArrayList(u32).empty;
         errdefer newlines.deinit(allocator);
 
-        var windows = simd.windows(u8, VLEN, input, ' ');
+        var windows = simd.windows(u8, vlen, ' ', input);
         var base_offset: usize = 0;
         while (windows.next()) |vector| {
-            const valid_count = @min(VLEN, input.len - base_offset);
-            const valid = simd.validMask(VLEN, valid_count);
-            const newline_mask = simd.matchByte(VLEN, vector, '\n') & valid;
+            const valid_count = @min(vlen, input.len - base_offset);
+            const valid = simd.validMask(vlen, valid_count);
+            const newline_mask = simd.matchByte(vlen, vector, '\n') & valid;
 
-            var indexes: [VLEN]u32 = undefined;
+            var indexes: [vlen]u32 = undefined;
             const newline_count = simd.extractBitIndexesChecked(
                 @TypeOf(newline_mask),
                 newline_mask,
@@ -469,7 +469,7 @@ const YamlLexicalMetadata = struct {
                 &indexes,
             ) catch return error.CapacityOverflow;
             try newlines.appendSlice(allocator, indexes[0..newline_count]);
-            base_offset += VLEN;
+            base_offset += vlen;
         }
 
         const newline_offsets = try newlines.toOwnedSlice(allocator);
@@ -525,7 +525,7 @@ const YamlParser = struct {
     line_cursor: usize = 0,
     depth: usize = 0,
 
-    const Self = @This();
+    const Self = YamlParser;
 
     fn fail(self: *Self, err: YamlError, kind: YamlDiagnosticKind, offset: usize) YamlError {
         if (self.failure.* == null) {
@@ -727,6 +727,10 @@ const YamlParser = struct {
 
             const key_end = trimSpaces(self.input, line.content_start, colon);
             try self.parseInlineValue(line.content_start, key_end, .block_key);
+            // The key is the token `parseInlineValue` just emitted, so the
+            // index holds at least that one entry. `DepthStack.peek` in
+            // `src/core/stage2.zig` proves its own depth the same way.
+            std.debug.assert(self.index.count > 0);
             self.index.kinds[self.index.count - 1] = .key;
 
             var value_start = colon + 1;
@@ -834,7 +838,7 @@ const YamlParser = struct {
             try self.emit(.scalar, start, 0);
             return;
         }
-        var inline_parser = InlineParser{
+        var inline_parser: InlineParser = .{
             .owner = self,
             .start = start,
             .pos = start,
@@ -856,7 +860,7 @@ const InlineParser = struct {
     end: usize,
     context: ParseContext,
     depth: usize = 0,
-    const Self = @This();
+    const Self = InlineParser;
 
     fn fail(self: *Self, err: YamlError, kind: YamlDiagnosticKind, offset: usize) YamlError {
         return self.owner.fail(err, kind, offset);
@@ -1088,7 +1092,14 @@ const InlineParser = struct {
             if (byte == '#' and self.pos > start and self.owner.input[self.pos - 1] == ' ') break;
             if (byte == '\t') return self.fail(error.Invalid, .syntax, self.pos);
             if (byte == '&' or byte == '*' or byte == '!') {
-                if (self.pos == start or self.owner.input[self.pos - 1] == ' ') {
+                // The indicator is unsupported as the scalar's first byte and
+                // after a space. `pos` only ever advances from `start`, so
+                // these two tests are exactly those two places.
+                if (self.pos > start) {
+                    if (self.owner.input[self.pos - 1] == ' ') {
+                        return self.fail(error.Unsupported, .unsupported, self.pos);
+                    }
+                } else {
                     return self.fail(error.Unsupported, .unsupported, self.pos);
                 }
             }
@@ -1110,15 +1121,15 @@ pub fn indexYaml(
     return indexYamlImpl(simd.default_vector_len, allocator, input);
 }
 
-/// Builds a yaml-basic-1.2.2 structural index. VLEN controls the SIMD
+/// Builds a yaml-basic-1.2.2 structural index. vlen controls the SIMD
 /// metadata scan; scalar parsing remains the independent oracle.
 pub fn indexYamlImpl(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     allocator: std.mem.Allocator,
     input: []const u8,
 ) YamlIndexError!YamlStructuralIndex {
     if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
-    var metadata = try YamlLexicalMetadata.init(VLEN, allocator, input);
+    var metadata = try YamlLexicalMetadata.init(vlen, allocator, input);
     defer metadata.deinit();
     return parseYamlIndex(allocator, input, null, &metadata);
 }
@@ -1148,13 +1159,13 @@ fn scalarParseYamlIndex(
     errdefer allocator.free(kinds);
     const lengths = try allocator.alloc(u32, token_capacity);
     errdefer allocator.free(lengths);
-    var result = YamlStructuralIndex{
+    var result: YamlStructuralIndex = .{
         .indexes = indexes.indexes,
         .kinds = kinds,
         .lengths = lengths,
         .count = 0,
     };
-    var parser = YamlParser{
+    var parser: YamlParser = .{
         .allocator = allocator,
         .input = input,
         .lines = lines.items,
@@ -1162,7 +1173,7 @@ fn scalarParseYamlIndex(
         .failure = failure,
     };
     try parser.parseDocument();
-    var final_index = stage1.StructuralIndex{
+    var final_index: stage1.StructuralIndex = .{
         .indexes = result.indexes,
         .count = result.count,
     };
@@ -1189,7 +1200,7 @@ fn parseYamlIndex(
     const lengths = try allocator.alloc(u32, token_capacity);
     errdefer allocator.free(lengths);
 
-    var result = YamlStructuralIndex{
+    var result: YamlStructuralIndex = .{
         .indexes = indexes.indexes,
         .kinds = kinds,
         .lengths = lengths,
@@ -1217,11 +1228,13 @@ fn parseYamlIndex(
         }
         result.indexes[result.count] = value.offset;
         result.kinds[result.count] = value.kind;
+        // `validateYamlSource` refused any input longer than `maxInt(u32)` and
+        // every span is a slice of that input, so the length is representable.
         result.lengths[result.count] = @intCast(value.raw.len);
         result.count += 1;
     }
 
-    var final_index = stage1.StructuralIndex{
+    var final_index: stage1.StructuralIndex = .{
         .indexes = result.indexes,
         .count = result.count,
     };
@@ -1245,7 +1258,7 @@ fn validateYamlInput(
     input: []const u8,
     failure: *?Failure,
 ) error{ Invalid, InputTooLarge }!void {
-    const invalid_offset = source.failureOffset(input) catch |err| return err;
+    const invalid_offset = try source.failureOffset(input);
     if (invalid_offset) |offset| {
         failure.* = .{ .err = error.Invalid, .kind = .syntax, .offset = offset };
         return error.Invalid;
@@ -1253,11 +1266,11 @@ fn validateYamlInput(
 }
 
 fn validateYamlInputImpl(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     input: []const u8,
     failure: *?Failure,
 ) error{ Invalid, InputTooLarge }!void {
-    const invalid_offset = source.failureOffsetImpl(VLEN, input) catch |err| return err;
+    const invalid_offset = try source.failureOffsetImpl(vlen, input);
     if (invalid_offset) |offset| {
         failure.* = .{ .err = error.Invalid, .kind = .syntax, .offset = offset };
         return error.Invalid;
@@ -1268,7 +1281,7 @@ fn validateYamlInputScalar(
     input: []const u8,
     failure: *?Failure,
 ) error{ Invalid, InputTooLarge }!void {
-    const invalid_offset = source.failureOffsetScalarFrom(input, 0) catch |err| return err;
+    const invalid_offset = try source.failureOffsetScalarFrom(input, 0);
     if (invalid_offset) |offset| {
         failure.* = .{ .err = error.Invalid, .kind = .syntax, .offset = offset };
         return error.Invalid;
@@ -1303,11 +1316,11 @@ fn collectLines(
     var offset: usize = if (input.len >= 3 and input[0] == 0xef and input[1] == 0xbb and input[2] == 0xbf) 3 else 0;
     while (offset < input.len) {
         const line_start = offset;
-        var content_end: usize = undefined;
-        var next: usize = undefined;
-        content_end = offset;
-        while (content_end < input.len and input[content_end] != '\n' and input[content_end] != '\r') : (content_end += 1) {}
-        next = content_end;
+        var content_end: usize = offset;
+        while (content_end < input.len and input[content_end] != '\n' and
+            input[content_end] != '\r') : (content_end += 1)
+        {}
+        var next: usize = content_end;
         if (content_end < input.len and input[content_end] == '\r') {
             if (content_end + 1 >= input.len or input[content_end + 1] != '\n') {
                 failure.* = .{ .err = error.Invalid, .kind = .syntax, .offset = content_end };
@@ -1379,8 +1392,14 @@ fn trimCommentEnd(
         }
         if (byte == '[' or byte == '{') flow_depth += 1;
         if (byte == ']' or byte == '}') flow_depth -|= 1;
-        if (byte == '#' and flow_depth == 0 and (index == start or input[index - 1] == ' ')) {
-            return trimSpaces(input, start, index);
+        if (byte == '#' and flow_depth == 0) {
+            // A comment starts the scalar or follows a space; `index` only
+            // advances from `start`, so the two tests below are those cases.
+            if (index > start) {
+                if (input[index - 1] == ' ') return trimSpaces(input, start, index);
+            } else {
+                return trimSpaces(input, start, index);
+            }
         }
     }
     return trimSpaces(input, start, end);
@@ -1397,7 +1416,10 @@ fn findBlockColon(
     while (index < end) : (index += 1) {
         const byte = input[index];
         if (quote == '\'') {
-            if (byte == '\'' and index + 1 < end and input[index + 1] == '\'') index += 1 else if (byte == '\'') quote = 0;
+            if (byte == '\'' and index + 1 < end and input[index + 1] == '\'')
+                index += 1
+            else if (byte == '\'')
+                quote = 0;
             continue;
         }
         if (quote == '"') {
@@ -1416,8 +1438,12 @@ fn findBlockColon(
             flow_depth -|= 1;
             continue;
         }
-        if (byte == '#' and flow_depth == 0 and (index == start or input[index - 1] == ' ')) {
-            break;
+        if (byte == '#' and flow_depth == 0) {
+            if (index > start) {
+                if (input[index - 1] == ' ') break;
+            } else {
+                break;
+            }
         }
         if (byte == ':' and flow_depth == 0) {
             if (index + 1 == end or input[index + 1] == ' ' or input[index + 1] == '#' or
@@ -1526,6 +1552,7 @@ pub fn validateYamlIndex(
     {
         return yamlDiagnosticAtKind(input, error.Invalid, .invalid_index, input.len);
     }
+    // The `InputTooLarge` ceiling above is what makes this representable.
     const sentinel: u32 = @intCast(input.len);
     if (structural_index.indexes[structural_index.count] != sentinel or
         structural_index.indexes[structural_index.count + 1] != sentinel or
@@ -1565,7 +1592,9 @@ pub fn validateYamlIndex(
 
     if (expected.count != structural_index.count) {
         const offset = if (structural_index.count < structural_index.indexes.len)
-            @as(usize, @intCast(structural_index.indexes[@min(structural_index.count, structural_index.indexes.len - 1)]))
+            @as(usize, @intCast(
+                structural_index.indexes[@min(structural_index.count, structural_index.indexes.len - 1)],
+            ))
         else
             input.len;
         return yamlDiagnosticAtKind(input, error.Invalid, .invalid_index, offset);
@@ -1617,6 +1646,8 @@ pub fn buildYamlTape(
             };
         };
         const value = event orelse break;
+        // `emit` rejects any longer span with `error.TapeTooLarge` before the
+        // event is published, so the payload length is representable.
         try tape.append(allocator, .{
             .kind = @intFromEnum(value.kind),
             .payload = @intCast(value.raw.len),
@@ -1662,7 +1693,7 @@ pub const YamlStreamIndexer = struct {
     input_len: usize = 0,
     finished: bool = false,
     failure: ?FinishError = null,
-    const Self = @This();
+    const Self = YamlStreamIndexer;
 
     pub const InitError = std.mem.Allocator.Error || error{
         CapacityOverflow,
@@ -1681,7 +1712,7 @@ pub const YamlStreamIndexer = struct {
     };
     pub const FeedFromError = FeedError || FinishError || std.Io.Reader.ShortError;
 
-    pub fn init(allocator: std.mem.Allocator, chunk_len: usize) InitError!Self {
+    pub fn init(allocator: std.mem.Allocator, chunk_len: usize) InitError!YamlStreamIndexer {
         if (chunk_len > std.math.maxInt(u32)) return error.InputTooLarge;
         var pending_line = std.ArrayList(u8).empty;
         try pending_line.ensureTotalCapacity(allocator, @min(chunk_len, max_u24));
@@ -1796,7 +1827,7 @@ pub const YamlStreamIndexer = struct {
         if (self.failure) |err| return err;
         self.engine.endWindow(true);
         try self.appendEngineEvents();
-        const sentinel = @as(u32, @intCast(self.input_len));
+        const sentinel: u32 = @intCast(self.input_len);
         try self.index_offsets.append(self.allocator, sentinel);
         try self.index_offsets.append(self.allocator, sentinel);
         try self.index_offsets.append(self.allocator, 0);
@@ -1911,9 +1942,13 @@ const YamlResidentEngine = struct {
     close_pending: usize = 0,
     resolve_pending: ?usize = null,
     nested_from_empty: bool = false,
+    // SAFETY: every frame is written by `pushBlock` before `block_len` exposes
+    // it, so no slot is read while uninitialized.
     block_frames: [yaml_max_depth]StreamFrame = undefined,
     block_len: usize = 0,
     pending_empty: ?StreamPendingEmpty = null,
+    // SAFETY: every frame is written by `pushFlow` before `flow_len` exposes
+    // it, so no slot is read while uninitialized.
     flow_frames: [yaml_max_depth]ResidentFlowFrame = undefined,
     flow_len: usize = 0,
     flow_pos: usize = 0,
@@ -1933,7 +1968,7 @@ const YamlResidentEngine = struct {
     failed: ?YamlError = null,
     diagnostic: ?Failure = null,
 
-    const Self = @This();
+    const Self = YamlResidentEngine;
 
     fn init() Self {
         return .{};
@@ -2014,7 +2049,7 @@ const YamlResidentEngine = struct {
         if (content_start == end or self.input[content_start] == '#') return;
         const visible_end = trimCommentEnd(self.input, content_start, end);
         if (visible_end <= content_start) return;
-        var line = ResidentLine{
+        var line: ResidentLine = .{
             .start = 0,
             .end = self.input_base + end,
             .content_start = content_start,
@@ -2068,7 +2103,12 @@ const YamlResidentEngine = struct {
                 error.InputTooLarge => return error.InputTooLarge,
             };
         }
-        const local_offset = if (self.flow_len > 0) self.flow_pos else if (self.line) |line| line.content_start else self.source_pos;
+        const local_offset = if (self.flow_len > 0)
+            self.flow_pos
+        else if (self.line) |line|
+            line.content_start
+        else
+            self.source_pos;
         const offset = std.math.add(usize, self.input_base, local_offset) catch self.input_base;
         const input_end = std.math.add(usize, self.input_base, self.input.len) catch offset;
         self.diagnostic = .{
@@ -2117,15 +2157,14 @@ const YamlResidentEngine = struct {
     fn prepareLine(self: *Self) YamlEngineError!bool {
         while (self.source_pos < self.input.len) {
             const start = self.source_pos;
-            var end: usize = undefined;
             const newline = if (self.metadata) |lex|
                 lex.nextNewline(&self.metadata_cursor, start)
-            else if (std.mem.indexOfScalar(u8, self.input[start..], '\n')) |relative|
+            else if (std.mem.findScalar(u8, self.input[start..], '\n')) |relative|
                 start + relative
             else
                 null;
             const has_newline = newline != null;
-            end = newline orelse self.input.len;
+            var end: usize = newline orelse self.input.len;
             const line_next = if (has_newline) end + 1 else end;
             self.window_has_newline = has_newline;
             if (end > start and self.input[end - 1] == '\r') {
@@ -2163,7 +2202,7 @@ const YamlResidentEngine = struct {
             const visible_end = trimCommentEnd(self.input, content_start, end);
             if (visible_end <= content_start) continue;
 
-            var line = ResidentLine{
+            var line: ResidentLine = .{
                 .start = start,
                 .end = end,
                 .content_start = content_start,
@@ -2314,10 +2353,12 @@ const YamlResidentEngine = struct {
             }
             if (byte == '#' and pos > start and self.input[pos - 1] == ' ') break;
             if (byte == '\t') return self.record(error.Invalid);
-            if ((byte == '&' or byte == '*' or byte == '!') and
-                (pos == start or self.input[pos - 1] == ' '))
-            {
-                return self.record(error.Unsupported);
+            if (byte == '&' or byte == '*' or byte == '!') {
+                if (pos > start) {
+                    if (self.input[pos - 1] == ' ') return self.record(error.Unsupported);
+                } else {
+                    return self.record(error.Unsupported);
+                }
             }
             pos += 1;
         }
@@ -2603,6 +2644,14 @@ const YamlResidentEngine = struct {
         return;
     }
 
+    /// The innermost open block frame. Every phase that reaches a continuation
+    /// step was set by a step that had a frame open, so the stack is never empty
+    /// here; the same proof `DepthStack.peek` makes about its own depth.
+    fn topBlockFrame(self: *Self) *StreamFrame {
+        std.debug.assert(self.block_len > 0);
+        return &self.block_frames[self.block_len - 1];
+    }
+
     fn stepLineContinuation(self: *Self) YamlEngineError!void {
         var line = self.line orelse return self.record(error.Invalid);
         switch (line.phase) {
@@ -2613,7 +2662,7 @@ const YamlResidentEngine = struct {
                 line.visible_end = trimCommentEnd(self.input, start, line.visible_end);
                 if (start >= line.visible_end) {
                     self.pending_empty = .{ .offset = line.end, .indent = line.indent };
-                    self.block_frames[self.block_len - 1].end_offset = line.end;
+                    self.topBlockFrame().end_offset = line.end;
                     self.saw_root = true;
                     line.phase = .done;
                     self.line = line;
@@ -2631,7 +2680,7 @@ const YamlResidentEngine = struct {
                 }
                 const span = try self.parseScalar(start, line.visible_end, .block_value, .scalar);
                 if (span.next != line.visible_end) return self.record(error.Invalid);
-                self.block_frames[self.block_len - 1].end_offset = line.end;
+                self.topBlockFrame().end_offset = line.end;
                 line.phase = .done;
                 self.line = line;
                 return self.emit(.scalar, span.start, span.length);
@@ -2659,7 +2708,7 @@ const YamlResidentEngine = struct {
                 line.value_start = start;
                 if (start >= line.visible_end) {
                     self.pending_empty = .{ .offset = self.input_base + colon + 1, .indent = line.indent };
-                    self.block_frames[self.block_len - 1].end_offset = line.end;
+                    self.topBlockFrame().end_offset = line.end;
                     self.saw_root = true;
                     line.phase = .done;
                     self.line = line;
@@ -2677,7 +2726,7 @@ const YamlResidentEngine = struct {
                 }
                 const span = try self.parseScalar(start, line.visible_end, .block_value, .scalar);
                 if (span.next != line.visible_end) return self.record(error.Invalid);
-                self.block_frames[self.block_len - 1].end_offset = line.end;
+                self.topBlockFrame().end_offset = line.end;
                 line.phase = .done;
                 self.line = line;
                 return self.emit(.scalar, span.start, span.length);
@@ -3227,16 +3276,16 @@ test "YAML resident reader is lazy borrowed guarded and reusable" {
 
     var document = try initOnDemandDocument(&parser, input);
     var reader = try document.eventReader();
-    const start = (try reader.next()).?;
+    const start = (try reader.next()) orelse return error.MissingEvent;
     try testing.expectEqual(YamlTokenKind.mapping_start, start.kind);
     try testing.expectEqual(@as(usize, 0), start.raw.len);
     var stale = reader;
-    const key = (try reader.next()).?;
+    const key = (try reader.next()) orelse return error.MissingEvent;
     try testing.expectEqual(YamlTokenKind.key, key.kind);
     try testing.expectEqualStrings("ok", key.raw);
     try testing.expect(key.raw.ptr == input.ptr);
     try testing.expectError(error.OutOfOrderIteration, stale.next());
-    const scalar = (try reader.next()).?;
+    const scalar = (try reader.next()) orelse return error.MissingEvent;
     try testing.expectEqual(YamlTokenKind.scalar, scalar.kind);
     try testing.expectEqualStrings("yes", scalar.raw);
     try testing.expect(scalar.raw.ptr == input.ptr + 4);

@@ -126,9 +126,9 @@ pub const Limits = struct {
 /// and the parser cannot drift apart silently. `depth_max` is the profile
 /// ceiling `yaml.yaml_max_depth`; the parser accepts lower values only.
 pub const default_limits: Limits = .{
-    .source_bytes_max = @as(usize, std.math.maxInt(u32)),
+    .source_bytes_max = std.math.maxInt(u32),
     .cooked_bytes_max = 16 * 1024 * 1024,
-    .scalar_source_bytes_max = @as(usize, std.math.maxInt(u24)),
+    .scalar_source_bytes_max = std.math.maxInt(u24),
     .line_count_max = 1024 * 1024,
     .scalar_line_count_max = 1024 * 1024,
     .indentation_max = 1024,
@@ -196,7 +196,8 @@ const yaml_depth_limit_limits: Limits = .{
 /// deliberately the smaller consumption, and `traverse` is the complete one.
 pub fn checksumSkeleton(events: []const Event) u64 {
     var checksum: u64 = contract.fnv_offset_basis;
-    contract.mix(&checksum, @intCast(events.len));
+    const event_count: u64 = events.len;
+    contract.mix(&checksum, event_count);
     var depth: u64 = 0;
     for (events) |event| {
         contract.mix(&checksum, @intFromEnum(event.kind));

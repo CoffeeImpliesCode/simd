@@ -261,14 +261,16 @@ fn verifyEvents(
         }
         if (info.indentation_width != want.indentation_width) {
             std.log.err(
-                "yaml extended oracle mismatch: fixture {d} ({s}) event {d} indentation width: observed {d}, expected {d}",
+                "yaml extended oracle mismatch: fixture {d} ({s}) event {d} " ++
+                    "indentation width: observed {d}, expected {d}",
                 .{ index, @tagName(fixture.workload), position, info.indentation_width, want.indentation_width },
             );
             return error.OracleMismatch;
         }
         if (!std.mem.eql(u8, value.bytes(), want.bytes)) {
             std.log.err(
-                "yaml extended oracle mismatch: fixture {d} ({s}) event {d} cooked bytes: observed \"{s}\", expected \"{s}\"",
+                "yaml extended oracle mismatch: fixture {d} ({s}) event {d} " ++
+                    "cooked bytes: observed \"{s}\", expected \"{s}\"",
                 .{ index, @tagName(fixture.workload), position, value.bytes(), want.bytes },
             );
             return error.OracleMismatch;

@@ -261,10 +261,10 @@ pub const Command = union(enum) {
 
 fn parseBoundedCount(
     comptime T: type,
-    text: []const u8,
     comptime low: u16,
     comptime high: u16,
     comptime out_of_range: OptionsError,
+    text: []const u8,
 ) CliError!T {
     const parsed = std.fmt.parseUnsigned(u32, text, 10) catch return error.NotANumber;
     if (parsed < low or parsed > high) return out_of_range;
@@ -293,20 +293,20 @@ fn parseRecordArguments(arguments: []const []const u8) CliError!RecordCommand {
             seen_samples = true;
             options.samples = try parseBoundedCount(
                 u16,
-                value,
                 min_samples,
                 max_samples,
                 error.SampleCountOutOfRange,
+                value,
             );
         } else if (std.mem.eql(u8, flag, "--iterations")) {
             if (seen_iterations) return error.DuplicateFlag;
             seen_iterations = true;
             options.iterations = try parseBoundedCount(
                 u16,
-                value,
                 min_iterations,
                 max_iterations,
                 error.IterationCountOutOfRange,
+                value,
             );
         } else if (std.mem.eql(u8, flag, "--stream-chunk-size")) {
             if (seen_chunk) return error.DuplicateFlag;
@@ -657,22 +657,24 @@ fn materializeHeaders(
         if (value == null) return error.MissingHeader;
     }
     const slot = struct {
-        fn need(slots: *const [header_slot_count]?[]const u8, index: usize) []const u8 {
-            return slots[index].?;
+        fn need(slots: *const [header_slot_count]?[]const u8, index: usize) BenchReportError![]const u8 {
+            return slots[index] orelse return error.MissingHeader;
         }
     };
 
+    // SAFETY: `live` counts the leading `owned_headers` slots that are already
+    // owned, and each of them is assigned before it is read or released.
     var headers: BenchHeaders = undefined;
     var live: usize = 0;
     errdefer freeOwnedHeaders(allocator, &headers, live);
     inline for (owned_headers) |entry| {
-        @field(headers, entry.field) = try allocator.dupe(u8, slot.need(values, entry.slot));
+        @field(headers, entry.field) = try allocator.dupe(u8, try slot.need(values, entry.slot));
         live += 1;
     }
 
-    headers.vector_len = try parseDecimal(u64, slot.need(values, 3));
-    headers.stream_chunk_bytes = try parseDecimal(u64, slot.need(values, 4));
-    headers.synthetic_scale = try parseDecimal(u64, slot.need(values, 6));
+    headers.vector_len = try parseDecimal(u64, try slot.need(values, 3));
+    headers.stream_chunk_bytes = try parseDecimal(u64, try slot.need(values, 4));
+    headers.synthetic_scale = try parseDecimal(u64, try slot.need(values, 6));
     return headers;
 }
 
@@ -768,6 +770,9 @@ pub fn headersEql(reference: BenchHeaders, observed: BenchHeaders) bool {
 /// Releases every string `materializeHeaders` duplicated.
 pub fn freeHeaders(allocator: Allocator, headers: *BenchHeaders) void {
     freeOwnedHeaders(allocator, headers, owned_headers.len);
+    // SAFETY: every owning field was released on the line above. The caller
+    // must not read `headers` again, so poisoning the released slices cannot
+    // hand back a pointer the allocator no longer owns.
     headers.* = undefined;
 }
 
@@ -813,6 +818,9 @@ pub fn freeAnalysis(allocator: Allocator, analysis: *Analysis) void {
     allocator.free(analysis.cases);
     allocator.free(analysis.inputs);
     freeHeaders(allocator, &analysis.headers);
+    // SAFETY: every allocation this analysis owned was released above, header
+    // strings included. The caller must not read `analysis` again, so the
+    // poison marks the record consumed instead of leaving live-looking slices.
     analysis.* = undefined;
 }
 

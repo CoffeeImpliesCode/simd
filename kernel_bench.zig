@@ -2,8 +2,8 @@ const std = @import("std");
 const simd = @import("src/core/simd.zig");
 
 const vector_len: usize = simd.default_vector_len;
-const Vec = simd.Vec(vector_len, u8);
-const Mask = simd.Mask(vector_len);
+const vec_type = simd.Vec(u8, vector_len);
+const mask_type = simd.Mask(vector_len);
 const input_len: usize = 1 << 20;
 const iterations: usize = 8;
 
@@ -31,15 +31,15 @@ fn oldWhitespaceMask(bytes: []const u8) u64 {
     var checksum: u64 = 0xcbf29ce484222325;
     var offset: usize = 0;
     while (offset + vector_len <= bytes.len) : (offset += vector_len) {
-        const block: Vec = bytes[offset..][0..vector_len].*;
+        const block: vec_type = bytes[offset..][0..vector_len].*;
         const mask = simd.matchAny4(vector_len, block, ' ', '\t', '\n', '\r');
         mix(&checksum, mask);
     }
     if (offset < bytes.len) {
-        var mask: Mask = 0;
+        var mask: mask_type = 0;
         for (bytes[offset..], 0..) |byte, lane| {
             if (isJsonWhitespace(byte)) {
-                mask |= @as(Mask, 1) << @as(std.math.Log2Int(Mask), @intCast(lane));
+                mask |= @as(mask_type, 1) << @as(std.math.Log2Int(mask_type), @intCast(lane));
             }
         }
         mix(&checksum, mask);
@@ -51,16 +51,16 @@ fn newWhitespaceMask(bytes: []const u8) u64 {
     var checksum: u64 = 0xcbf29ce484222325;
     var offset: usize = 0;
     while (offset + vector_len <= bytes.len) : (offset += vector_len) {
-        const block: Vec = bytes[offset..][0..vector_len].*;
-        const mask: Mask = simd.matchJsonWhitespace(vector_len, block);
+        const block: vec_type = bytes[offset..][0..vector_len].*;
+        const mask: mask_type = simd.matchJsonWhitespace(vector_len, block);
         mix(&checksum, mask);
     }
     if (offset < bytes.len) {
-        var mask: Mask = 0;
+        var mask: mask_type = 0;
         for (bytes[offset..], 0..) |byte, lane| {
             if (isJsonWhitespace(byte)) {
-                mask |= @as(Mask, 1) <<
-                    @as(std.math.Log2Int(Mask), @intCast(lane));
+                mask |= @as(mask_type, 1) <<
+                    @as(std.math.Log2Int(mask_type), @intCast(lane));
             }
         }
         mix(&checksum, mask);
@@ -68,8 +68,8 @@ fn newWhitespaceMask(bytes: []const u8) u64 {
     return checksum;
 }
 
-fn maskPattern(block_index: usize) Mask {
-    const rotated = @as(u64, @intCast(block_index *% 0x9e3779b9));
+fn maskPattern(block_index: usize) mask_type {
+    const rotated: u64 = @intCast(block_index *% 0x9e3779b9);
     const value = (rotated ^ (rotated >> 17) ^ 0xa5a5_5a5a_3c3c_c3c3) *% 0x27d4_eb2d;
     return @truncate(value);
 }
@@ -82,7 +82,7 @@ fn oldScratchExtract(bytes_len: usize, seed: usize) u64 {
     while (base_offset < bytes_len) {
         const mask = maskPattern(block_index +% seed);
         var scratch: [vector_len]u32 = undefined;
-        const scratch_count = simd.extractBitIndexes(Mask, mask, base_offset, &scratch);
+        const scratch_count = simd.extractBitIndexes(mask_type, mask, base_offset, &scratch);
         @memcpy(output[0..scratch_count], scratch[0..scratch_count]);
         for (output[0..scratch_count]) |index| mix(&checksum, index);
         base_offset += vector_len;
@@ -99,12 +99,12 @@ fn checkedDirectExtract(bytes_len: usize, seed: usize) !u64 {
     var base_offset: usize = 0;
     while (base_offset < bytes_len) {
         const bitmask = maskPattern(block_index +% seed);
-        const output_count = simd.extractBitIndexesChecked(
-            Mask,
+        const output_count = try simd.extractBitIndexesChecked(
+            mask_type,
             bitmask,
             base_offset,
             &output,
-        ) catch |err| return err;
+        );
         for (output[0..output_count]) |index| mix(&checksum, index);
         base_offset += vector_len;
         block_index += 1;
@@ -113,7 +113,7 @@ fn checkedDirectExtract(bytes_len: usize, seed: usize) !u64 {
     return checksum;
 }
 
-fn oldTrailingRunOdd(block: Vec, valid_count: usize, previous_odd: bool) bool {
+fn oldTrailingRunOdd(block: vec_type, valid_count: usize, previous_odd: bool) bool {
     if (valid_count == 0) return false;
     const bytes: [vector_len]u8 = block;
     var index = valid_count;
@@ -133,8 +133,8 @@ fn oldReverseByteCarry(bytes: []const u8) u64 {
         const valid_count = @min(bytes.len - offset, vector_len);
         var block: [vector_len]u8 = @splat(0);
         @memcpy(block[0..valid_count], bytes[offset..][0..valid_count]);
-        const vector: Vec = block;
-        const backslashes: Mask = simd.matchByte(vector_len, vector, '\\');
+        const vector: vec_type = block;
+        const backslashes: mask_type = simd.matchByte(vector_len, vector, '\\');
         mix(&checksum, backslashes);
         const odd = oldTrailingRunOdd(block, valid_count, previous_odd);
         mix(&checksum, @intFromBool(odd));
@@ -151,8 +151,8 @@ fn newMaskCarry(bytes: []const u8) u64 {
         const valid_count = @min(bytes.len - offset, vector_len);
         var block: [vector_len]u8 = @splat(0);
         @memcpy(block[0..valid_count], bytes[offset..][0..valid_count]);
-        const vector: Vec = block;
-        const backslashes: Mask = simd.matchByte(vector_len, vector, '\\');
+        const vector: vec_type = block;
+        const backslashes: mask_type = simd.matchByte(vector_len, vector, '\\');
         mix(&checksum, backslashes);
         const odd = simd.trailingRunOdd(
             vector_len,
@@ -167,9 +167,9 @@ fn newMaskCarry(bytes: []const u8) u64 {
 }
 
 fn timeWhitespace(
+    comptime function: fn ([]const u8) u64,
     io: std.Io,
     bytes: []const u8,
-    comptime function: fn ([]const u8) u64,
 ) !BenchResult {
     var checksum: u64 = 0;
     const start = std.Io.Clock.awake.now(io).nanoseconds;
@@ -201,9 +201,9 @@ fn timeDirect(io: std.Io, bytes_len: usize) !BenchResult {
 }
 
 fn timeCarry(
+    comptime function: fn ([]const u8) u64,
     io: std.Io,
     bytes: []const u8,
-    comptime function: fn ([]const u8) u64,
 ) !BenchResult {
     var checksum: u64 = 0;
     const start = std.Io.Clock.awake.now(io).nanoseconds;
@@ -232,16 +232,16 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 
-    const whitespace_old = try timeWhitespace(init.io, input, oldWhitespaceMask);
-    const whitespace_new = try timeWhitespace(init.io, input, newWhitespaceMask);
+    const whitespace_old = try timeWhitespace(oldWhitespaceMask, init.io, input);
+    const whitespace_new = try timeWhitespace(newWhitespaceMask, init.io, input);
     if (whitespace_old.checksum != whitespace_new.checksum) return error.ChecksumMismatch;
 
     const scratch = try timeScratch(init.io, input.len);
     const direct = try timeDirect(init.io, input.len);
     if (scratch.checksum != direct.checksum) return error.ChecksumMismatch;
 
-    const carry_old = try timeCarry(init.io, input, oldReverseByteCarry);
-    const carry_new = try timeCarry(init.io, input, newMaskCarry);
+    const carry_old = try timeCarry(oldReverseByteCarry, init.io, input);
+    const carry_new = try timeCarry(newMaskCarry, init.io, input);
     if (carry_old.checksum != carry_new.checksum) return error.ChecksumMismatch;
 
     var stdout_buffer: [4096]u8 = undefined;

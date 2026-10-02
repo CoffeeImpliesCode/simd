@@ -347,7 +347,18 @@ fn checkLineLimits(input: []const u8, limits: Limits) Error!void {
 fn errorKind(err: Error) DiagnosticKind {
     return switch (err) {
         error.Unsupported => .unsupported,
-        error.SourceBytesExceeded, error.CookedBytesExceeded, error.ScalarSourceExceeded, error.LineLimitExceeded, error.ScalarLineLimitExceeded, error.IndentationExceeded, error.TapeWordsExceeded, error.InputTooLarge, error.TapeTooLarge, error.CapacityOverflow, error.DepthExceeded => .resource,
+        error.SourceBytesExceeded,
+        error.CookedBytesExceeded,
+        error.ScalarSourceExceeded,
+        error.LineLimitExceeded,
+        error.ScalarLineLimitExceeded,
+        error.IndentationExceeded,
+        error.TapeWordsExceeded,
+        error.InputTooLarge,
+        error.TapeTooLarge,
+        error.CapacityOverflow,
+        error.DepthExceeded,
+        => .resource,
         else => .syntax,
     };
 }
@@ -402,7 +413,7 @@ fn buildBasicDocument(
     input: []const u8,
     limits: Limits,
 ) Error!Document {
-    var source_document = basic.buildYamlTape(allocator, input) catch |err| return err;
+    var source_document = try basic.buildYamlTape(allocator, input);
     defer source_document.deinit(allocator);
 
     var depth: usize = 0;
@@ -437,7 +448,7 @@ fn buildBasicDocument(
 
     var cooked = std.ArrayList(u8).empty;
     errdefer cooked.deinit(allocator);
-    var sink = CookedSink{ .allocator = allocator, .bytes = &cooked, .limits = limits };
+    var sink: CookedSink = .{ .allocator = allocator, .bytes = &cooked, .limits = limits };
 
     for (tape, 0..) |word, event_index| {
         const kind = try checkedKind(word);
@@ -520,6 +531,7 @@ const Parser = struct {
         self.tape.deinit(self.allocator);
         self.metadata.deinit(self.allocator);
         self.cooked.deinit(self.allocator);
+        self.* = undefined;
     }
 
     fn fail(self: *Parser, err: Error, kind: DiagnosticKind, offset: usize) Error {
@@ -547,7 +559,7 @@ const Parser = struct {
 
     fn collectLines(self: *Parser) Error!void {
         if (self.input.len == 0) return self.syntax(0);
-        const invalid_offset = source.failureOffset(self.input) catch |err| return err;
+        const invalid_offset = try source.failureOffset(self.input);
         if (invalid_offset) |offset| return self.syntax(offset);
         var offset: usize = if (std.mem.startsWith(u8, self.input, "\xef\xbb\xbf")) 3 else 0;
         while (offset < self.input.len) {
@@ -584,7 +596,7 @@ const Parser = struct {
             });
             offset = next;
         }
-        if (self.input[self.input.len - 1] == '\n') {
+        if (std.mem.endsWith(u8, self.input, "\n")) {
             try self.appendLine(.{
                 .start = self.input.len,
                 .content_start = self.input.len,
@@ -649,45 +661,6 @@ const Parser = struct {
             .raw_length = @intCast(length),
             .style = .plain,
             .ownership = .source_borrowed,
-        };
-    }
-
-    fn emitOwned(
-        self: *Parser,
-        kind: basic.YamlTokenKind,
-        offset: usize,
-        length: usize,
-        style: ScalarStyle,
-        chomping: Chomping,
-        indentation: ScalarIndentation,
-        indentation_indicator: u8,
-        indentation_width: usize,
-        decode: fn (*Parser, *CookedSink, usize, usize) Error!void,
-        decode_start: usize,
-        decode_end: usize,
-    ) Error!void {
-        if (length > self.limits.scalar_source_bytes_max) {
-            return self.resource(error.ScalarSourceExceeded, offset);
-        }
-        const event_index = try self.emit(kind, offset, length);
-        const cooked_start = self.cooked.items.len;
-        var sink = CookedSink{ .allocator = self.allocator, .bytes = &self.cooked, .limits = self.limits };
-        try decode(self, &sink, decode_start, decode_end);
-        const cooked_length = self.cooked.items.len - cooked_start;
-        if (cooked_start > max_u32 or cooked_length > max_u32) {
-            return self.resource(error.CookedBytesExceeded, offset);
-        }
-        self.metadata.items[event_index] = .{
-            .raw_start = @intCast(offset),
-            .raw_length = @intCast(length),
-            .style = style,
-            .chomping = chomping,
-            .indentation = indentation,
-            .indentation_indicator = indentation_indicator,
-            .indentation_width = @intCast(indentation_width),
-            .ownership = .document_owned,
-            .cooked_start = @intCast(cooked_start),
-            .cooked_length = @intCast(cooked_length),
         };
     }
 
@@ -1046,7 +1019,7 @@ const Parser = struct {
         }
         const event_index = try self.emit(kind, start, length);
         const cooked_start = self.cooked.items.len;
-        var sink = CookedSink{ .allocator = self.allocator, .bytes = &self.cooked, .limits = self.limits };
+        var sink: CookedSink = .{ .allocator = self.allocator, .bytes = &self.cooked, .limits = self.limits };
         decodeQuotedRange(&sink, self.input, start, end, style, cooked_start) catch |err| {
             const offset = if (err == error.Invalid)
                 invalidQuotedOffset(self.input, start, end, style)
@@ -1194,7 +1167,7 @@ const Parser = struct {
         }
         const event_index = try self.emit(.scalar, start, raw_length);
         const cooked_start = self.cooked.items.len;
-        var sink = CookedSink{ .allocator = self.allocator, .bytes = &self.cooked, .limits = self.limits };
+        var sink: CookedSink = .{ .allocator = self.allocator, .bytes = &self.cooked, .limits = self.limits };
         self.cookBlock(&sink, body_start, body_end, body_indent, header.style) catch |err| {
             if (err == error.OutOfMemory) return err;
             return self.fail(err, errorKind(err), start);
@@ -1318,7 +1291,7 @@ fn parseExtended(
 ) Error!Document {
     var parser = Parser.init(allocator, input, limits, failure);
     defer parser.deinit();
-    parser.parseDocument() catch |err| return err;
+    try parser.parseDocument();
     return parser.finish();
 }
 
@@ -1622,7 +1595,10 @@ fn trimComment(input: []const u8, start: usize, end: usize) usize {
     while (index < end) : (index += 1) {
         const byte = input[index];
         if (quote == '\'') {
-            if (byte == '\'' and index + 1 < end and input[index + 1] == '\'') index += 1 else if (byte == '\'') quote = 0;
+            if (byte == '\'' and index + 1 < end and input[index + 1] == '\'')
+                index += 1
+            else if (byte == '\'')
+                quote = 0;
             continue;
         }
         if (quote == '"') {
@@ -1635,8 +1611,14 @@ fn trimComment(input: []const u8, start: usize, end: usize) usize {
         }
         if (byte == '[' or byte == '{') flow_depth += 1;
         if (byte == ']' or byte == '}') flow_depth -|= 1;
-        if (byte == '#' and flow_depth == 0 and (index == start or input[index - 1] == ' ')) {
-            return trimSpaces(input, start, index);
+        if (byte == '#' and flow_depth == 0) {
+            // A comment starts the scalar or follows a space; `index` only
+            // advances from `start`, so these two tests are those cases.
+            if (index > start) {
+                if (input[index - 1] == ' ') return trimSpaces(input, start, index);
+            } else {
+                return trimSpaces(input, start, index);
+            }
         }
     }
     return trimSpaces(input, start, end);
@@ -1649,7 +1631,10 @@ fn findColon(input: []const u8, start: usize, end: usize) ?usize {
     while (index < end) : (index += 1) {
         const byte = input[index];
         if (quote == '\'') {
-            if (byte == '\'' and index + 1 < end and input[index + 1] == '\'') index += 1 else if (byte == '\'') quote = 0;
+            if (byte == '\'' and index + 1 < end and input[index + 1] == '\'')
+                index += 1
+            else if (byte == '\'')
+                quote = 0;
             continue;
         }
         if (quote == '"') {
@@ -1668,7 +1653,15 @@ fn findColon(input: []const u8, start: usize, end: usize) ?usize {
             flow_depth -|= 1;
             continue;
         }
-        if (byte == '#' and flow_depth == 0 and (index == start or input[index - 1] == ' ')) break;
+        if (byte == '#' and flow_depth == 0) {
+            // `index` only advances from `start`, so `index == start` is the
+            // comment-at-first-byte case and `index > start` the one after a space.
+            if (index > start) {
+                if (input[index - 1] == ' ') break;
+            } else {
+                break;
+            }
+        }
         if (byte == ':' and flow_depth == 0 and
             (index + 1 == end or input[index + 1] == ' ' or input[index + 1] == '#' or
                 input[index + 1] == '[' or input[index + 1] == '{'))

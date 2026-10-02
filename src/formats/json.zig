@@ -12,7 +12,7 @@ const IndexSink = struct {
     indexes: []u32,
     count: usize = 0,
 
-    pub fn appendOffset(self: *@This(), offset: usize) lexical.Error!void {
+    pub fn appendOffset(self: *IndexSink, offset: usize) lexical.Error!void {
         if (offset > std.math.maxInt(u32)) return error.InputTooLarge;
         if (self.count >= self.indexes.len) return error.CapacityExceeded;
         self.indexes[self.count] = @intCast(offset);
@@ -20,7 +20,7 @@ const IndexSink = struct {
     }
 
     pub fn appendMask(
-        self: *@This(),
+        self: *IndexSink,
         comptime T: type,
         mask: T,
         base_offset: usize,
@@ -167,7 +167,7 @@ pub fn indexJson(
 }
 
 pub fn indexJsonImpl(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     allocator: std.mem.Allocator,
     input: []const u8,
 ) stage1.StructuralIndex.InitError!stage1.StructuralIndex {
@@ -177,7 +177,7 @@ pub fn indexJsonImpl(
     errdefer indexes.deinit(allocator);
 
     indexes.count = indexJsonInto(
-        VLEN,
+        vlen,
         indexes.indexes[0 .. indexes.indexes.len - sentinel_count],
         input,
     ) catch |err| switch (err) {
@@ -190,15 +190,15 @@ pub fn indexJsonImpl(
 }
 
 pub fn indexJsonInto(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     indexes: []u32,
     input: []const u8,
 ) lexical.Error!usize {
     if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
 
-    var sink = IndexSink{ .indexes = indexes };
+    var sink: IndexSink = .{ .indexes = indexes };
     var state: lexical.State = .{};
-    lexical.feed(VLEN, .json, &state, input, 0, &sink) catch |err| switch (err) {
+    lexical.feed(vlen, .json, &state, input, 0, &sink) catch |err| switch (err) {
         error.NonContiguousInput => unreachable,
         error.CapacityExceeded => return error.CapacityExceeded,
         error.InputTooLarge => return error.InputTooLarge,
@@ -287,12 +287,12 @@ fn expectMatchesScalar(input: []const u8) !void {
     return expectMatchesScalarAtWidth(simd.default_vector_len, input);
 }
 
-fn expectMatchesScalarAtWidth(comptime VLEN: usize, input: []const u8) !void {
+fn expectMatchesScalarAtWidth(comptime vlen: usize, input: []const u8) !void {
     var expected = try scalarIndexJson(testing.allocator, input);
     defer expected.deinit(testing.allocator);
     try expectValidIndexes(input.len, expected.slice());
 
-    var actual = try indexJsonImpl(VLEN, testing.allocator, input);
+    var actual = try indexJsonImpl(vlen, testing.allocator, input);
     defer actual.deinit(testing.allocator);
 
     try testing.expectEqualSlices(u32, expected.slice(), actual.slice());
@@ -324,7 +324,7 @@ fn expectSameDiagnostic(
 }
 
 fn expectHandoffMatchesScalarAtWidth(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     input: []const u8,
     expected_indexes: []const u32,
 ) !void {
@@ -334,7 +334,7 @@ fn expectHandoffMatchesScalarAtWidth(
     try testing.expectEqualSlices(u32, expected_indexes, scalar.slice());
     try expectValidIndexes(input.len, scalar.slice());
 
-    var actual = try indexJsonImpl(VLEN, testing.allocator, input);
+    var actual = try indexJsonImpl(vlen, testing.allocator, input);
     defer actual.deinit(testing.allocator);
     try testing.expectEqualSlices(u32, scalar.slice(), actual.slice());
     try expectValidIndexes(input.len, actual.slice());
@@ -354,13 +354,13 @@ const HandoffCarry = enum {
 };
 
 fn expectConsecutiveBlockHandoffAtWidth(
-    comptime VLEN: usize,
+    comptime vlen: usize,
     prior_mask: HandoffPriorMask,
     carry: HandoffCarry,
 ) !void {
     // Keep two full blocks followed by a short borrowed tail.
     const tail_length = 6;
-    const input_length = 2 * VLEN + tail_length;
+    const input_length = 2 * vlen + tail_length;
     var input: [2 * 512 + tail_length]u8 = @splat(' ');
     var expected: [2 * 512 + tail_length]u32 = undefined;
     var expected_count: usize = 0;
@@ -368,7 +368,7 @@ fn expectConsecutiveBlockHandoffAtWidth(
     switch (prior_mask) {
         .empty => {},
         .sparse => {
-            const offsets = [_]usize{ 1, VLEN / 2, VLEN - 2, VLEN - 1 };
+            const offsets = [_]usize{ 1, vlen / 2, vlen - 2, vlen - 1 };
             const bytes = [_]u8{ '{', ':', ',', 'n' };
             for (offsets, bytes) |offset, byte| {
                 input[offset] = byte;
@@ -378,7 +378,7 @@ fn expectConsecutiveBlockHandoffAtWidth(
         },
         .dense => {
             const structural_bytes = "{[,:]}";
-            for (input[0..VLEN], 0..) |*byte, offset| {
+            for (input[0..vlen], 0..) |*byte, offset| {
                 byte.* = structural_bytes[offset % structural_bytes.len];
                 expected[expected_count] = @intCast(offset);
                 expected_count += 1;
@@ -386,60 +386,54 @@ fn expectConsecutiveBlockHandoffAtWidth(
         },
     }
 
-    input[VLEN] = '"';
-    expected[expected_count] = @intCast(VLEN);
+    input[vlen] = '"';
+    expected[expected_count] = @intCast(vlen);
     expected_count += 1;
 
     switch (carry) {
         .quote => {
-            input[2 * VLEN - 2] = '"';
-            input[2 * VLEN - 1] = '"';
-            expected[expected_count] = @intCast(2 * VLEN - 1);
+            input[2 * vlen - 2 .. 2 * vlen + 1].* = "\"\"\"".*;
+            expected[expected_count] = @intCast(2 * vlen - 1);
             expected_count += 1;
 
-            input[2 * VLEN] = '"';
-            input[2 * VLEN + 1] = ']';
-            input[2 * VLEN + 2] = '0';
-            input[2 * VLEN + 4] = '[';
-            expected[expected_count] = @intCast(2 * VLEN + 1);
+            input[2 * vlen + 1] = ']';
+            input[2 * vlen + 2] = '0';
+            input[2 * vlen + 4] = '[';
+            expected[expected_count] = @intCast(2 * vlen + 1);
             expected_count += 1;
-            expected[expected_count] = @intCast(2 * VLEN + 2);
+            expected[expected_count] = @intCast(2 * vlen + 2);
             expected_count += 1;
-            expected[expected_count] = @intCast(2 * VLEN + 4);
+            expected[expected_count] = @intCast(2 * vlen + 4);
             expected_count += 1;
         },
         .backslash_odd => {
-            input[2 * VLEN - 1] = '\\';
-            input[2 * VLEN] = '"';
-            input[2 * VLEN + 1] = '"';
-            input[2 * VLEN + 2] = ']';
-            input[2 * VLEN + 3] = '0';
-            input[2 * VLEN + 5] = '{';
-            expected[expected_count] = @intCast(2 * VLEN + 2);
+            input[2 * vlen - 1 .. 2 * vlen + 2].* = "\\\"\"".*;
+            input[2 * vlen + 2] = ']';
+            input[2 * vlen + 3] = '0';
+            input[2 * vlen + 5] = '{';
+            expected[expected_count] = @intCast(2 * vlen + 2);
             expected_count += 1;
-            expected[expected_count] = @intCast(2 * VLEN + 3);
+            expected[expected_count] = @intCast(2 * vlen + 3);
             expected_count += 1;
-            expected[expected_count] = @intCast(2 * VLEN + 5);
+            expected[expected_count] = @intCast(2 * vlen + 5);
             expected_count += 1;
         },
         .backslash_even => {
-            input[2 * VLEN - 2] = '\\';
-            input[2 * VLEN - 1] = '\\';
-            input[2 * VLEN] = '"';
-            input[2 * VLEN + 1] = ']';
-            input[2 * VLEN + 2] = '0';
-            input[2 * VLEN + 4] = '{';
-            expected[expected_count] = @intCast(2 * VLEN + 1);
+            input[2 * vlen - 2 .. 2 * vlen + 1].* = "\\\\\"".*;
+            input[2 * vlen + 1] = ']';
+            input[2 * vlen + 2] = '0';
+            input[2 * vlen + 4] = '{';
+            expected[expected_count] = @intCast(2 * vlen + 1);
             expected_count += 1;
-            expected[expected_count] = @intCast(2 * VLEN + 2);
+            expected[expected_count] = @intCast(2 * vlen + 2);
             expected_count += 1;
-            expected[expected_count] = @intCast(2 * VLEN + 4);
+            expected[expected_count] = @intCast(2 * vlen + 4);
             expected_count += 1;
         },
     }
 
     try expectHandoffMatchesScalarAtWidth(
-        VLEN,
+        vlen,
         input[0..input_length],
         expected[0..expected_count],
     );
@@ -932,7 +926,7 @@ test "validateJson returns first diagnostic with source location" {
     const escape_diagnostic = (try validateJson(
         testing.allocator,
         malformed_escape,
-    )).?;
+    )) orelse return error.ExpectedJsonDiagnostic;
     try testing.expectEqual(error.InvalidEscape, escape_diagnostic.err);
     try testing.expectEqual(@as(usize, 9), escape_diagnostic.byte_offset);
     try testing.expectEqual(@as(u32, 2), escape_diagnostic.line);
@@ -944,7 +938,7 @@ test "validateJson returns first diagnostic with source location" {
     const array_diagnostic = (try validateJson(
         testing.allocator,
         unclosed_array,
-    )).?;
+    )) orelse return error.ExpectedJsonDiagnostic;
     try testing.expectEqual(error.UnclosedArray, array_diagnostic.err);
     try testing.expectEqual(@as(usize, 3), array_diagnostic.byte_offset);
     try testing.expectEqual(@as(u32, 2), array_diagnostic.line);
@@ -955,7 +949,7 @@ test "validateJson returns first diagnostic with source location" {
     const object_diagnostic = (try validateJson(
         testing.allocator,
         unclosed_object,
-    )).?;
+    )) orelse return error.ExpectedJsonDiagnostic;
     try testing.expectEqual(error.UnclosedObject, object_diagnostic.err);
     try testing.expectEqual(@as(usize, 2), object_diagnostic.byte_offset);
     try testing.expectEqual(@as(u32, 2), object_diagnostic.line);

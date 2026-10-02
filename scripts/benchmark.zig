@@ -70,10 +70,9 @@ const semantic_mode: bool = build_options.semantic_mode;
 /// `freeHeaders`, `freeAnalysis`, and `sameAs`; they differ in the work they
 /// describe. Every `report.` name below is this mode's module, so the branches
 /// that reach for a field only one of them has are explicit.
-const report = if (semantic_mode)
-    @import("semantic_benchmark_report.zig")
-else
-    @import("benchmark_report.zig");
+const semantic_report = @import("semantic_benchmark_report.zig");
+const legacy_report = @import("benchmark_report.zig");
+const report = if (semantic_mode) semantic_report else legacy_report;
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -135,14 +134,18 @@ const status_failed = "failed";
 // parser-free and needs no CPU-dependent library module.
 // ---------------------------------------------------------------------------
 
+const semantic_contract = @import("semantic_contract");
+const commonmark_fixtures = @import("commonmark_bench_fixtures.zig").fixtures;
+const yaml_extended_fixtures = @import("yaml_extended_bench_fixtures.zig").fixtures;
+
 const semantic_segments = if (semantic_mode) [_]report.DomainSegment{
     .{
         .format = .commonmark,
-        .fixtures = @import("commonmark_bench_fixtures.zig").fixtures,
+        .fixtures = commonmark_fixtures,
     },
     .{
         .format = .yaml_extended,
-        .fixtures = @import("yaml_extended_bench_fixtures.zig").fixtures,
+        .fixtures = yaml_extended_fixtures,
     },
 } else void;
 
@@ -643,7 +646,7 @@ fn openRegularFile(io: Io, dir: Io.Dir, sub_path: []const u8) ArchiveError!Io.Fi
     };
     errdefer file.close(io);
 
-    const opened = file.stat(io) catch |err| return err;
+    const opened = try file.stat(io);
     switch (opened.kind) {
         .file => {},
         .sym_link => return error.SymlinkInArchive,
@@ -1084,7 +1087,7 @@ fn civilFromDays(days_since_epoch: i64) CivilDate {
 /// Formats the recording time as UTC. Every field is printed as an unsigned
 /// integer, so the zero padding is digits and never a sign.
 fn formatUtc(allocator: Allocator, io: Io) !struct { unix_ns: i128, text: []u8 } {
-    const nanoseconds = @as(i128, @intCast(Io.Timestamp.now(io, .real).nanoseconds));
+    const nanoseconds: i128 = @intCast(Io.Timestamp.now(io, .real).nanoseconds);
     const seconds = @divFloor(nanoseconds, 1_000_000_000);
     const days = @divFloor(seconds, 86_400);
     const seconds_of_day: u64 = @intCast(seconds - days * 86_400);
@@ -1359,14 +1362,29 @@ fn collectToolchain(allocator: Allocator, io: Io) ArchiveError!ToolchainFacts {
 
     const vector_len: ?u64 = if (build_options.bench_vector_len) |width| @intCast(width) else null;
 
+    // Every allocation is bound and given an errdefer before the struct is
+    // built: `errdefer` cannot appear inside a struct literal, so a field
+    // filled by a later `try` would otherwise leak the memory an earlier one
+    // already took when it failed.
+    const zig_basename = try allocator.dupe(u8, basename);
+    errdefer allocator.free(zig_basename);
+    const zig_version = try allocator.dupe(u8, text);
+    errdefer allocator.free(zig_version);
+    const bench_target = try allocator.dupe(u8, build_options.bench_target);
+    errdefer allocator.free(bench_target);
+    const bench_cpu = try allocator.dupe(u8, build_options.bench_cpu);
+    errdefer allocator.free(bench_cpu);
+    const bench_optimize = try allocator.dupe(u8, build_options.bench_optimize);
+    errdefer allocator.free(bench_optimize);
+
     return .{
-        .zig_basename = try allocator.dupe(u8, basename),
-        .zig_version = try allocator.dupe(u8, text),
+        .zig_basename = zig_basename,
+        .zig_version = zig_version,
         .zig_sha256 = digest.sha256,
         .zig_bytes = digest.bytes,
-        .bench_target = try allocator.dupe(u8, build_options.bench_target),
-        .bench_cpu = try allocator.dupe(u8, build_options.bench_cpu),
-        .bench_optimize = try allocator.dupe(u8, build_options.bench_optimize),
+        .bench_target = bench_target,
+        .bench_cpu = bench_cpu,
+        .bench_optimize = bench_optimize,
         .bench_vector_len = vector_len,
     };
 }
@@ -1492,7 +1510,8 @@ fn writeManifest(json: *JsonWriter, manifest: *const Manifest) !void {
             try json.key("format");
             try json.string(@tagName(segment.format));
             try json.key("inputs");
-            try json.uint(@intCast(segment.fixtures.len));
+            const fixtures_len: usize = segment.fixtures.len;
+            try json.uint(@intCast(fixtures_len));
             try json.key("cases");
             try json.uint(@intCast(cases));
             try json.endObject();
@@ -1875,6 +1894,9 @@ fn freeToolchain(allocator: Allocator, facts: *ToolchainFacts) void {
     allocator.free(facts.bench_target);
     allocator.free(facts.bench_cpu);
     allocator.free(facts.bench_optimize);
+    // SAFETY: every owning field was released on the lines above. The caller
+    // must not read `facts` again, so poisoning the released slices cannot
+    // hand back a pointer the allocator no longer owns.
     facts.* = undefined;
 }
 
@@ -1913,6 +1935,9 @@ fn freeHost(allocator: Allocator, facts: *HostFacts) void {
     allocator.free(facts.cpu_features);
     allocator.free(facts.cpus_allowed_list);
     allocator.free(facts.affinity_ranges);
+    // SAFETY: every owning field was released on the lines above; the poison
+    // only makes a later read of `facts` fail loudly instead of returning a
+    // freed pointer.
     facts.* = undefined;
 }
 
@@ -1929,6 +1954,9 @@ fn freeEnvironment(allocator: Allocator, facts: *EnvironmentFacts) void {
     if (facts.lang) |text| allocator.free(text);
     if (facts.lc_all) |text| allocator.free(text);
     if (facts.tz) |text| allocator.free(text);
+    // SAFETY: every optional field was released above or was null; the poison
+    // only makes a later read fail loudly instead of returning a freed
+    // pointer.
     facts.* = undefined;
 }
 
@@ -2120,6 +2148,9 @@ fn loadAnalysis(
             // Filled one field at a time so each mode declares exactly the
             // facts it records: the shared case facts in both, and the
             // observed outcome only where a semantic case has one.
+            // SAFETY: every field is assigned between here and the read of
+            // `stable`, and `outcome` exists only in the mode whose branch
+            // assigns it.
             var stable: report.CaseRecord = undefined;
             stable.format = try fieldFormat(object, "format");
             stable.workload = try fieldWorkload(object, "workload");
@@ -2291,6 +2322,9 @@ fn freeManifest(allocator: Allocator, manifest: *Manifest) void {
     freeSources(allocator, manifest.sources, manifest.sources.len);
     freeSamples(allocator, manifest.samples, manifest.samples.len);
     if (manifest.analysis) |*analysis| report.freeAnalysis(allocator, analysis);
+    // SAFETY: every owning field was released above, recursively through the
+    // facts, sources, samples and analysis this manifest owns; the poison only
+    // makes a later read fail loudly instead of returning a freed pointer.
     manifest.* = undefined;
 }
 
@@ -2454,7 +2488,7 @@ fn emptyManifest(options: report.Options) Manifest {
 fn writeManifestFile(ctx: *Context, archive: Io.Dir, manifest: *const Manifest) ArchiveError!void {
     var allocating: std.Io.Writer.Allocating = .init(ctx.gpa);
     defer allocating.deinit();
-    var json = JsonWriter{ .writer = &allocating.writer };
+    var json: JsonWriter = .{ .writer = &allocating.writer };
     // The render buffer is memory only, so the one fault a write into it can
     // report is its own failure to grow. `Writer.Allocating` names that
     // `error.WriteFailed` because a write can also fail at a sink that does
@@ -2487,12 +2521,16 @@ fn runBenchSample(
     ctx: *Context,
     bench_path: []const u8,
     options: report.Options,
-    ordinal: u16,
+    slot: usize,
     archive: Io.Dir,
     stdouts: [][]const u8,
     manifest: *Manifest,
     sample_log: *std.ArrayList(SampleRecord),
 ) ArchiveError!void {
+    // The recorded sample number is the slot plus one; the capture keeps its
+    // own index, so the caller never has to hand over an ordinal whose "minus
+    // one" is the slot it already had.
+    const ordinal: u16 = @intCast(slot + 1);
     const iterations_text = try std.fmt.allocPrint(ctx.arena, "{d}", .{options.iterations});
     // The invocation is the mode's own. Semantic mode passes the iteration
     // count and nothing else: its bench takes one optional positional value,
@@ -2542,7 +2580,7 @@ fn runBenchSample(
         .term_value = term.value,
     });
     manifest.samples = sample_log.items;
-    stdouts[ordinal - 1] = try ctx.arena.dupe(u8, result.stdout);
+    stdouts[slot] = try ctx.arena.dupe(u8, result.stdout);
 
     if (term.kind != .exited) return error.BenchTerminated;
     if (term.value != 0) return error.BenchExitedNonzero;
@@ -2585,7 +2623,7 @@ fn recordSteps(
             ctx,
             bench_path,
             manifest.options,
-            @intCast(index + 1),
+            index,
             archive,
             stdouts,
             manifest,
@@ -2710,7 +2748,12 @@ fn runVerify(ctx: *Context, archive_path: []const u8) ArchiveError!void {
     );
 }
 
-fn runRecord(ctx: *Context, bench_path: []const u8, repo_path: []const u8, command: report.RecordCommand) ArchiveError!void {
+fn runRecord(
+    ctx: *Context,
+    bench_path: []const u8,
+    repo_path: []const u8,
+    command: report.RecordCommand,
+) ArchiveError!void {
     if (bench_path.len == 0) return error.BenchmarkPathMissing;
     const repo = Io.Dir.openDirAbsolute(ctx.io, repo_path, .{}) catch return error.RepositoryRootMissing;
     defer repo.close(ctx.io);
@@ -2763,8 +2806,12 @@ fn runReproduce(
 }
 
 fn fail(ctx: *Context, operation: []const u8, err: anyerror) noreturn {
-    ctx.out.print("{s} {s}: {s}\n", .{ program_name, operation, @errorName(err) }) catch {};
-    ctx.out.flush() catch {};
+    // Failure to write the diagnostic must still terminate with status 1.
+    ctx.out.print(
+        "{s} {s}: {s}\n",
+        .{ program_name, operation, @errorName(err) },
+    ) catch std.process.exit(1);
+    ctx.out.flush() catch std.process.exit(1);
     std.process.exit(1);
 }
 
@@ -2793,7 +2840,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
-    var ctx = Context{
+    var ctx: Context = .{
         .gpa = init.gpa,
         .arena = arena,
         .io = init.io,
@@ -2804,7 +2851,9 @@ pub fn main(init: std.process.Init) !void {
     switch (command) {
         .verify => |archive_path| runVerify(&ctx, archive_path) catch |err| fail(&ctx, "verify", err),
         .record => |record| runRecord(&ctx, argv[1], argv[2], record) catch |err| fail(&ctx, "record", err),
-        .reproduce => |reproduce| runReproduce(&ctx, argv[1], argv[2], reproduce) catch |err| fail(&ctx, "reproduce", err),
+        .reproduce => |reproduce| {
+            runReproduce(&ctx, argv[1], argv[2], reproduce) catch |err| fail(&ctx, "reproduce", err);
+        },
     }
     try out.flush();
 }
@@ -2885,17 +2934,17 @@ fn synthObservation(case_index: usize) struct {
 /// Fills `out` with the inputs this mode's capture declares, in print order.
 fn fillSynthInputs(out: []SynthInput) void {
     if (comptime semantic_mode) {
-        const contract = @import("semantic_contract");
         var index: usize = 0;
         for (semantic_domain.segments) |segment| {
             for (segment.fixtures) |fixture| {
+                const source_len: usize = fixture.source.len;
                 out[index] = .{
                     .format = segment.format,
                     .workload = fixture.workload,
                     // The real fixture source, so the declaration carries the
                     // hash and the byte count the decoder checks it against.
-                    .input_hash = contract.checksumBytes(fixture.source),
-                    .input_bytes = @intCast(fixture.source.len),
+                    .input_hash = semantic_contract.checksumBytes(fixture.source),
+                    .input_bytes = @intCast(source_len),
                     .stages = fixture.stages,
                     .outcome = fixture.outcome,
                 };
@@ -2956,7 +3005,9 @@ fn synthReport(allocator: Allocator, options: report.Options) ![]u8 {
         // Exactly what the measurement executable prints. A synthetic capture
         // that claimed a whole-document checksum for every stage would assert
         // coverage the `parse` stage deliberately does not perform.
-        try writer.writeAll("# consumption=traverse consumes complete semantics; parse consumption is small by design\n");
+        try writer.writeAll(
+            "# consumption=traverse consumes complete semantics; parse consumption is small by design\n",
+        );
         try writer.writeAll("# render_html=safe mode: raw HTML omitted, dangerous URLs filtered\n");
         try writer.print("# streaming={s}\n", .{report.streaming_boundary_text});
         try writer.print("# ranking={s}\n", .{report.ranking_boundary_text});
@@ -3008,7 +3059,9 @@ fn synthReport(allocator: Allocator, options: report.Options) ![]u8 {
         try writer.writeAll("# resident_consumption=resident consumption\n");
         try writer.writeAll("# traverse_prefix8=first 8 events\n");
         try writer.writeAll("# baseline=baseline\n");
-        try writer.writeAll("format,workload,stage,input_bytes,iterations,elapsed_ns,checksum,allocation_count,allocated_bytes\n");
+        try writer.writeAll(
+            "format,workload,stage,input_bytes,iterations,elapsed_ns,checksum,allocation_count,allocated_bytes\n",
+        );
 
         for (inputs) |input| {
             try writer.print(
@@ -3134,7 +3187,7 @@ fn firstRow(
 // The tests are a container the mode selects, because Zig has no
 // container-level `if` of its own. The other mode takes `struct {}` here, so
 // it never resolves a legacy name at all.
-const legacy_tests = if (semantic_mode) struct {} else struct {
+const LegacyTests = if (semantic_mode) struct {} else struct {
     test "a canonical capture decodes to 35 inputs and 210 cases" {
         const options: report.Options = .{};
         const text = try synthReport(testing.allocator, options);
@@ -3403,13 +3456,31 @@ const legacy_tests = if (semantic_mode) struct {} else struct {
         try testing.expectError(error.UnknownOperation, report.parseCommand(&.{"compare"}));
         try testing.expectError(error.MissingOutputDirectory, report.parseCommand(&.{"record"}));
         try testing.expectError(error.MissingFlagValue, report.parseCommand(&.{ "record", "out", "--samples" }));
-        try testing.expectError(error.SampleCountOutOfRange, report.parseCommand(&.{ "record", "out", "--samples", "0" }));
-        try testing.expectError(error.SampleCountOutOfRange, report.parseCommand(&.{ "record", "out", "--samples", "33" }));
+        try testing.expectError(
+            error.SampleCountOutOfRange,
+            report.parseCommand(&.{ "record", "out", "--samples", "0" }),
+        );
+        try testing.expectError(
+            error.SampleCountOutOfRange,
+            report.parseCommand(&.{ "record", "out", "--samples", "33" }),
+        );
         try testing.expectError(error.NotANumber, report.parseCommand(&.{ "record", "out", "--samples", "many" }));
-        try testing.expectError(error.IterationCountOutOfRange, report.parseCommand(&.{ "record", "out", "--iterations", "0" }));
-        try testing.expectError(error.IterationCountOutOfRange, report.parseCommand(&.{ "record", "out", "--iterations", "64" }));
-        try testing.expectError(error.UnsupportedChunkSize, report.parseCommand(&.{ "record", "out", "--stream-chunk-size", "128" }));
-        try testing.expectError(error.DuplicateFlag, report.parseCommand(&.{ "record", "out", "--samples", "2", "--samples", "3" }));
+        try testing.expectError(
+            error.IterationCountOutOfRange,
+            report.parseCommand(&.{ "record", "out", "--iterations", "0" }),
+        );
+        try testing.expectError(
+            error.IterationCountOutOfRange,
+            report.parseCommand(&.{ "record", "out", "--iterations", "64" }),
+        );
+        try testing.expectError(
+            error.UnsupportedChunkSize,
+            report.parseCommand(&.{ "record", "out", "--stream-chunk-size", "128" }),
+        );
+        try testing.expectError(
+            error.DuplicateFlag,
+            report.parseCommand(&.{ "record", "out", "--samples", "2", "--samples", "3" }),
+        );
         try testing.expectError(error.UnknownFlag, report.parseCommand(&.{ "record", "out", "--depth", "2" }));
         try testing.expectError(error.ExtraArguments, report.parseCommand(&.{"verify"}));
         try testing.expectError(error.ExtraArguments, report.parseCommand(&.{ "verify", "a", "b" }));
@@ -3420,7 +3491,7 @@ const legacy_tests = if (semantic_mode) struct {} else struct {
 comptime {
     // A test belongs to the build only in a container this compilation
     // analyzes, and nothing else names this one.
-    testing.refAllDecls(legacy_tests);
+    testing.refAllDecls(LegacyTests);
 }
 
 test "archive-relative paths are validated before use" {
@@ -3456,6 +3527,7 @@ const TestContext = struct {
 
     fn deinit(self: *TestContext) void {
         self.arena.deinit();
+        self.* = undefined;
     }
 
     fn context(self: *TestContext) Context {
@@ -3464,6 +3536,8 @@ const TestContext = struct {
             .arena = self.arena.allocator(),
             .io = self.io,
             .environ = null,
+            // SAFETY: only `main` reports through `out`, and no test enters it:
+            // every path these tests take returns its result to the caller.
             .out = undefined,
         };
     }
@@ -3582,7 +3656,7 @@ fn writeForgedManifest(
 ) !void {
     var allocating: std.Io.Writer.Allocating = .init(ctx.gpa);
     defer allocating.deinit();
-    var json = JsonWriter{ .writer = &allocating.writer };
+    var json: JsonWriter = .{ .writer = &allocating.writer };
     try writeManifest(&json, manifest);
     const patched = try replaceAll(ctx.gpa, allocating.written(), needle, replacement);
     defer ctx.gpa.free(patched);
@@ -3682,7 +3756,7 @@ test "an archive whose manifest is a symlink is refused" {
     const manifest = try buildSyntheticArchive(&ctx, archive, status_complete);
     var allocating: std.Io.Writer.Allocating = .init(ctx.gpa);
     defer allocating.deinit();
-    var json = JsonWriter{ .writer = &allocating.writer };
+    var json: JsonWriter = .{ .writer = &allocating.writer };
     try writeManifest(&json, &manifest);
 
     // The link resolves to a manifest that would load and verify exactly as
@@ -3757,7 +3831,8 @@ test "a per-case timing that contradicts the archived capture is refused" {
     // A timing is an observation and never an identity, so this forgery agrees
     // with every equality check; only re-deriving the value from the archive's
     // own capture can catch it. The array below is the first case's.
-    const recorded = manifest.analysis.?.cases[0].elapsed_ns[0];
+    const analysis = manifest.analysis orelse return error.MissingAnalysis;
+    const recorded = analysis.cases[0].elapsed_ns[0];
     const honest = try std.fmt.allocPrint(ctx.gpa, "[{d}]", .{recorded});
     defer ctx.gpa.free(honest);
     const forged = try std.fmt.allocPrint(ctx.gpa, "[{d}]", .{recorded + 1});
@@ -3765,7 +3840,8 @@ test "a per-case timing that contradicts the archived capture is refused" {
     try writeForgedManifest(&ctx, tmp.dir, &manifest, honest, forged);
 
     var loaded = try loadWrittenManifest(&ctx, tmp.dir);
-    try testing.expectEqual(recorded + 1, loaded.manifest.analysis.?.cases[0].elapsed_ns[0]);
+    const reloaded = loaded.manifest.analysis orelse return error.MissingAnalysis;
+    try testing.expectEqual(recorded + 1, reloaded.cases[0].elapsed_ns[0]);
     try testing.expectError(error.ManifestIncomplete, verifyArchive(&ctx, tmp.dir, &loaded));
 }
 
@@ -3780,7 +3856,8 @@ test "a per-case timing array that is not one entry per sample is refused" {
 
     // The first case's array must carry one entry per recorded sample, or the
     // timings it claims are not observations of that many captures.
-    const recorded = manifest.analysis.?.cases[0].elapsed_ns[0];
+    const analysis = manifest.analysis orelse return error.MissingAnalysis;
+    const recorded = analysis.cases[0].elapsed_ns[0];
     const honest = try std.fmt.allocPrint(ctx.gpa, "[{d}]", .{recorded});
     defer ctx.gpa.free(honest);
     const padded = try std.fmt.allocPrint(ctx.gpa, "[{d},{d}]", .{ recorded, recorded });
@@ -3815,7 +3892,7 @@ test "a traversing source path is refused before the archive is read" {
     var manifest = try buildSyntheticArchive(&ctx, tmp.dir, status_complete);
     var allocating: std.Io.Writer.Allocating = .init(ctx.gpa);
     defer allocating.deinit();
-    var json = JsonWriter{ .writer = &allocating.writer };
+    var json: JsonWriter = .{ .writer = &allocating.writer };
     try writeManifest(&json, &manifest);
 
     const patched = try replaceAll(
@@ -3840,7 +3917,7 @@ test "a manifest for a different schema is refused" {
     var manifest = try buildSyntheticArchive(&ctx, tmp.dir, status_complete);
     var allocating: std.Io.Writer.Allocating = .init(ctx.gpa);
     defer allocating.deinit();
-    var json = JsonWriter{ .writer = &allocating.writer };
+    var json: JsonWriter = .{ .writer = &allocating.writer };
     try writeManifest(&json, &manifest);
 
     const patched = try replaceAll(ctx.gpa, allocating.written(), "\"schema_version\":1", "\"schema_version\":2");
@@ -3971,9 +4048,10 @@ test "an archive keeps a full-width checksum exact through its manifest" {
     const raw = try readFileBounded(ctx.gpa, ctx.io, tmp.dir, manifest_name, max_manifest_bytes);
     defer ctx.gpa.free(raw);
     const loaded = try loadManifest(ctx.arena, raw);
+    const loaded_analysis = loaded.manifest.analysis orelse return error.MissingAnalysis;
     try testing.expectEqual(
         std.math.maxInt(u64),
-        loaded.manifest.analysis.?.cases[0].stable.checksum,
+        loaded_analysis.cases[0].stable.checksum,
     );
 
     const analysis = try verifyArchive(&ctx, tmp.dir, &loaded);
@@ -4022,7 +4100,7 @@ test "nested library directories keep their separators in the snapshot" {
 //
 // This container is selected the way the legacy tests above are: the legacy
 // compilation takes `struct {}` here and never resolves a semantic name.
-const semantic_tests = if (semantic_mode) struct {
+const SemanticTests = if (semantic_mode) struct {
     /// Replaces the archived capture with `text` and re-records its digest, so
     /// the archive's own bytes stay internally consistent and the check that
     /// fails is the decoder reading them rather than a checksum mismatch.
@@ -4089,9 +4167,10 @@ const semantic_tests = if (semantic_mode) struct {
         );
 
         var relabeled_accepted = try loadWrittenManifest(&ctx, tmp.dir);
+        const accepted_analysis = relabeled_accepted.manifest.analysis orelse return error.MissingAnalysis;
         try testing.expectEqualStrings(
             "TooManyNodes",
-            relabeled_accepted.manifest.analysis.?.cases[0].stable.outcome,
+            accepted_analysis.cases[0].stable.outcome,
         );
         try testing.expectError(
             error.ManifestIncomplete,
@@ -4101,11 +4180,12 @@ const semantic_tests = if (semantic_mode) struct {
         // The other direction: a resource fixture may not be recorded as one
         // the parser accepted. The needle is the first such row in the file,
         // so it is that row and not a fixed index that has to change.
-        const resource_case = firstCaseWithOutcome(manifest.analysis.?, "InputTooLarge") orelse
+        const manifest_analysis = manifest.analysis orelse return error.MissingAnalysis;
+        const resource_case = firstCaseWithOutcome(manifest_analysis, "InputTooLarge") orelse
             return error.NoResourceCase;
         try testing.expectEqualStrings(
             "InputTooLarge",
-            manifest.analysis.?.cases[resource_case].stable.outcome,
+            manifest_analysis.cases[resource_case].stable.outcome,
         );
         try writeForgedManifest(
             &ctx,
@@ -4116,9 +4196,10 @@ const semantic_tests = if (semantic_mode) struct {
         );
 
         var relabeled_rejected = try loadWrittenManifest(&ctx, tmp.dir);
+        const rejected_analysis = relabeled_rejected.manifest.analysis orelse return error.MissingAnalysis;
         try testing.expectEqualStrings(
             "accepted",
-            relabeled_rejected.manifest.analysis.?.cases[resource_case].stable.outcome,
+            rejected_analysis.cases[resource_case].stable.outcome,
         );
         try testing.expectError(
             error.ManifestIncomplete,
@@ -4219,11 +4300,13 @@ const semantic_tests = if (semantic_mode) struct {
     fn loadVerifyAndRelease(allocator: Allocator) !void {
         var arena_state: std.heap.ArenaAllocator = .init(allocator);
         defer arena_state.deinit();
-        var ctx = Context{
+        var ctx: Context = .{
             .gpa = allocator,
             .arena = arena_state.allocator(),
             .io = testing.io,
             .environ = null,
+            // SAFETY: only `main` reports through `out`, and this helper calls
+            // no reporting path: both phases return their own result.
             .out = undefined,
         };
         var tmp = testing.tmpDir(.{ .iterate = true });
@@ -4254,5 +4337,5 @@ const semantic_tests = if (semantic_mode) struct {
 comptime {
     // A test belongs to the build only in a container this compilation
     // analyzes, and nothing else names this one.
-    testing.refAllDecls(semantic_tests);
+    testing.refAllDecls(SemanticTests);
 }

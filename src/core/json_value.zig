@@ -42,7 +42,7 @@ pub fn decodeString(raw: []const u8, output: []u8) StringDecodeError![]u8 {
     }
 
     const decoded_len = try preflightString(raw, output.len);
-    decodeStringUnchecked(raw, output[0..decoded_len]);
+    try decodeStringUnchecked(raw, output[0..decoded_len]);
     return output[0..decoded_len];
 }
 
@@ -143,7 +143,7 @@ fn addDecodedLength(
     decoded_len.* += addition;
 }
 
-fn decodeStringUnchecked(raw: []const u8, output: []u8) void {
+fn decodeStringUnchecked(raw: []const u8, output: []u8) StringDecodeError!void {
     var raw_index: usize = 0;
     var output_index: usize = 0;
     while (raw_index < raw.len) {
@@ -187,9 +187,9 @@ fn decodeStringUnchecked(raw: []const u8, output: []u8) void {
                 raw_index += 2;
             },
             'u' => {
-                const first = parseCodeUnit(raw, raw_index) catch unreachable;
+                const first = try parseCodeUnit(raw, raw_index);
                 const codepoint: u32 = if (isHighSurrogate(first)) blk: {
-                    const second = parseCodeUnitAt(raw, raw_index + 6) catch unreachable;
+                    const second = try parseCodeUnitAt(raw, raw_index + 6);
                     break :blk combineSurrogates(first, second);
                 } else first;
                 const written = encodeCodepoint(codepoint, output[output_index..]);
