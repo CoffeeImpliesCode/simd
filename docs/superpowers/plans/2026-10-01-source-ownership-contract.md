@@ -758,7 +758,7 @@ declared at `:1326`) — and the parser stays UTF-8-only with no namespace
 resolution, no transcoder, and no DTD processing (`AGENTS.md:88-91`). For
 CommonMark, the flat document stays flat; no mutable
 AST, no full CommonMark streaming, and no additional renderer are in scope
-(`docs/superpowers/plans/2026-09-09-reference-markdown.md:514-517`).
+(`AGENTS.md:71-73`, `:119-123`).
 
 **The legacy benchmark domain, not back-filled.** The benchmark's YAML rows
 remain `yaml-basic-1.2.2` and its Markdown rows remain a marker-kind projection

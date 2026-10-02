@@ -12,32 +12,21 @@ Scope: this document records current contracts and the remaining roadmap.
 Sections marked **Future roadmap** are designs, not current APIs. Sections
 marked **Historical design record** describe the plan used for completed work.
 
-Verification counts and benchmark paths quoted anywhere under `docs/` are
-historical records captured on a different host. A pass count such as
-`382/382` or `482/482`, the AVX2-host native width of 32, and any
-`~/...` packet path describe that run, not this machine. They are not
-current verification results and support no new performance ranking.
-
-This checkout was verified on 2026-10-01 on an AVX-512 host, so its native
-width is 64: `zig build check -j2 --summary all` passed 128 of 128 build steps
-and 4445 of 4445 tests, including the `[4, 5, 7, 12, 16, 24, 32, 64]` matrix
-over all six test roots, and the acceptance-closed local archives named below
-were recorded, verified, and reproduced with 35 inputs and 210 cases identical.
-The native column of that run is 350 library, 103 public root, 1 executable, 9
-fuzz, 1 corpus, and 26 CommonMark tests. `AGENTS.md` records that evidence in
-full.
-Rerun `zig build check` for a current count; `AGENTS.md` also records that
-gate's contract. This repository's own performance baseline is the local
-record/verify/reproduce contract recorded under **Local performance baseline**
-below; it is a new baseline, not a recovery of the external packet.
+Verification counts, benchmark paths, and archive identities recorded under
+`docs/` are historical records from another host, not results for this
+checkout. They support no performance ranking and none is restated here as a
+current result. The current gate contract, the current verification state, the
+storage and cache-placement rules, and the recorded evidence for each run live
+in `AGENTS.md`; rerun `zig build check` for a current count. This repository's
+own performance baseline is the local record/verify/reproduce contract recorded
+under **Local performance baseline** below; it is a new baseline, not a
+recovery of the external packet.
 
 Grounded in: `papers/1902.08318_parsing_gigabytes_of_json_per_second.pdf`,
-`papers/2312.17149_on_demand_json.pdf`, an out-of-tree copy of simdjson's
-`ondemand_design.md` under `~/projects/github-simdjson-simdjson/doc/` that is
-not checked into this repository, simdjson `json_scanner.h` /
-`json_structural_indexer.h` / tape design, RFC 8259, and the current repo
-(`src/core/stage1.zig`, `src/core/stage2.zig`, `src/core/ondemand.zig`,
-`src/core/stream.zig`, and `src/formats/*`).
+`papers/2312.17149_on_demand_json.pdf`, simdjson's upstream On-Demand design
+note and its `json_scanner.h` / `json_structural_indexer.h` / tape design, RFC
+8259, and the current repo (`src/core/stage1.zig`, `src/core/stage2.zig`,
+`src/core/ondemand.zig`, `src/core/stream.zig`, and `src/formats/*`).
 
 ---
 
@@ -728,7 +717,7 @@ under **Implemented per-format baseline** and **General streaming reader
 boundary**. No name in this record exists in the tree — there is no
 `DocumentStreamIndexer`, no `carve`, no `error.Truncated`, no `MAX_SIMD_WINDOW`,
 `UTF8_MAX_TAIL`, or `XML_LOOKAHEAD`, and no `locs` or `arena` member. The
-shipped equivalents are `core.stream.SAFE_PAD = simd.default_vector_len + 9`,
+shipped equivalents are `core.stream.safe_pad = simd.default_vector_len + 9`,
 the index `stage1.StructuralIndex { indexes: []u32, count: usize }` grown with
 `allocator.realloc`, and a `StreamIndexer` that allocates both padded input
 slots once in `init`, whose real signature is
@@ -881,6 +870,46 @@ therefore still require independent complete input owned by the caller.
 8. The `feedFrom` reader and its backing storage are caller-owned for the
    duration of the call only; the indexer retains parser state and indexes, not
    source bytes.
+9. The current core signatures are `Vec(T, len)` and
+   `windows(T, len, fill, data)`, with comptime arguments before runtime data.
+   `core.stream.safe_pad` is the stream padding constant. Earlier signatures
+   and uppercase padding names below belong to historical design records,
+   not compatibility aliases.
+10. Matchers carry a lane-to-bit contract: `Mask(len)` bit `i` is the match
+    result for lane `v[i]`, and the explicit walk establishes that by shifting
+    each lane's 0/1 result into bit `lane`. The five public matchers —
+    `matchByte`, `matchAny2`, `matchAny4`, `matchRange`, and
+    `matchJsonWhitespace` — are `inline` and resolve their target selection at
+    comptime, so a target either uses the packed body that `@bitCast`s a
+    `Vec(bool, len)` comparison or the walk. The walk is taken only where the
+    packed body cannot hold that contract: a `.big` `builtin.cpu.arch`, and
+    `hexagon` with `len < 16`. That target query is hoisted rather than
+    re-read: `src/core/simd.zig` resolves it once at comptime into the module
+    constants `target_is_big_endian` and `target_is_hexagon`
+    (`src/core/simd.zig:227-228`), so no matcher reads `builtin.cpu.arch`
+    itself and no runtime `Arch.endian` call exists in these paths. The
+    hoisting is load-bearing rather than cosmetic, because an inlined caller
+    instantiates one width at a time and each repeat of that switch spent
+    backwards branches of the caller's shared comptime budget. Every other
+    target instantiates the packed body alone and never instantiates the
+    walks. The walks are `noinline` and take the vector directly, and both
+    properties are load-bearing: a vector-to-array coercion inside a large
+    inlined caller corrupted lanes at width 64 on `aarch64_be`, and out-of-line
+    LoongArch Debug matcher calls corrupted width-256/512 masks while direct
+    comparisons and `bitcast` in the same caller agreed. The coercion rule is
+    scoped to the matcher and leaf boundaries — the walks and the scalar oracles
+    beside them. Array-to-vector initialization, array-taking leaf helpers, and
+    array arguments elsewhere in the tree are ordinary code and are not covered
+    by it; a tree-wide ban would be wider than the defect. Verified scope for
+    that kernel on this machine is recorded in `AGENTS.md`: ReleaseSafe property
+    tests plus the original caller at widths 12, 64, and 257 from byte starts 2,
+    0, and 255, a real parser consumer at width 12, a LoongArch JSON consumer at
+    widths 16 through 512, the `hexagon` `len < 16` fallback property tests in
+    Debug and ReleaseSafe over two `src/core/simd.zig` test families only, and
+    an `aarch64-macos` compile under `--test-no-exec` with no Apple runtime
+    present. That is a statement about lane-to-bit mapping and comptime target
+    selection. It is not a statement about how raw physical object padding
+    reads, and not a claim that the expanded acceptance command passes.
 
 ## Current reference-guided API additions
 
@@ -922,6 +951,10 @@ therefore still require independent complete input owned by the caller.
   an extension of the marker-only `formats.markdown` tape. Its flat document
   owns nodes and semantic text and borrows source bytes. Parsing has explicit
   input, node, text, delimiter, bracket, reference, depth, and work limits.
+  Its text records use `u32` offsets and lengths: the effective text budget is
+  `min(options.max_text_bytes, maxInt(u32))`, established once at parser entry.
+  A larger configured budget still permits a small document; it cannot widen
+  the text-record representation.
   More than 64 prefixes on one line returns `NestingTooDeep`. Rendering bounds
   output bytes and rejects malformed traversal links. `HtmlRenderMode.safe` is
   the default: it omits raw HTML and filters dangerous URL schemes, including
@@ -957,34 +990,56 @@ archives. The external commands run uncached once on the host; a missing
 executable or nonzero exit fails acceptance. No analyzer rule is disabled.
 The external tools must already be on `PATH`; the build installs none.
 
-Cross-test uses this build's compiler and the complete version-pinned
-Tier 1/2 target matrix. It invokes `test` rather than `check` for each target,
-avoiding recursive gate execution. Its logs and summary live under
-`zig-out/cross-test/`. Unavailable runners produce explicit `build_only`
-coverage, never a test pass; the default cross-test exit policy permits that
-partial execution coverage. Full execution requires `--require-runners` and
-the corresponding installed runtimes. Earlier native/width gate passes do
-not establish a pass of this expanded acceptance command.
+`zig-gate --no-zbc` is not narrower than that list. It drops only its own
+advisory `zbc` section; its `zwanzig` section and its `cross-test` section stay
+enabled, and the build graph passes neither `--no-zwanzig` nor `--no-cross`. The
+exact `zig-gate --no-zbc` this gate requires therefore also runs strict
+`zwanzig` and the full 53-target `cross-test` internally, and `cross-test` is
+still required standalone by the build graph as well. `build.zig` pins `ZIG` to
+`b.graph.zig_exe` for both, so the aggregate gate and the standalone step use
+this build's own compiler. Its `cross-test` section fails outright when
+`./cross-test.profile.sh` is absent, so that file is a gate input. The profile
+sets `CROSS_BUILD_STEP=test`, `CROSS_JOBS=2`, and `CROSS_BUILD_JOBS=1` and
+names no `CROSS_MATRIX`, no `TARGETS`, and no compile-only override, so the
+complete compiler-pinned table and its automatic runners stay in force and the
+matrix is not narrowed. `zig-gate` does not pass `--require-runners`, so it
+judges its own `partial` and `build_only` results by the failure count alone.
+Partial execution coverage is not full execution coverage.
 
-Those external commands write scratch outside the local disks: the gate exports
-`TMPDIR` as `$scratch_dir/<user>/simd-check`, `-Dscratch_dir` defaults to the
-`/vol/tmp` root every node provides, and the directory is created only when the
-gate runs. Cross-test's per-target build cache is what makes `/tmp`
-inappropriate. `zig-gate` and `zbc` additionally write a few hundred bytes at
-their own fixed `/tmp` paths; that residue cannot be redirected and stays
-bounded. The repository's `.zig-cache` is a symlink into `/home/tmp`, so the
-project's own build cache already sits on sanctioned storage. `AGENTS.md`
-records the same storage contract.
+`cross-test.profile.sh` is listed in `build.zig.zon`'s `paths`, so it is
+packaged rather than copied by hand: an actual `zig fetch` of a local tarball
+of this tree produced a package containing that exact profile, and the probe
+residue from that fetch was removed afterwards.
+
+Cross-test uses this build's compiler and the complete version-pinned Tier 1/2
+target matrix. It invokes `test` rather than `check` for each target, avoiding
+recursive gate execution. The standalone step's logs and summary live under
+`zig-out/cross-test/`; the aggregate section inside `zig-gate` writes under the
+namespaced cache-root path recorded in `AGENTS.md`. Unavailable runners
+produce explicit
+`build_only` coverage, never a test pass; the default cross-test exit policy
+permits that partial execution coverage. Full execution requires
+`--require-runners` and the corresponding installed runtimes. Earlier
+native/width gate passes do not establish a pass of this expanded acceptance
+command.
+
+**Scratch and cross-output placement.** Where the gate's scratch goes, which
+external writes cannot be redirected, the stricter physical rule `zig-gate`
+enforces for its own scratch and caches, the `.zig-cache` symlink, the
+`has_side_effects` marking that keeps those commands uncached, the
+`GATE_CROSS_OUTPUT` prefix `build.zig` sets for the aggregate cross section, and
+the two limits that travel with it are recorded once, in `AGENTS.md` under
+**Scratch storage**. That section is the single record of the storage contract;
+nothing here restates or overrides it.
 
 ## Local performance baseline: record, verify, reproduce
 
-The external comparison packet described throughout `docs/superpowers/plans/`
-is unavailable and was not recovered: filesystem and archive searches found no
-packet source or result history, the authenticated owner-repository listing
-exposed only the private `CoffeeImpliesCode/simd`, the authenticated
-`simd-bench-corpus` API returned 404, the recorded packet commits are absent,
-and no SSH recovery host is configured. The decision is to establish a new
-local baseline, not to recreate that packet or its results.
+The external comparison packet is unavailable and was not recovered: filesystem
+and archive searches found no packet source or result history, the authenticated
+owner-repository listing exposed only the private `CoffeeImpliesCode/simd`, the
+authenticated `simd-bench-corpus` API returned 404, the recorded packet commits
+are absent, and no SSH recovery host is configured. The decision is to establish
+a new local baseline, not to recreate that packet or its results.
 
 `scripts/benchmark.zig` provides it. The runner receives
 `[runner, bench_executable_path, repository_root_path, operation, args...]`:
@@ -1081,56 +1136,33 @@ this harness measures this parser against itself, never against another
 library, so no winner, cross-library comparison, or restored packet result may
 be derived from it.
 
-**Observed recordings.** The current source reproduction baseline was recorded
-and verified on 2026-10-01 from source identity
-`fcdb7c0e7c8719fb9fd22385aecee9d3998d36317a40950e36fa55c108fb9c49`:
-`acceptance-closed-20261001` was recorded with `-Doptimize=ReleaseFast
--Dvector_len=32` at 3 samples, 3 iterations, and 4096-byte chunks and verified
-from its own bytes over 35 inputs and 210 cases;
-`acceptance-closed-reproduce-20261001` was recorded from it by `reproduce`,
-independently verified, and reported all 35 inputs and 210 cases identical; and
-`acceptance-closed-chunk256-20261001` was recorded at 256-byte chunks with 1
-sample and 3 iterations and independently verified over the same 35 inputs and
-210 cases.
-
-Two earlier families remain immutable historical evidence. From source identity
-`033b3923543f486a32d0fb00f6492e7c9911d977a6417b4d01b1092c7d740a3c`,
-`baseline-final-20261001` at 3 samples, 3 iterations, and 4096-byte chunks,
-`reproduce-final-20261001` at 3 samples with every input and case identical,
-and `chunk256-final-20261001` at 1 sample and 256-byte chunks each verified
-over 35 inputs and 210 cases. From source identity
-`76f4b3b414f208a7934aca1720f325c80b7bbf0450f1713722c7ef2bfe0a8a8d`,
-`baseline-20261001`, `reproduce-20261001`, and `chunk256-20261001` were
-recorded earlier the same day. Acceptance-closure work then edited the
-sources those archives captured, so neither family is the current source
-reproduction baseline and reproducing one from the present tree is refused
-with `IdentityMismatch`. None is overwritten or deleted. The `033b3923`
-manifests record `zig` 0.16.0, compiler executable SHA-256
-`2317bbb91798556d9d0f38aabdac23db83f0979b25f767259ae474546724087c` over
-172,641,672 bytes, target `x86_64-linux` with glibc 2.39, CPU
-`icelake_server`, ReleaseFast, and vector length 32. Each `samples[]` entry
-carries no timing; the only retained timing is each `cases[]` entry's actual
-per-sample array, an observation that is excluded from the reproduction
-comparison and is never a ranking.
-
-The archives live under the ignored `zig-out/bench-evidence/` and are
-named in `AGENTS.md`; no gate writes them. Editing any captured source changes
-the identity, so reproducing an archive from a different tree is refused.
+**Observed recordings.** The recorded archive families, the source identity each
+was captured from, the parameters it was recorded with, and the toolchain its
+manifests record are a dated run log rather than a contract, and `AGENTS.md`
+carries that log. The archives live outside version control under the ignored
+`zig-out/bench-evidence/`; no gate writes them. No recorded source capture
+matches the tree as it stands, so every family named there is a historical
+source snapshot rather than a current-tree result, and a future recording
+against the present tree needs a fresh source identity to match, of which none
+is claimed here. Editing any captured source changes that identity, so
+reproducing an archive from a different tree is refused with `IdentityMismatch` —
+the outcome the identity contract requires once a captured source has changed,
+not a fresh result measured here. None is overwritten or deleted.
 
 Observed failure paths, exercised on copies with the originals untouched:
 reusing an existing output directory fails with `PathAlreadyExists` without
 truncating it; a changed raw capture byte fails verification with
 `HashMismatch`; a manifest timing changed from 11470 to 11471 fails with
-`ManifestIncomplete`; reproducing the `76f4b3b4`-era archive from the current
-tree fails with `IdentityMismatch` before any directory is created;
+`ManifestIncomplete`; reproducing an archive whose captured source has since
+changed fails with `IdentityMismatch` before any directory is created;
 `--samples 0`, `--stream-chunk-size 7`, and an unknown flag each exit 1. The
 last control is a deliberately corrupted copy rather than a healthy archive: a
-fresh exclusive copy of `acceptance-closed-chunk256-20261001` whose
-`manifest.json` `status` member was changed to `failed` printed
-`simd-benchmark verify: ManifestFailedStatus` and exited 1. That is evidence
-about the corrupted copy and about the verifier's status check in
-`scripts/benchmark.zig`; it is not a statement about a recorded archive, and
-the recorded archive itself verifies from its own bytes.
+fresh exclusive copy of a recorded 256-byte-chunk archive whose `manifest.json`
+`status` member was changed to `failed` printed `simd-benchmark verify:
+ManifestFailedStatus` and exited 1. That is evidence about the corrupted copy
+and about the verifier's status check in `scripts/benchmark.zig`; it is not a
+statement about a recorded archive, and the recorded archive itself verifies
+from its own bytes.
 
 ## Semantic measurement: CommonMark 0.31.2 and `yaml-extended-e2b-1.2.2`
 

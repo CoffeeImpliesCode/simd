@@ -25,23 +25,41 @@ roadmap section as an implemented API.
   `Mask(N) = @Int(.unsigned, N)`, which is defined for every width from 4
   upward. Native defaults are 64 bytes with AVX-512F and AVX-512BW, 32 with
   AVX2, and 16 otherwise.
-- A logical width is not a storage width. On this checkout's Zig 0.16.0, a
-  logical `Mask` width of 5, 24, 48, 65, or 257 occupies 1, 4, 8, 16, or 48
-  storage bytes, and `@ctz` of a logical zero returns 5, 24, 48, 65, or 257. A
-  storage-zero scan must normalize to the logical value before counting
-  trailing zeros, or it advances by the backing width. No contract here
-  describes how raw physical object padding reads.
+- A logical width is not a storage width. On Zig 0.16.0, a logical `Mask` width
+  of 5, 24, 48, 65, or 257 occupies 1, 4, 8, 16, or 48 storage bytes, and
+  `@ctz` of a logical zero returns 5, 24, 48, 65, or 257. A storage-zero scan
+  must normalize to the logical value before counting trailing zeros, or it
+  advances by the backing width. No contract here describes how raw physical
+  object padding reads.
 - `StructuralIndex` uses `u32` offsets and ends with `input_len`, `input_len`,
   zero. Reject inputs that cannot fit. A test that needs an input longer than
   `u32` max must compile on 32-bit targets too, so guard it on
   `@bitSizeOf(usize) > @bitSizeOf(u32)`: on those targets the oversized length is
   unrepresentable, not merely rejected.
-- The byte kernels are little-endian only, and this is a known defect rather
-  than a documented limitation. On `s390x-linux`, `powerpc64-linux`, and
-  `aarch64_be-linux` the tree builds and 463 tests run, but the structural
-  indexer returns different widths than on little-endian targets, so the corpus,
-  Stage 2, cursor, and on-demand tests all fail there. Treat a big-endian
-  divergence as a bug to fix, never as an accepted difference.
+- Matcher lane-to-bit contract: `Mask(len)` bit `i` carries the match result
+  for lane `v[i]`, and the explicit walk establishes that by shifting each
+  lane's 0/1 result into bit `lane`. The five public matchers — `matchByte`,
+  `matchAny2`, `matchAny4`, `matchRange`, and `matchJsonWhitespace` — are
+  `inline` and resolve that choice at comptime: the walk is taken only where
+  `builtin.cpu.arch.endian() == .big`, or on `hexagon` with `len < 16`. That
+  query is hoisted, not re-read: `src/core/simd.zig` resolves it once at
+  comptime into the module constants `target_is_big_endian` and
+  `target_is_hexagon` (`src/core/simd.zig:227-228`), so no matcher reads
+  `builtin.cpu.arch` itself and no runtime `Arch.endian` call exists in these
+  paths. Hoisting is load-bearing rather than cosmetic — an inlined caller
+  instantiates one width at a time, and each repeat of that switch spent
+  backwards branches of the caller's shared comptime budget. Every other
+  target instantiates the packed body alone and never instantiates the walks.
+  The walks are `noinline` and take the vector directly. Keep the public
+  matchers `inline`, and forbid vector-to-array coercions **at the matcher and
+  leaf boundaries** — the walks and the scalar oracles beside them, where a
+  conversion inside a large inlined caller corrupted lanes at width 64 on
+  `aarch64_be`. That rule is deliberately local: array-to-vector
+  initialization (`const v: Vec(T, n) = bytes;`), the array-taking leaf
+  helpers, and array arguments elsewhere in the tree are ordinary and must
+  not be swept up into a tree-wide ban. The scope actually verified for this
+  kernel is under **Evidence**; treat any new big-endian divergence as a bug
+  to fix, never as an accepted difference.
 - Preserve each format's quote, comment, framing, and token rules. Similar
   JSON-family APIs do not imply shared dialect rules.
 - A Stage 2 document owns its tape but borrows source bytes. Keep source and
@@ -169,13 +187,16 @@ step:
   narrow widths that no native CPU selects, and the native widths. A width
   below 4 must fail, not silently fall back.
 - `zig-gate --no-zbc`: the external aggregate build, test, AST, and lint gate.
+  `ZIG` is pinned to this build's own `b.graph.zig_exe` here too, so the
+  aggregate gate and the standalone `cross-test` step use one compiler.
 - `zbc --no-color` over every owned `.zig` source, as a separate required
   command rather than zig-gate's advisory borrow-checker invocation.
 - `zwanzig --threads 2` over the same owned `.zig` sources, with its default
   rules and no disabled checks.
-- `cross-test --jobs 2 --build-jobs 1`, using the compiler selected by this
-  build and its full version-pinned Tier 1/2 target matrix. It runs `test`,
-  not `check`, in each target build, so the gate does not recurse.
+- `cross-test --jobs 2 --build-jobs 1`, with `ZIG` pinned to this build's own
+  `b.graph.zig_exe` so the gate cannot switch toolchains, over its full
+  version-pinned Tier 1/2 target matrix. It runs `test`, not `check`, in each
+  target build, so the gate does not recurse.
 
 All four external commands run on every gate invocation; their results are
 not cached. Missing executables and nonzero exits fail the gate. Analyzer
@@ -183,31 +204,98 @@ findings and incompatible analyzer frontends must not be suppressed merely
 to obtain a green run. The tools must be available on `PATH`; the gate does
 not install them. They run once on the host, not once per SIMD width.
 
-Cross-test retains logs and `cross-test-summary.json` under
-`zig-out/cross-test/`. Missing foreign runtimes are reported as `build_only`,
-not as executed test passes. Its default exit policy permits explicit partial
-execution coverage; only `cross-test --require-runners` requires every target
-to execute. Do not describe a successful default cross-test run as full
-execution coverage.
+`zig-gate --no-zbc` is not narrower than that list. It drops only its own
+advisory `zbc` section; its `zwanzig` section and its `cross-test` section stay
+enabled, and the build graph passes neither `--no-zwanzig` nor `--no-cross`. So
+the exact `zig-gate --no-zbc` required above also runs strict `zwanzig` and the
+full 53-target `cross-test` internally, and `cross-test` is still required
+standalone by this gate as well. Its `cross-test` section fails outright when
+`./cross-test.profile.sh` is absent, so that file is a gate input. The profile
+sets `CROSS_BUILD_STEP=test`, `CROSS_JOBS=2`, and `CROSS_BUILD_JOBS=1`, and
+names no `CROSS_MATRIX`, no `TARGETS`, and no compile-only override, so the
+complete compiler-pinned table and its automatic runners stay in force and the
+matrix is not narrowed. `zig-gate` does not pass `--require-runners`, so its
+own `partial` and `build_only` results are judged by the failure count alone.
+
+`cross-test.profile.sh` is listed in `build.zig.zon`'s `paths`, so it is
+packaged with the tree rather than copied by hand.
+
+The standalone `cross-test` step retains its logs and `cross-test-summary.json`
+under `zig-out/cross-test/`; the aggregate section inside `zig-gate` writes
+under the namespaced cache-root path described under **Scratch storage**.
+Missing foreign runtimes are reported as `build_only`, not as executed test
+passes. Its default exit policy permits explicit partial execution coverage;
+only `cross-test --require-runners` requires every target to execute. Do not
+describe a successful default cross-test run as full execution coverage.
 
 ## Scratch storage
 
-`/tmp` and `/var/tmp` are small local disks on the compute nodes and must not
-absorb scratch or build caches. The sanctioned roots are `/vol/tmp` and
-`/vol/tmp2` on every node, and `/home/tmp` or `/home/tmp2` on the nodes that
-provide them; check with `lsblk` and `df -hT` rather than assuming. Check which
-roots a node has and how much space remains before putting anything large there.
+The gate writes its scratch to `$TMPDIR/<user>/simd-check` and hands that
+directory to the gate subprocesses as their own `TMPDIR`. The root of that path
+defaults to the temporary directory the environment already names and falls
+back to `/tmp` where it names none, so a host that redirects `TMPDIR` places
+gate scratch there without a repository change. `-Dscratch_dir` overrides the
+root, not the per-user subdirectory below it. The directory is created by a gate
+step rather than at configure time, so an ordinary `zig build` still touches no
+shared disk.
 
-The gate writes its scratch to `$TMPDIR/<user>/simd-check` under `-Dscratch_dir`,
-which defaults to `/vol/tmp`, and creates that directory only when the gate
-runs. An ordinary `zig build` still touches no shared disk. Cross-test keeps its
-per-target build cache there, which is what makes it too large for `/tmp`.
-`zig-gate` and `zbc` still write a few hundred bytes at their own hardcoded
-`/tmp` paths; that residue is not redirectable and is bounded.
+Gate scratch is not small: cross-test keeps a per-target build cache there, and
+the analyzers keep multi-hundred-megabyte build caches per target, so a host
+whose temporary directory cannot hold them points `-Dscratch_dir` at a larger
+root. Check what that root is and how much space is free before putting anything
+large there, rather than assuming. `zig-gate` and `zbc` still write a few
+hundred bytes at their own hardcoded `/tmp` paths; that residue is not
+redirectable and is bounded.
 
-This checkout's `.zig-cache` is a symlink into `/home/tmp`, so the repository's
-own build cache already follows the policy. It is regenerable: delete its
-contents, never the symlink or its directory.
+The `mkdir -p` that creates that scratch directory is marked
+`has_side_effects`, as are the four external commands, so the build graph runs
+them every time instead of caching a result for them.
+
+`zig-gate` holds its own scratch and caches to a stricter, *physical* rule,
+which is the host tool's own policy rather than an infrastructure change this
+repository makes. When it selects a scratch root automatically it enforces the
+full rule itself: the directory must be owned, writable, not a symlink, and
+carry at least 1 GiB free. An explicit `GATE_SCRATCH` override is a different
+check — only that the resolved path is on an approved physical volume, after
+which the gate creates it; the automatic
+ownership, writability, symlink, and free-space selection is not re-run over
+an explicit override. The NFS exports are refused either way, because every
+directory that gate writes is a Zig cache or is read back by one, a Zig cache
+needs `renameat2()`, and an NFS mount rejects it with `EINVAL`. Its cache
+defaults follow `$ZIG_LOCAL_CACHE_DIR` and `$ZIG_GLOBAL_CACHE_DIR`, and an
+ambient `TMPDIR` pointing outside an approved physical volume is corrected with
+a notice rather than silently used. No repository change makes the `TMPDIR`
+this gate exports and `zig-gate`'s approved-volume rule agree.
+
+A `.zig-cache` in a checkout can be a symlink to a shared cache outside the work
+tree, so treat the link itself as part of the setup: its contents are
+regenerable, while the symlink and the directory it points to are not. Delete
+the contents, never the symlink or its directory.
+
+**Cross-output namespacing, and what it is not.** `zig-gate` derives its
+cross-test output from `GATE_SCRATCH`, which the host policy above selects per
+user and not per project, so its default prefix is one directory shared by
+every project that same user gates; cross-test takes an exclusive lock there
+and refuses to start rather than share it, which is how two unrelated
+checkouts fail each other during setup instead of running. `build.zig` now
+sets `GATE_CROSS_OUTPUT` for the aggregate section to
+`<this build's local cache directory>/zig-gate-cross/<project-root basename>-<first
+8 SHA-256 bytes of the resolved project root, rendered as 16 hex digits>`,
+resolved against that cache directory's working directory. The standalone
+`cross-test` step keeps cross-test's own default under `zig-out/cross-test/`,
+so the two full 53-target runs remain separate steps writing separate trees
+rather than contending for one prefix. Both stay uncached, both stay pinned to
+this build's own compiler, and no lock was removed and no check was disabled
+to get there.
+
+Two limits travel with that contract. Logs under the cache root are real
+diagnostic evidence: they are where a run's own output was captured and read to
+classify that run. What they do not have is durability. They are volatile cache
+contents, so a cache cleanup may remove them at any time, a missing log proves
+nothing, and no claim here depends on one surviving. And the 16-hex-digit
+suffix is a disambiguator, not a collision guarantee: it is a truncated SHA-256
+prefix, which keeps two checkouts apart in practice and does not prove that two
+distinct roots can never share one.
 
 The matrix is a representative sample, not a proof about every width.
 `Mask(N) = @Int(.unsigned, N)` is what makes every width from 4 upward a
@@ -222,9 +310,9 @@ benchmark` and `zig build benchmark-semantic` write one.
 
 ## Repository layout notes
 
-The checkout's `.zig-cache` is a symlink to a shared cache outside the work
-tree. `.gitignore` must list `.zig-cache` without a trailing slash, because a
-trailing slash matches a directory only and would not match that symlink.
+`.zig-cache` can be a symlink to a cache outside the work tree. `.gitignore` must
+list `.zig-cache` without a trailing slash, because a trailing slash matches a
+directory only and would not match that symlink.
 
 `zig build check` is not side-effect free with respect to scratch storage: it
 creates the scratch directory above and the four external commands write into
@@ -232,101 +320,85 @@ it. It still touches no benchmark archive.
 
 ## Evidence
 
-Counts and timings under `docs/superpowers/plans/` are historical records from a
-different host. `382/382`, `482/482`, the AVX2-host native width of 32, and
-every `~/...` path describe that run, not this machine. Do not
-restate them as current results, and do not derive a ranking from them.
+This section states what has been verified and what is not claimed. It keeps no
+run log: no pass counts, no run identifiers, no host, CPU, or toolchain
+identity, and no recorded archive identity. What follows is either a durable
+contract or a deliberately scoped claim. Rerun `zig build check` for a current
+result, and do not restate any of it as a fresh observation.
 
-The passing gate observations below predate the external-tool expansion.
-They do not establish that the expanded gate passes.
+**Scope actually verified for the matcher kernel.** This is a focused scope,
+not a gate: the matcher property tests, the original caller at widths 12, 64,
+and 257 from byte starts 2, 0, and 255, and a real parser consumer at width 12
+all pass in ReleaseSafe on `aarch64_be-linux`, `powerpc64-linux`, and
+`s390x-linux`; a sparse and dense JSON consumer passes at widths 16, 32, 64,
+128, 256, and 512 on LoongArch through the real parser; the `hexagon`
+`len < 16` fallback property tests pass in Debug and ReleaseSafe; and the
+`aarch64-macos` library root compiles under `--test-no-exec`, with no Apple
+runtime executed and no Apple runtime result claimed. This records how lanes
+map to bits and how target selection is made. It is not a claim about how raw
+physical object padding reads, it is not an ABI mechanism, and it establishes
+no pass of the expanded gate.
 
-This checkout has its own observation, recorded on 2026-10-01 on the host that
-has AVX-512F and AVX-512BW, so its native width is 64:
+The `hexagon` proof covers exactly two `src/core/simd.zig` test families, and
+those two are the entire claim. Those focused property-test invocations did not
+run `test/checking.zig` and did not run the root boundary tests, so they are
+evidence about neither of them:
 
-- `zig build check -j2 --summary all` passed: 128 of 128 build steps and 4445
-  of 4445 tests, including the `[4, 5, 7, 12, 16, 24, 32, 64]` matrix over all
-  six test roots, the native roots, the offline corpora, the pinned CommonMark
-  suite, `zig fmt --check`, the visualizer smoke, and 35 benchmark-script
-  tests run once on the host. The native column is 350 library, 103 public
-  root, 1 executable, 9 fuzz, 1 corpus, and 26 CommonMark tests. This is the
-  actual current run, not the historical `382/382` or `482/482` counts.
-- A fresh `zig-out/bin/simd` visualizer run printed its banner and five chunks.
-- Six Markdown consumer binaries, Debug, ReleaseSafe, and ReleaseFast crossed
-  with the default width 64 and the explicit width 5, checked exact marker
-  offsets, kinds, and sentinels at widths 4, 5, 7, 12, 16, 24, 48, 65, and 72,
-  and streamed the same document at widths 5 and 64 with chunks of 1, 7, 31,
-  and 73 bytes. That source carries 312 letters and a CRLF prefix before the
-  markers, so the widths above 64 execute full windows rather than only a
-  tail.
-- A local benchmark baseline was recorded, verified, and reproduced on
-  2026-10-01 from source identity
-  `033b3923543f486a32d0fb00f6492e7c9911d977a6417b4d01b1092c7d740a3c`:
-  `baseline-final-20261001` at 3 samples, `reproduce-final-20261001` at 3
-  samples with all 35 inputs and 210 cases reported identical, and
-  `chunk256-final-20261001` at 1 sample, each over 35 inputs and 210 cases.
-  Acceptance-closure work then edited the sources those archives captured, so
-  they are historical snapshots now; reproducing one from the present tree is
-  refused with `IdentityMismatch`, and none is overwritten or deleted. Their
-  manifest records `zig` 0.16.0, compiler executable SHA-256
-  `2317bbb91798556d9d0f38aabdac23db83f0979b25f767259ae474546724087c` over
-  172,641,672 bytes, target `x86_64-linux` with glibc 2.39, CPU
-  `icelake_server`, ReleaseFast, and an explicit vector length of 32. Each
-  sample entry carries no timing of its own; each case carries its actual
-  per-sample timing array, which is an observation excluded from the
-  reproduction comparison.
+- `comparison masks extract only matching vector lanes` at widths 4, 5, 7, 12,
+  16, 24, 32, 48, 64, 65, and 257 — every matching lane at each width, every
+  candidate position for `matchAny2`/`matchAny4`, the two-matching-lane case,
+  and `extractBitIndexes` over a combined punctuation mask.
+- `matchJsonWhitespace agrees with scalar classification for every byte` at
+  widths 4, 5, 7, 12, 16, 24, 32, 48, 64, 129, and 257 — all 256 byte starts,
+  and every lane at each start, against a kept-out-of-line scalar oracle.
 
-These are this machine's observations, not portable guarantees and not a
-performance ranking. Rerun `zig build check` for a current count.
-None of these observations compares this parser against another library or
-ranks anything.
+The two width lists differ on purpose: the comparison family takes 65 and the
+whitespace family takes 129. Quote each list from its own family, because one
+merged list is not what either test contains.
 
-The original external comparison packet is unavailable and was not recovered:
-filesystem and archive searches found no packet source or result history, the
-authenticated owner-repository listing exposed only the private
-`CoffeeImpliesCode/simd`, the authenticated `simd-bench-corpus` API returned
-404, the recorded packet commits are absent, and no SSH recovery host is
-configured. The decision is a new local baseline, not a recreated packet.
+The original-caller evidence quoted above — widths 12, 64, and 257 from byte
+starts 2, 0, and 255 — is a separate measurement of a separate caller and is
+not part of either family.
 
-The current source reproduction baseline lives under the ignored
-`zig-out/bench-evidence/`, recorded on 2026-10-01 from source identity
-`fcdb7c0e7c8719fb9fd22385aecee9d3998d36317a40950e36fa55c108fb9c49`:
+**No green expanded-gate result is claimed.** No pass of the expanded gate is
+claimed anywhere in this document, and no scope above is one. The gate stays
+strict until every analyzer finding it reports is resolved: no analyzer rule is
+disabled, no finding is suppressed, and no narrower target list, width list, or
+check stands in for one that would have to pass. Nothing is committed while the
+expanded gate is red, and no push is authorized.
 
-- `acceptance-closed-20261001`: recorded with `-Doptimize=ReleaseFast
-  -Dvector_len=32`, 3 samples, 3 iterations, and 4096-byte chunks. It verifies
-  from its own bytes: 35 inputs, 210 cases.
-- `acceptance-closed-reproduce-20261001`: produced by `reproduce` from that
-  archive, and independently verified: 3 samples, 35 inputs, 210 cases, every
-  input and case identical.
-- `acceptance-closed-chunk256-20261001`: recorded with 256-byte stream chunks,
-  1 sample, and 3 iterations, and independently verified: 35 inputs, 210 cases.
+`zbc` classifies the `Lease` nested in `Guard.lease` as an owning field —
+`owned-field-no-outer-cleanup` at `resident.zig:73` — and asks for a
+`Guard.deinit` forwarding to a `deinit` or `close` on the lease, while `Lease`
+in fact exposes `check`, `release`, and `claim` (`src/core/resident.zig:43-70`)
+and `Guard` stores it by value (`src/core/resident.zig:72-73`). That is a model
+gap rather than a runtime defect, and it is unresolved. `Guard` borrows a
+generation and focus token and must **not** be released when it goes out of
+scope — an automatic release would invalidate the active document — so the fix
+is not to add a release, a `deinit`, a clamp, a recheck, or a duplicated
+counter. Remediate the finding itself: a disabled rule and a suppressed report
+are not a fix, and this repository does not claim that work is done.
 
-The work domain behind all three is unchanged: 7 formats x 5 workloads x 6
-stages is 35 inputs and 210 cases, with no `formats.commonmark` row and no
-`yaml-extended-e2b-1.2.2` row.
+An analyzer inventory is that analyzer's own unwrap, unused, and style rules
+over fixtures and aliases. It is not evidence of a runtime fault, and it is not
+evidence that no runtime defect exists anywhere in the tree; that claim is not
+made and must not be read into an inventory. The runtime invariants these paths
+do exercise are covered by the tests the gate runs.
 
-`baseline-final-20261001`, `reproduce-final-20261001`, and
-`chunk256-final-20261001` are the earlier `033b3923` family described above.
-They remain immutable historical observations, they are not the current source
-reproduction baseline, and none is overwritten or deleted. So do
-`baseline-20261001`, `reproduce-20261001`, and `chunk256-20261001`, recorded
-earlier the same day from the tree whose source identity was
-`76f4b3b414f208a7934aca1720f325c80b7bbf0450f1713722c7ef2bfe0a8a8d`; the
-sources they captured have been edited since, so reproducing one of them now is
-refused with `IdentityMismatch`.
+Recorded benchmark archives are historical source snapshots. An archive names
+the sources it captured, so a later edit to any captured source makes
+`reproduce` report `IdentityMismatch` instead of a false match — the outcome the
+identity contract requires once a captured source has changed. Archives live
+outside version control on purpose, `zig build` and `zig build check` never
+write them, and only `zig build benchmark` does.
 
-They live outside version control on purpose, and an archive names the sources
-it captured, so a later edit to any captured source makes `reproduce` report
-`IdentityMismatch` instead of a false match. `zig build` and `zig build check`
-never write them; only `zig build benchmark` does.
-
-The failure paths were observed on this machine, on copies of recorded archives
-with the originals left untouched: reusing an existing output
-directory fails with `PathAlreadyExists` and does not truncate it; reproducing
-the `76f4b3b4`-era archive from the current tree fails with `IdentityMismatch`
-before creating any directory; a copy whose first raw capture byte was changed
-fails verification with `HashMismatch`; a copy whose manifest timing for case 0
-was changed from 11470 to 11471 fails with `ManifestIncomplete`; and
-`--samples 0`, `--stream-chunk-size 7`, and an unknown flag each exit 1.
+The failure paths of that runner are contract, not anecdote: reusing an
+existing output directory fails with `PathAlreadyExists` and does not truncate
+it; reproducing an archive whose captured sources have since changed fails with
+`IdentityMismatch` before creating any directory; an archive whose first raw
+capture byte was altered fails verification with `HashMismatch`; an archive
+whose manifest timing for a case was altered fails with `ManifestIncomplete`;
+and `--samples 0`, `--stream-chunk-size 7`, and an unknown flag each exit 1.
 
 `scripts/benchmark.zig` owns that baseline:
 
@@ -384,7 +456,7 @@ marker-kind projection, YAML rows are `yaml-basic-1.2.2`, and the resident
 
 Exact match is the reproducibility claim. A recording's timings are retained
 as observations, not a ranking: nothing here compares against another library,
-declares a winner, or restores the historical packet's results.
+declares a winner, or reproduces a result measured on a past tree.
 
 ## Semantic measurement
 
