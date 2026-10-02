@@ -32,21 +32,50 @@ const fmt_paths = [_][]const u8{
     "string_bench.zig",
 };
 
-/// Default root for scratch that gate subprocesses write.
+/// Root that gate scratch falls back to when nothing else names one.
 ///
-/// `/tmp` and `/var/tmp` are small local disks on the compute nodes and must not
-/// absorb bulk scratch; `/vol/tmp` is the sanctioned root present on every node.
-/// `-Dscratch_dir` overrides the root, not the per-user subdirectory below it.
-const gate_scratch_root = "/vol/tmp";
+/// The default is the temporary directory the environment already names, so a
+/// host that redirects `TMPDIR` places gate scratch there without a repository
+/// change, and `/tmp` is the fallback where it names none. `-Dscratch_dir`
+/// overrides the root, not the per-user subdirectory below it.
+const gate_scratch_root = "/tmp";
+
+/// Root that gate scratch defaults to when `-Dscratch_dir` names none.
+fn gateScratchDefault(b: *std.Build) []const u8 {
+    return b.graph.environ_map.get("TMPDIR") orelse gate_scratch_root;
+}
 
 /// Absolute scratch directory handed to gate subprocesses as `TMPDIR`.
 ///
-/// The per-user and per-project components keep concurrent checkouts on shared
-/// storage from colliding. The directory is created by a gate step rather than
-/// at configure time, so an ordinary `zig build` still touches no shared disk.
+/// The per-user component keeps concurrent users on shared storage from
+/// colliding. The directory is created by a gate step rather than at configure
+/// time, so an ordinary `zig build` still touches no shared disk.
 fn gateScratchDir(b: *std.Build, scratch_root: []const u8) []const u8 {
     const user = b.graph.environ_map.get("USER") orelse "shared";
     return b.pathJoin(&.{ scratch_root, user, "simd-check" });
+}
+
+/// Directory the aggregate gate's own cross-test run writes its evidence to.
+///
+/// zig-gate's `GATE_CROSS_OUTPUT` defaults to `$GATE_SCRATCH/zig-gate-cross`,
+/// and the host policy picks `GATE_SCRATCH` per user, not per project, so
+/// unrelated checkouts share one prefix and its exclusive `.cross-test.lock`
+/// makes one refuse to start. This build derives the path from this build's
+/// local cache and the absolute project root instead; zig-gate checks the
+/// resolved volume when the step runs, and cross-test creates the directory
+/// then rather than at configure time. Cache cleanup can remove its logs.
+fn gateCrossOutputDir(b: *std.Build) []const u8 {
+    const cache_root = b.cache_root.path orelse @panic(
+        "zig build supplied no local cache directory, so no approved cross output can be derived",
+    );
+    const project_root = b.pathResolve(&.{ b.graph.cache.cwd, b.build_root.path orelse "." });
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(project_root, &digest, .{});
+    // Eight digest bytes render as sixteen lowercase hex digits: enough to keep
+    // a project's namespace compact, not a guarantee that two projects cannot
+    // land on the same one. A truncated hash still collides.
+    const namespace = b.fmt("{s}-{x}", .{ std.fs.path.basename(project_root), digest[0..8] });
+    return b.pathResolve(&.{ b.graph.cache.cwd, cache_root, "zig-gate-cross", namespace });
 }
 
 /// The analyzers accept files, not the format check's mixed file/directory list.
@@ -683,15 +712,17 @@ pub fn build(b: *std.Build) void {
 
     // External checks are required, uncached commands. Keep zbc separate from
     // zig-gate's advisory invocation so its nonzero exit always fails check.
-    // Their scratch goes to the sanctioned root: the analyzers keep multi-
-    // hundred-megabyte build caches per target, and /tmp cannot hold them.
+    // Their scratch is large — the analyzers keep multi-hundred-megabyte build
+    // caches per target — so `-Dscratch_dir` is how a host whose temporary
+    // directory cannot hold them redirects it.
     const scratch_root = b.option(
         []const u8,
         "scratch_dir",
         "Root directory for gate scratch files",
-    ) orelse gate_scratch_root;
+    ) orelse gateScratchDefault(b);
     const scratch_dir = gateScratchDir(b, scratch_root);
     const scratch_make = b.addSystemCommand(&.{ "mkdir", "-p", scratch_dir });
+    scratch_make.has_side_effects = true;
 
     const zig_gate = b.addSystemCommand(&.{ "zig-gate", "--no-zbc" });
     const zbc = b.addSystemCommand(&.{ "zbc", "--no-color" });
@@ -705,7 +736,14 @@ pub fn build(b: *std.Build) void {
     }
     addAnalysisSources(b, zbc, zwanzig);
     // Use the compiler that owns this build, not a different PATH selection.
+    zig_gate.setEnvironmentVariable("ZIG", b.graph.zig_exe);
     cross_test.setEnvironmentVariable("ZIG", b.graph.zig_exe);
+    // Section 9 of zig-gate runs this repository's full cross-test matrix
+    // under its own prefix, which is this build's to name. The standalone
+    // `cross_test` step above keeps cross-test's own default of
+    // `zig-out/cross-test`, so the two full runs write separate trees and
+    // stay independent steps rather than being serialized behind one prefix.
+    zig_gate.setEnvironmentVariable("GATE_CROSS_OUTPUT", gateCrossOutputDir(b));
 
     const check_step = b.step(
         "check",
