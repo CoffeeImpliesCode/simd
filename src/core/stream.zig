@@ -1,3 +1,11 @@
+//! Incremental structural indexing for JSON, JSONC, JSON5 and strict JSONL.
+//!
+//! Use `StreamIndexer.init`, `feed` or `feedFrom`, `finish`, then `take`.
+//! Release the transferred index with the construction allocator and deinitialize
+//! the indexer separately. Input chunks are copied and need not survive a feed.
+//! This module validates neither grammar nor UTF-8 and retains no complete source:
+//! Stage 2 needs the caller's complete immutable input independently of this index.
+
 const std = @import("std");
 const stage1 = @import("stage1.zig");
 const simd = @import("simd.zig");
@@ -17,66 +25,105 @@ comptime {
     assert(safe_pad > simd.default_vector_len);
 }
 
+/// Lexical rules for one document. JSONL framing is selected separately by `Mode`.
 pub const Dialect = enum {
     json,
     jsonc,
     json5,
 };
 
+/// Framing of the indexed input, not a Stage 2 grammar or traversal mode.
 pub const Mode = enum {
+    /// Default: index one JSON-family document without treating LF as a record boundary.
     document,
+    /// Strict JSON records separated by LF; requires `Options.dialect == .json`.
     jsonl,
 };
 
+/// Required dialect and framing for one indexer; no mixed JSONC/JSON5 JSONL profile.
 pub const Options = struct {
+    /// Quote, atom and comment rules. Required because the input determines the dialect.
     dialect: Dialect,
+    /// Defaults to one document. Select `.jsonl` only with `.json`, otherwise
+    /// `StreamIndexer.init` returns `error.InvalidOptions` before allocating.
     mode: Mode = .document,
 };
 
+/// The same lexical comment state as `json_lexical.CommentState`; its owner
+/// documents each state and transition. This alias adds no ownership or checks.
 pub const CommentState = lexical.CommentState;
+/// The complete `json_lexical.State` carried by `StreamIndexer.carry`.
+/// Its owner documents the fields, copied scan position and contiguity rule;
+/// callers must not mutate this state independently of the indexer.
 pub const CarryState = lexical.State;
-/// Incrementally builds a JSON-family StructuralIndex. Input bytes are copied
-/// through two fixed, padded slots allocated by init; feed never allocates or
-/// replaces that input buffer.
+/// Single owner of two padded input slots and, until `take`, one structural index.
+///
+/// Construct with `init`; call `deinit` exactly once with no simultaneous operation.
+/// Copies alias allocations and are not independent owners. The stored allocator's
+/// identity and backing state must survive cleanup; do not replace it while live.
+/// No stable address is needed if no pointer to this value is retained by a caller.
+/// All fields are reachable, but changing allocation, counters or lexical state
+/// outside these methods violates the indexer's invariants. Mutating use is exclusive.
 pub const StreamIndexer = struct {
+    /// Construction allocator, borrowed through `deinit` and transferred index disposal.
     allocator: std.mem.Allocator,
+    /// Immutable lexical/framing selection for the current indexer.
     options: Options,
+    /// Owned slots, invalid after `deinit`; input must not alias this storage.
     buffer: []u8,
+    /// Usable bytes in each slot, rounded up to a multiple of the configured SIMD width.
     slot_len: usize,
+    /// Bytes between slot starts, including `safe_pad`.
     slot_stride: usize,
+    /// Current slot number, 0 or 1.
     active_slot: usize = 0,
+    /// Unprocessed bytes in the current slot.
     fill: usize = 0,
+    /// Source bytes already indexed; offsets are absolute from this document's start.
     processed_len: usize = 0,
+    /// Total accepted source bytes, at most `maxInt(u32)`.
     input_len: usize = 0,
+    /// Scanner state across chunks, reset by `reset`.
     carry: lexical.State = .{},
+    /// Owned unfinished/finalized index; `null` after ownership transfers through `take`.
     index: ?stage1.StructuralIndex,
+    /// True after successful `finish`; `feed` then returns `error.AlreadyFinished`.
     finished: bool = false,
 
     const Self = StreamIndexer;
 
-    pub const InitError = stage1.StructuralIndex.InitError;
+    /// Initialization failures; no allocation escapes an error return.
+    pub const InitError = stage1.StructuralIndex.InitError || error{InvalidOptions};
+    /// Feed failures; size/reservation errors leave the previously accepted input intact.
     pub const FeedError = std.mem.Allocator.Error || error{
         AlreadyFinished,
         CapacityExceeded,
         CapacityOverflow,
         InputTooLarge,
     };
+    /// Finalization failures; no index transfers before a successful `take`.
     pub const FinishError = std.mem.Allocator.Error || error{
         CapacityExceeded,
         CapacityOverflow,
         InputTooLarge,
     };
+    /// Feed/finalization failures plus the supplied Reader's `error.ReadFailed`.
     pub const FeedFromError = FeedError ||
         FinishError ||
         std.Io.Reader.ShortError;
 
-    /// Allocates both padded input slots and the initial structural storage.
-    /// chunk_len is rounded up so every non-final processed slot is SIMD-wide.
+    /// Allocates both padded slots and initial structural storage, owned by the result.
+    /// `chunk_len` is a requested byte count: zero and smaller widths become one
+    /// SIMD block, larger values round up. Arithmetic overflow is `error.CapacityOverflow`.
+    /// Mixed JSONL/comment dialects fail with `error.InvalidOptions` before allocation.
+    /// On every error all allocations made here are released; no input is retained.
     pub fn init(
         allocator: std.mem.Allocator,
         chunk_len: usize,
         options: Options,
     ) InitError!StreamIndexer {
+        if (options.mode == .jsonl and options.dialect != .json) return error.InvalidOptions;
+
         const requested_len = @max(chunk_len, simd.default_vector_len);
         const rounded_len = std.math.add(
             usize,
@@ -114,6 +161,8 @@ pub const StreamIndexer = struct {
         };
     }
 
+    /// Releases owned slots and any untaken index exactly once. A taken index remains
+    /// the caller's responsibility. The indexer is unusable afterward, including copies.
     pub fn deinit(self: *Self) void {
         if (self.index) |*index| {
             index.deinit(self.allocator);
@@ -122,8 +171,15 @@ pub const StreamIndexer = struct {
         self.* = undefined;
     }
 
-    /// Adds bytes to the current document. Offsets emitted during this call are
-    /// absolute offsets from the first byte supplied after init or reset.
+    /// Copies `data` into this document and emits absolute offsets from its first byte.
+    /// `data` is borrowed only during the call and must not overlap the owned slots.
+    /// After `finish`, returns `error.AlreadyFinished` without accepting data.
+    /// Size/reservation failures accept no bytes and preserve prior logical state.
+    /// A later `error.CapacityExceeded` can leave copied slots, emitted offsets
+    /// and advanced scanner state, while `input_len` already counts all of `data`,
+    /// including any uncopied tail. No index transfers. Discard the partial
+    /// document with `reset`, or release the indexer with `deinit`; do not retry
+    /// the same chunk or finalize that partial state.
     pub fn feed(self: *Self, data: []const u8) FeedError!void {
         if (self.finished) return error.AlreadyFinished;
 
@@ -159,8 +215,14 @@ pub const StreamIndexer = struct {
 
         assert(self.processed_len + self.fill == self.input_len);
     }
-    /// Drains an optional Reader adapter into feed and finishes at EOF. Reader
-    /// bytes are borrowed only for each feed call and are never retained.
+    /// Consumes the supplied Reader until EOF, then calls `finish`.
+    /// The Reader and its backing provider must stay live during this call; neither
+    /// is retained. Reading may block. Provider failures, including cancellation
+    /// reported by a provider, arrive as `error.ReadFailed`; inspect that provider
+    /// for its cause. This method does not return `error.Canceled` directly.
+    /// On error, earlier successful feeds remain accepted and their bytes consumed;
+    /// the current Reader bytes are not tossed if their feed fails. Reset to discard
+    /// partial indexing. Success still requires `take` and separate owner disposal.
     pub fn feedFrom(
         self: *Self,
         reader: *std.Io.Reader,
@@ -180,8 +242,11 @@ pub const StreamIndexer = struct {
         }
     }
 
-    /// Flushes the final partial slot and writes the StructuralIndex sentinels.
-    /// Repeated calls are harmless and do not duplicate output.
+    /// Flushes buffered input and appends sentinels; success enables one `take`.
+    /// Repeated successful calls are harmless. Allocation/size failures during
+    /// reservation preserve logical state and may be retried; for any later
+    /// scanner/capacity failure use `reset` or `deinit`, not a retry of this document.
+    /// No source or index transfers on error, and this performs no grammar validation.
     pub fn finish(self: *Self) FinishError!void {
         if (self.finished) return;
 
@@ -198,8 +263,11 @@ pub const StreamIndexer = struct {
         self.finished = true;
     }
 
-    /// Returns the finalized index without copying. The caller owns the result
-    /// and must deinitialize it with the allocator passed to init.
+    /// Transfers the finalized index without copying; dispose it with the construction
+    /// allocator. Requires successful `finish` and no previous `take` since `reset`.
+    /// Violating either precondition is diagnosed by assertions in Debug/ReleaseSafe
+    /// and is unchecked illegal behavior in ReleaseFast/ReleaseSmall.
+    /// This index owns offsets, not the bytes needed by a Stage 2 consumer.
     pub fn take(self: *Self) stage1.StructuralIndex {
         assert(self.finished);
         assert(self.index != null);
@@ -209,8 +277,10 @@ pub const StreamIndexer = struct {
         return result;
     }
 
-    /// Starts a new document. Structural and input-buffer allocations are
-    /// retained unless ownership of the structural index was moved by take.
+    /// Discards the current logical document, including a failed one. Retains owned
+    /// allocations; after `take`, the next feed/finalization allocates a new index.
+    /// A previously transferred index remains independent and is not released here.
+    /// Offsets restart at zero. Borrowed views of untaken index contents lose validity.
     pub fn reset(self: *Self) void {
         if (self.index) |*index| {
             index.count = 0;
@@ -718,4 +788,15 @@ test "JSON stream take transfers ownership and reset starts at offset zero" {
 
     try expectIndexEqual(&expected_first, &first);
     try expectIndexEqual(&expected_second, &second);
+}
+
+// Conflicting dialect/framing must fail before the allocator is consulted.
+test "JSONL rejects comment dialects before allocating" {
+    inline for (.{ Dialect.jsonc, Dialect.json5 }) |dialect| {
+        try testing.expectError(error.InvalidOptions, StreamIndexer.init(
+            testing.failing_allocator,
+            1,
+            .{ .dialect = dialect, .mode = .jsonl },
+        ));
+    }
 }

@@ -1,9 +1,33 @@
+//! SIMD primitives, mask run arithmetic and UTF-8 classification.
+//!
+//! `Vec` and `Mask` name the lane widths the matchers work at, `windows` cuts
+//! a borrowed slice into chunks of that width, `prefixXor`,
+//! `computeBackslashRuns` and `trailingRunOdd` answer run-parity questions over
+//! one `Mask`, and `validateUtf8` classifies one borrowed byte range. Reached
+//! as `simd` from the package root, or by relative import from inside this
+//! project.
+//!
+//! The module allocates nothing, retains nothing and performs no I/O, so a
+//! consumer releases nothing after use and every slice it returns borrows the
+//! storage the caller passed in. Grammar, tape building and structural
+//! indexing live in `stage1`, `stage2` and `json_value` instead.
+//!
+//! Lane widths and target selection are resolved at comptime from
+//! `builtin.cpu` and the `vector_len` build option, so a width is fixed for
+//! the whole build rather than chosen per call, and a mask produced at one
+//! width is a different type from the same mask at another.
+
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const assert = std.debug.assert;
 const testing = std.testing;
 
+/// Lanes per vector on the compile target, chosen from its CPU features.
+///
+/// 64 with both `avx512f` and `avx512bw`, 32 with `avx2`, otherwise 16 on
+/// x86, and 16 on every other architecture. This is a decision made while
+/// compiling, not a probe of the machine at run time.
 pub const native_vector_len: usize = switch (builtin.cpu.arch) {
     .x86, .x86_64 => if (std.Target.x86.featureSetHas(builtin.cpu.features, .avx512f) and
         std.Target.x86.featureSetHas(builtin.cpu.features, .avx512bw))
@@ -15,8 +39,18 @@ pub const native_vector_len: usize = switch (builtin.cpu.arch) {
     else => 16,
 };
 
+/// The lane width used when a caller does not name one.
+///
+/// The `vector_len` build option when the package was compiled with one,
+/// otherwise `native_vector_len`.
 pub const default_vector_len: usize = build_options.vector_len orelse native_vector_len;
 
+/// A vector of `len` lanes of `T`.
+///
+/// `len` must be greater than zero, checked at comptime. Every matcher here
+/// takes and returns one width, so a vector is only ever exchanged with a
+/// vector of the same `T` and `len`. The lanes are plain values: a `Vec` owns
+/// nothing, and copying one copies every lane.
 pub fn Vec(comptime T: type, comptime len: usize) type {
     comptime assert(len > 0);
     return @Vector(len, T);
@@ -24,9 +58,11 @@ pub fn Vec(comptime T: type, comptime len: usize) type {
 
 /// An unsigned mask with exactly `bit_count` lanes.
 ///
-/// Values retain Zig's logical-bit integer semantics. Their object storage may
-/// occupy more bits; `MaskStorage` and `exactMask` provide an explicit wider
-/// representation for consumers that perform storage-width scans.
+/// `bit_count` must be greater than zero, checked at comptime; lane `i` is bit
+/// `i`, counted from the least significant. Every value in
+/// `0..maxInt(Mask(bit_count))` is a valid mask, and only those lanes exist
+/// logically whatever width the object occupies in memory. `MaskStorage`
+/// names that occupied width and `exactMask` converts a mask to it.
 pub fn Mask(comptime bit_count: usize) type {
     comptime assert(bit_count > 0);
     return @Int(.unsigned, bit_count);
@@ -45,14 +81,34 @@ fn validateMaskType(comptime T: type) void {
     }
 }
 
+/// Hands out one `len`-wide `Vec` per call over a borrowed slice, optionally
+/// padding the final short chunk.
+///
+/// `T` and `len` are fixed at comptime and `len` must be greater than zero.
+/// `pad` decides whether a trailing partial chunk is produced, and the two
+/// answers are separate instantiations rather than a run-time branch. The
+/// iterator copies no elements: `rest` borrows the `data` given to `init`,
+/// which must stay alive and unmodified until the iterator reports
+/// exhaustion. The value itself needs no stable address, and copying one
+/// borrows the same input and continues from the same position.
 pub fn ChunkIterator(comptime T: type, comptime len: usize, comptime pad: bool) type {
     comptime assert(len > 0);
     return struct {
         const Self = @This();
 
+        /// Value written into the padded tail lanes. `null` only when `pad` is
+        /// `false`, where no lane is ever padded.
         fill: ?T,
+        /// The unconsumed tail of the borrowed input. `next` advances it and
+        /// empties it after the final chunk; it never regrows.
         rest: []const T,
 
+        /// Borrows all of `data` as the remaining input.
+        ///
+        /// `fill` must be non-`null` when `pad` is `true`. That is a caller
+        /// precondition held by `std.debug.assert`, so Debug and ReleaseSafe
+        /// diagnose it and ReleaseFast and ReleaseSmall treat a violation as
+        /// unchecked illegal behavior.
         pub fn init(data: []const T, fill: ?T) Self {
             if (pad) {
                 assert(fill != null);
@@ -63,6 +119,14 @@ pub fn ChunkIterator(comptime T: type, comptime len: usize, comptime pad: bool) 
             };
         }
 
+        /// The next `len` elements, or `null` once the input is spent.
+        ///
+        /// Fewer than `len` remaining elements return `null`, except under
+        /// `pad`, where one final chunk is returned with the tail lanes set
+        /// from `init`'s `fill`; an input whose length is an exact multiple of
+        /// `len`, including an empty one, produces no padding chunk at all.
+        /// The returned vector holds the elements by value and does not borrow
+        /// the iterator.
         pub fn next(self: *Self) ?Vec(T, len) {
             if (self.rest.len < len) {
                 if (self.rest.len == 0 or !pad) return null;
@@ -80,6 +144,11 @@ pub fn ChunkIterator(comptime T: type, comptime len: usize, comptime pad: bool) 
     };
 }
 
+/// `ChunkIterator(T, len, fill != null)` over `data`, padded when `fill` is given.
+///
+/// The returned iterator borrows `data` on the terms `ChunkIterator.init`
+/// states. Whether the padding exists is decided here, at comptime, so an
+/// unpadded caller never pays for the padded path.
 pub fn windows(
     comptime T: type,
     comptime len: usize,
@@ -101,6 +170,13 @@ const PrefixXorPclmul = struct {
     }
 };
 
+/// Inclusive prefix XOR: bit `i` of the result is the XOR of bits `0..i`.
+///
+/// `T` must be an integer type with at least one bit. Widths up to 64 use
+/// `PrefixXorPclmul.multiply` on `x86_64` with `avx` and `pclmul`, except with the
+/// `.stage2_c` backend. Every other instantiation uses the portable shift chain.
+/// Both paths compute the same logical value; this states no instruction count
+/// or performance result. Widths above 64 are supported by the portable path.
 pub fn prefixXor(comptime T: type, bitmask: T) T {
     const bits = @typeInfo(T).int.bits;
     comptime assert(bits > 0);
@@ -124,14 +200,34 @@ pub fn prefixXor(comptime T: type, bitmask: T) T {
     return x;
 }
 
+/// The two run facts `computeBackslashRuns` derives from one backslash mask.
+///
+/// `T` must be an unsigned integer type with at least one bit; a type that is
+/// not one fails at comptime. The value holds plain integers: it owns
+/// nothing, borrows nothing, and a copy is independent of the original.
 pub fn BackslashResult(comptime T: type) type {
     comptime validateMaskType(T);
     return struct {
+        /// Lanes that immediately follow a backslash run of odd length, so the
+        /// byte at such a lane is escaped by an odd run before it.
         odd_length_ends: T,
+        /// Whether the highest lane is a backslash, meaning a run is still open
+        /// at the end of the mask and continues into the next one.
         ends_in_backslash: bool,
     };
 }
 
+/// Finds the lanes an odd-length backslash run escapes, within `backslash_mask`.
+///
+/// `T` must be an unsigned integer type with at least one bit. The run
+/// arithmetic uses `T`'s logical width, so a mask whose object is stored wider
+/// than its logical width is unaffected by the spare bits.
+///
+/// `prev_ends_in_backslash` continues the run left open by the previous mask
+/// and must be that mask's own `ends_in_backslash`; any other value splits a
+/// run in two and changes both answers. A clear mask with a carried-in run
+/// still marks lane 0, because that lane follows the run. Nothing is retained
+/// and no allocation happens.
 pub fn computeBackslashRuns(
     comptime T: type,
     backslash_mask: T,
@@ -182,11 +278,13 @@ pub fn computeBackslashRuns(
     };
 }
 
-/// The integer type that actually stores `Mask(bits)`.
+/// The unsigned integer type that occupies the storage of `Mask(bits)`.
 ///
-/// Storage size is target-dependent: `Mask(24)` occupies 32 bits, `Mask(48)`
-/// occupies 64, and `Mask(257)` can occupy 384. Derive the width from `@sizeOf`,
-/// not byte alignment or a fixed power-of-two rule.
+/// `bits` must be greater than zero, checked at comptime. The returned type is
+/// `Mask(bits)` itself when the object occupies exactly its logical width, and
+/// otherwise an unsigned integer of `@sizeOf(Mask(bits)) * 8` bits. The width
+/// a given `bits` maps to is decided by the target, so derive it from
+/// `@sizeOf` rather than from a fixed power-of-two rule.
 pub fn MaskStorage(comptime bits: usize) type {
     comptime assert(bits > 0);
     const result = Mask(bits);
@@ -194,11 +292,13 @@ pub fn MaskStorage(comptime bits: usize) type {
     return @Int(.unsigned, @sizeOf(result) * 8);
 }
 
-/// Widens `mask` to its storage type and explicitly bounds the logical lanes.
+/// Converts `mask` to its storage width with the logical lanes explicitly
+/// bounded.
 ///
-/// Logical-width comparisons and bit scans remain valid Zig operations. This
-/// helper gives storage-width consumers one normalized representation; values
-/// already at that width pass through unchanged.
+/// `T` must be an unsigned integer type with at least one bit. Bits at and
+/// above `T`'s logical width are cleared, so a storage-width scan never reads a
+/// spare bit as a lane. A `T` that already occupies its full storage width is
+/// returned unchanged. The result is a value: nothing is borrowed or retained.
 pub fn exactMask(comptime T: type, mask: T) MaskStorage(@typeInfo(T).int.bits) {
     comptime validateMaskType(T);
 
@@ -294,6 +394,12 @@ noinline fn laneMatchRange(
     return @truncate(result);
 }
 
+/// Lanes equal to `target`: lane `i` is set when `v[i] == target`.
+///
+/// `len` must be greater than zero. This entry point must stay `inline`; the
+/// out-of-line instantiation corrupts wide mask results on LoongArch, while the
+/// inlined comparison agrees with it. Big-endian targets and vectors narrower
+/// than 16 bytes on Hexagon take a lane-by-lane walk that yields the same mask.
 pub inline fn matchByte(comptime len: usize, v: Vec(u8, len), target: u8) Mask(len) {
     if (comptime target_is_big_endian or (target_is_hexagon and len < 16)) {
         return laneMatchByte(len, v, target);
@@ -304,6 +410,7 @@ pub inline fn matchByte(comptime len: usize, v: Vec(u8, len), target: u8) Mask(l
     return @bitCast(eq);
 }
 
+/// Lanes equal to either `c1` or `c2`. Same inline contract as `matchByte`.
 pub inline fn matchAny2(comptime len: usize, v: Vec(u8, len), c1: u8, c2: u8) Mask(len) {
     if (comptime target_is_big_endian or (target_is_hexagon and len < 16)) {
         return laneMatchAny2(len, v, c1, c2);
@@ -315,6 +422,7 @@ pub inline fn matchAny2(comptime len: usize, v: Vec(u8, len), c1: u8, c2: u8) Ma
     return @bitCast(combined);
 }
 
+/// Lanes equal to one of `c1`, `c2`, `c3` or `c4`. Same inline contract as `matchByte`.
 pub inline fn matchAny4(comptime len: usize, v: Vec(u8, len), c1: u8, c2: u8, c3: u8, c4: u8) Mask(len) {
     if (comptime target_is_big_endian or (target_is_hexagon and len < 16)) {
         return laneMatchAny4(len, v, c1, c2, c3, c4);
@@ -328,6 +436,7 @@ pub inline fn matchAny4(comptime len: usize, v: Vec(u8, len), c1: u8, c2: u8, c3
     return @bitCast(combined);
 }
 
+/// Lanes in `min..=max`, inclusive at both ends. Same inline contract as `matchByte`.
 pub inline fn matchRange(comptime len: usize, v: Vec(u8, len), min: u8, max: u8) Mask(len) {
     if (comptime target_is_big_endian or (target_is_hexagon and len < 16)) {
         return laneMatchRange(len, v, min, max);
@@ -339,6 +448,14 @@ pub inline fn matchRange(comptime len: usize, v: Vec(u8, len), min: u8, max: u8)
     return @bitCast(in_range);
 }
 
+/// The low `valid_count` lanes set, for a `Mask(bits)` of `bits` lanes.
+///
+/// `bits` must be greater than zero, checked at comptime. A `valid_count` of
+/// `0` yields `0` and one of `bits` yields every lane set. A `valid_count`
+/// above `bits` is a caller precondition held by `std.debug.assert`, so Debug
+/// and ReleaseSafe diagnose it and ReleaseFast and ReleaseSmall treat it as
+/// unchecked illegal behavior. Bits at and above `valid_count` are clear,
+/// whatever width the mask occupies in storage.
 pub fn validMask(comptime bits: usize, valid_count: usize) Mask(bits) {
     comptime assert(bits > 0);
     assert(valid_count <= bits);
@@ -351,6 +468,11 @@ pub fn validMask(comptime bits: usize, valid_count: usize) Mask(bits) {
     return (@as(result, 1) << @as(shift, @intCast(valid_count))) - 1;
 }
 
+/// Lanes holding JSON whitespace: `' '`, `'\t'`, `'\n'` or `'\r'`.
+///
+/// No other byte matches, including the `0x0b` and `0x0c` a JSON5 grammar also
+/// accepts as whitespace; a JSON5 scanner matches those on its own. This
+/// entry point must stay `inline` on the terms `matchByte` states.
 pub inline fn matchJsonWhitespace(comptime len: usize, v: Vec(u8, len)) Mask(len) {
     comptime assert(len > 0);
     if (comptime target_is_big_endian or (target_is_hexagon and len < 16)) {
@@ -368,6 +490,20 @@ pub inline fn matchJsonWhitespace(comptime len: usize, v: Vec(u8, len)) Mask(len
     return @bitCast(whitespace);
 }
 
+/// Whether the run of lanes clear in `mask`, ending at its last valid lane,
+/// has odd length.
+///
+/// `bits` must be greater than zero, checked at comptime. Only the first
+/// `valid_count` lanes take part, and a `valid_count` of `0` returns `false`.
+/// A `valid_count` above `bits` is a caller precondition held by
+/// `std.debug.assert`, so Debug and ReleaseSafe diagnose it and the fast
+/// release modes treat it as unchecked illegal behavior.
+///
+/// `previous_odd` continues the same run across a block boundary and must be
+/// the previous block's own answer; any other value changes the parity. When
+/// every valid lane has its bit set, this block adds no clear lane, so the run
+/// keeps the length it had before this block. The answer is then the carried-in
+/// parity combined with the parity of `valid_count`.
 pub fn trailingRunOdd(
     comptime bits: usize,
     mask: Mask(bits),
@@ -398,6 +534,16 @@ pub fn trailingRunOdd(
     return trailing_count % 2 != 0;
 }
 
+/// Writes `base_offset` plus the lane index of every set lane of `bitmask`
+/// into `out_indexes`.
+///
+/// `T` must be an unsigned integer type with at least one bit. Lanes are
+/// written from the lowest upward, at most `out_indexes.len` of them, and the
+/// returned count is how many were stored; `out_indexes[written..]` keeps
+/// whatever the caller left there. A mask with more set lanes than room is
+/// truncated silently, so a caller that must see every lane sizes the output
+/// from `@popCount` or calls `extractBitIndexesChecked`. Each written value
+/// must fit in `u32`, and this call does not check that.
 pub fn extractBitIndexes(
     comptime T: type,
     bitmask: T,
@@ -426,6 +572,15 @@ pub fn extractBitIndexes(
     return written;
 }
 
+/// `extractBitIndexes` that reports a mask that will not fit instead of
+/// truncating it.
+///
+/// `error.CapacityExceeded` when `out_indexes` is shorter than the number of
+/// set lanes, and `error.InputTooLarge` when `base_offset` plus the highest
+/// set lane does not fit in `u32`. Both are decided before any lane is
+/// written, so `out_indexes` is unchanged on either path. On success every
+/// set lane is written from the lowest upward and the returned count equals
+/// the number of set lanes.
 pub fn extractBitIndexesChecked(
     comptime T: type,
     bitmask: T,
@@ -461,23 +616,50 @@ pub fn extractBitIndexesChecked(
     return written;
 }
 
+/// The UTF-8 rules `validateUtf8` distinguishes.
+///
+/// One class per rule, so a caller can tell a malformed sequence from one that
+/// is merely cut short at the end of the range it was given.
 pub const Utf8ErrorKind = enum(u8) {
+    /// A byte in `0xf8..0xff`, which is not a UTF-8 lead byte at all.
     invalid_header,
+    /// A `0x80..0xbf` byte that no sequence consumed.
     unexpected_continuation,
+    /// The byte at which a continuation byte was required and something else
+    /// was found.
     missing_continuation,
+    /// The range ended inside a sequence; `Utf8Error.offset` is the lead byte.
     truncated_sequence,
+    /// A sequence encoding a value below the shortest form for its length.
     overlong,
+    /// `0xed` followed by `0xa0..0xbf`, encoding a UTF-16 surrogate half.
     surrogate,
+    /// A sequence above `U+10FFFF`: a `0xf5..0xf7` lead byte, or `0xf4`
+    /// followed by a byte above `0x8f`.
     too_large,
 };
 
+/// Why `validateUtf8` rejected a byte range, and where.
+///
+/// `offset` is a byte index into the slice that was validated. It names the
+/// offending byte for every class except `.truncated_sequence`, which names
+/// the lead byte of the sequence the range ended inside.
 pub const Utf8Error = struct {
+    /// Which rule the input broke.
     kind: Utf8ErrorKind,
+    /// Byte index into the validated slice, as this comment describes.
     offset: usize,
 };
 
+/// Whether a byte range is valid UTF-8, and the first failure when it is not.
+///
+/// This is a returned value rather than an error union: an invalid range is
+/// an ordinary answer a caller inspects rather than an exceptional path, and
+/// neither answer allocates or retains anything.
 pub const Utf8Result = union(enum) {
+    /// Every byte in the range is well-formed UTF-8.
     valid,
+    /// The first failure, scanning upward from the lowest byte offset.
     invalid: Utf8Error,
 };
 
@@ -732,6 +914,14 @@ fn validateUtf8Replay(input: []const u8, suspect_offset: usize) Utf8Result {
     };
 }
 
+/// UTF-8 classification of `input` at one vector width.
+///
+/// `len` is the block width the scan uses. A width below 4 takes the scalar
+/// classifier directly; from 4 upward a vector pass locates a suspect block
+/// and a scalar replay reclassifies it, so `Utf8Error.kind` and
+/// `Utf8Error.offset` name the same first failure at every width. A short
+/// input is never read past its end. Nothing is retained and no allocation
+/// happens.
 pub fn validateUtf8WithWidth(comptime len: usize, input: []const u8) Utf8Result {
     if (comptime len < 4) return validateUtf8Scalar(input);
 
@@ -741,6 +931,10 @@ pub fn validateUtf8WithWidth(comptime len: usize, input: []const u8) Utf8Result 
     return validateUtf8Replay(input, suspect_offset);
 }
 
+/// UTF-8 classification of `input` at `default_vector_len`.
+///
+/// The whole contract is `validateUtf8WithWidth`'s; this entry point only fixes
+/// the width to the one this package's own scanners use.
 pub fn validateUtf8(input: []const u8) Utf8Result {
     return validateUtf8WithWidth(default_vector_len, input);
 }

@@ -174,8 +174,8 @@ step:
   suite, with no network access and no excluded example.
 - A visualizer smoke run of the real `simd` executable.
 - `zig fmt --check` over the Zig sources this repository owns:
-  `build.zig`, `build.zig.zon`, `src`, `test`, `scripts`, `library_test.zig`,
-  `bench.zig`, `kernel_bench.zig`, `semantic_bench.zig`, and `string_bench.zig`.
+  `build.zig`, `build.zig.zon`, `src`, `test`, `scripts`, `examples`,
+  `library_test.zig`, `bench.zig`, `kernel_bench.zig`, `semantic_bench.zig`, and `string_bench.zig`.
 - The `scripts/benchmark.zig` behavior tests, once, on the host. They are not
   repeated per width.
 - The same `scripts/benchmark.zig` source compiled again in semantic mode with
@@ -367,17 +367,41 @@ disabled, no finding is suppressed, and no narrower target list, width list, or
 check stands in for one that would have to pass. Nothing is committed while the
 expanded gate is red, and no push is authorized.
 
-`zbc` classifies the `Lease` nested in `Guard.lease` as an owning field —
-`owned-field-no-outer-cleanup` at `resident.zig:73` — and asks for a
-`Guard.deinit` forwarding to a `deinit` or `close` on the lease, while `Lease`
-in fact exposes `check`, `release`, and `claim` (`src/core/resident.zig:43-70`)
-and `Guard` stores it by value (`src/core/resident.zig:72-73`). That is a model
-gap rather than a runtime defect, and it is unresolved. `Guard` borrows a
-generation and focus token and must **not** be released when it goes out of
-scope — an automatic release would invalidate the active document — so the fix
-is not to add a release, a `deinit`, a clamp, a recheck, or a duplicated
-counter. Remediate the finding itself: a disabled rule and a suppressed report
-are not a fix, and this repository does not claim that work is done.
+The `zbc` misclassification of the `Lease` nested in `Guard.lease` — the
+`owned-field-no-outer-cleanup` finding that asked for a `Guard.deinit` forwarding
+to a `deinit` or `close` on a lease that only exposes `check`, `release` and
+`claim` — is resolved in the analyzer rather than in this repository, because
+`Guard` borrows a generation and focus token and must **not** be released when it
+goes out of scope. An automatic release would invalidate the document the guard is
+still reading, so adding a release, a `deinit`, a clamp, a recheck or a duplicated
+counter would have been a new defect.
+
+`zbc` now splits its cleanup vocabulary in two: a teardown name (`deinit`,
+`free`, `destroy`, `close`, `stop`, `finalize`, `dispose`) destroys the value's own
+storage, and a borrow-release name (`release`, `deref`, `unref`, `removeRef`)
+hands back a borrow, a lease or a reference count. `owned-field-no-outer-cleanup`
+treats a value field as owning when its type exposes a teardown name, or when it
+exposes a refcount-acquire name such as `retain`, and it no longer fires for a
+type that exposes neither. The two sets are disjoint and their union is the
+unchanged cleanup vocabulary, so every other rule that asks "does this type have a
+cleanup method?" is unaffected, and `missing-deinit-on-composed-owner` still
+covers a refcounted field that an outer forgets to release. No rule was disabled
+and no report was suppressed.
+
+**The remaining analyzer surface is analyzer model gaps, not project defects.** A
+triage of every finding the two analyzers report on this tree found that each one
+is a proof the analyzer cannot make, and that no finding exposes a reachable
+defect. `zbc` reports `use-undefined` for arrays and locals that a loop provably
+fills, `index-type-narrowing-wraparound` for a length that a ceiling checked
+earlier in the same call chain bounds, `index-minus-one-without-zero-guard` for a
+loop-guarded index, and `slice-loop-reentrant-grow` for a callee that cannot
+reach the iterated collection. `zwanzig` reports a forced unwrap that an
+`assert` makes unreachable, a published entry point as unused because the analyzer
+cannot resolve the package import that calls it, and container members that it
+cannot resolve through a `comptime` type parameter. Both analyzers exit nonzero on
+any finding at any severity, so the gate is red on these until the analyzer
+proves the cases above. They stay visible: no rule is disabled and no finding is
+suppressed to obtain a green run.
 
 An analyzer inventory is that analyzer's own unwrap, unused, and style rules
 over fixtures and aliases. It is not evidence of a runtime fault, and it is not

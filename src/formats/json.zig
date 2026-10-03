@@ -1,3 +1,33 @@
+//! Strict RFC 8259 JSON: structural indexing, tape building, validation, and
+//! the reused-parser and chunk-fed entry points for the one JSON dialect with
+//! no extensions.
+//!
+//! Reachable as `simd.formats.json`. Nothing here decodes values, unescapes
+//! strings, or rewrites bytes: `stage2.TapeCursor.rawValue` hands back
+//! still-escaped spans into the caller's own input, and value-level reading
+//! belongs to `simd.json_value`. The dialects with extensions are separate
+//! modules — `simd.formats.jsonc`, `simd.formats.json5`, and
+//! `simd.formats.jsonl` — and similar names do not imply shared dialect rules.
+//!
+//! Nothing here synchronizes concurrent access, so a caller that shares one
+//! index, document, or parser across threads serializes it itself.
+//!
+//! Three sequences cover the module, ordered by how much state they retain.
+//!
+//! Eager tape: `buildJsonTape(gpa, input)` returns a `stage2.Document` owning
+//! one tape. Release it once with `document.deinit(gpa)` and keep `input`
+//! alive for the document, its cursors, and every raw slice.
+//!
+//! Reused parser: `ondemand.Parser.init(gpa, 0)` allocates one index buffer
+//! that grows on demand. `initOnDemandDocument` lends that buffer to an
+//! `ondemand.Document`; release the document with `document.deinit()` before
+//! the next document, and the parser with `parser.deinit()`. A parser keeps
+//! one active document at a time.
+//!
+//! Streaming: `initStreamIndexer(gpa, chunk_len)` allocates two padded input
+//! slots and one index and stores `gpa`, so the allocator's backing state must
+//! outlive `indexer.deinit()` and the `index.deinit(gpa)` that follows a
+//! `take`. Chunk bytes are borrowed only for the duration of each `feed` call.
 const std = @import("std");
 const simd = @import("../core/simd.zig");
 const stage1 = @import("../core/stage1.zig");
@@ -36,7 +66,17 @@ const IndexSink = struct {
     }
 };
 
-/// Initializes a chunk-fed RFC JSON Stage 1 indexer in document mode.
+/// Chunk-fed Stage 1 indexer pinned to strict RFC 8259 JSON in document mode.
+///
+/// The wrapper fixes the mode and dialect; the caller supplies the allocator,
+/// whose interface this indexer stores. That backing state must outlive both
+/// `indexer.deinit()` and the `index.deinit(allocator)` that releases an index
+/// moved out by `take`, because both free into it. Chunk bytes are borrowed
+/// only for the duration of each `feed` call.
+///
+/// The error set is `stream.StreamIndexer.InitError`, which
+/// `stream.StreamIndexer.init` defines; it includes `error.InvalidOptions` for
+/// a mode and dialect pair this wrapper never forms.
 pub fn initStreamIndexer(
     allocator: std.mem.Allocator,
     chunk_len: usize,
@@ -48,9 +88,16 @@ pub fn initStreamIndexer(
     );
 }
 
-/// Builds an on-demand document backed by parser-owned structural storage.
+/// Builds an on-demand document over `parser`'s reusable structural storage.
 ///
-/// The input must outlive the returned document.
+/// The document borrows `input` and the parser's index buffer, so both must
+/// outlive it, every cursor made from it, and every raw slice those cursors
+/// return. The parser allows one active document: `Document.deinit` releases
+/// that claim and no allocation, and must run before the next document and
+/// before `parser.deinit`. The error set is `ondemand.Error`.
+///
+/// Index storage is reserved before the scan, so an error return leaves the
+/// parser holding the capacity it grew to.
 pub fn initOnDemandDocument(
     parser: *ondemand.Parser,
     input: []const u8,
@@ -132,7 +179,16 @@ test "on-demand JSON grow policy survives parser resize" {
     try testing.expect(parser.capacity > first_capacity);
 }
 
-/// Builds an owned, validated RFC JSON tape from the Stage1 structural index.
+/// Builds an owned, validated RFC JSON tape and releases the structural index
+/// it was built from.
+///
+/// The returned `stage2.Document` owns one tape and stores no allocator, so
+/// release it once with `document.deinit(allocator)` while that backing is
+/// still alive, and keep `input` alive for the document, its cursors, and
+/// their raw slices. No error path leaves the caller owning anything. Stage 1
+/// failures other than `error.OutOfMemory` arrive as `error.TapeTooLarge`,
+/// because Stage 1 cannot represent an input that Stage 2 cannot address on
+/// its tape.
 pub fn buildJsonTape(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -147,6 +203,12 @@ pub fn buildJsonTape(
 }
 
 /// Validates RFC JSON and returns the first semantic diagnostic, if any.
+///
+/// Allocates one structural index and releases it before returning, so a
+/// successful call leaves nothing to release. `null` means the input is valid
+/// RFC 8259 JSON; a returned `stage2.Diagnostic` borrows `input` for its
+/// `snippet` and reports byte, line, and column positions within it. Stage 1
+/// failures arrive as `error.TapeTooLarge`, exactly as in `buildJsonTape`.
 pub fn validateJson(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -159,6 +221,14 @@ pub fn validateJson(
     return stage2.validate(input, &structural_index, .json);
 }
 
+/// Owns the absolute `u32` offsets of every RFC JSON structural byte and atom
+/// start in `input`, plus the three trailing sentinel slots.
+///
+/// The result owns its allocation and is released once with
+/// `index.deinit(allocator)`; it holds no bytes of `input`, which may be
+/// released as soon as this returns. A copy names the same allocation and is
+/// not a second owner. `stage1.StructuralIndex.InitError` carries
+/// `error.OutOfMemory`, `error.CapacityOverflow`, and `error.InputTooLarge`.
 pub fn indexJson(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -166,6 +236,11 @@ pub fn indexJson(
     return indexJsonImpl(simd.default_vector_len, allocator, input);
 }
 
+/// `indexJson` at an explicit SIMD width.
+///
+/// `vlen` is the bytes-per-vector width the scanner and the bit-index
+/// extractor are instantiated at, and must be at least 4. Ownership, the
+/// sentinel slots, and the errors are `indexJson`'s.
 pub fn indexJsonImpl(
     comptime vlen: usize,
     allocator: std.mem.Allocator,
@@ -189,6 +264,19 @@ pub fn indexJsonImpl(
     return indexes;
 }
 
+/// Scans `input` for RFC JSON offsets, writes them into caller-owned `indexes`,
+/// and returns how many were written.
+///
+/// The slice is the caller's storage: nothing here resizes or frees it, and the
+/// returned count excludes the sentinel slots, which this call does not write.
+/// A caller that owns a `stage1.StructuralIndex` passes its slice minus those
+/// three slots and then calls `stage1.StructuralIndex.finish`.
+///
+/// The checked sink reports `error.CapacityExceeded` the moment `indexes` is
+/// full, so on that error the slice holds an unknown-length prefix of the
+/// offsets and no count is returned; discard or recompute it rather than read a
+/// partial result. `error.InputTooLarge` when `input` exceeds the `u32` offset
+/// boundary. `vlen` is the SIMD width and must be at least 4.
 pub fn indexJsonInto(
     comptime vlen: usize,
     indexes: []u32,

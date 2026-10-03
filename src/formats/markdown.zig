@@ -1,3 +1,23 @@
+//! Marker-only Markdown indexing, tape validation and navigation.
+//!
+//! The scanner records eight markers — headings, code fences, list items,
+//! block quotes, inline code runs, link delimiters and thematic breaks — at
+//! their source offsets. It builds no tree, resolves no link destination and
+//! interprets no emphasis, HTML block or list nesting, so it is not a
+//! CommonMark parser; the document model lives in `formats.commonmark`.
+//!
+//! A consumer reaches this module as `simd.formats.markdown`, or by importing
+//! `formats/markdown.zig` relatively. It publishes a one-shot indexer, the
+//! chunk-fed `MarkdownStreamIndexer`, the owned `MarkdownDocument` tape with
+//! its cursor, and the resident `Parser` family.
+//!
+//! Every entry point takes the caller's allocator. `indexMarkdown` copies
+//! offsets only, so `input` may be released when it returns; `buildMarkdownTape`
+//! borrows `input` into `MarkdownDocument.source`, which must stay alive and
+//! unmodified while the document, its cursors and its diagnostics are read.
+//! The index, the tape and the resident parser each own their allocations and
+//! release them in exactly one `deinit`.
+
 const std = @import("std");
 const simd = @import("../core/simd.zig");
 const stage1 = @import("../core/stage1.zig");
@@ -5,6 +25,14 @@ const resident = @import("../core/resident.zig");
 const assert = std.debug.assert;
 const testing = std.testing;
 
+/// The marker kinds this scanner records.
+///
+/// Each kind names the byte that opens it and the run it covers:
+/// `code_fence` spans the whole backtick or tilde run, `list_item` spans an
+/// ordered marker's digits and trailing `'.'`, or one `-`, `*` or `+`, and
+/// the remaining kinds are a single byte. `link_open` covers `[` and `(` and
+/// `link_close` covers `]` and `)`; reference, image and autolink forms are
+/// not distinguished from one another.
 pub const MarkdownTokenKind = enum(u8) {
     heading,
     code_fence,
@@ -16,17 +44,42 @@ pub const MarkdownTokenKind = enum(u8) {
     thematic_break,
 };
 
+/// Owned Stage 1 Markdown output: one marker offset per entry, with its kind.
+///
+/// The index stores offsets only, so the source bytes may be released as soon
+/// as the indexer returns. One index owns `indexes` and `kinds` and releases
+/// both in one `deinit`, from the same allocator the indexer was given.
+/// Copying an index copies the two slice handles, so a copy is not a second
+/// owner and must not be `deinit`'d.
 pub const MarkdownStructuralIndex = struct {
+    /// Marker offsets, strictly increasing, of `indexes[0..count]`.
+    ///
+    /// Three entries past `count` are reserved for the sentinels
+    /// `stage1.StructuralIndex.finish` writes: the input length twice and
+    /// then `0`.
     indexes: []u32,
+    /// Kind of each of `kinds[0..count]`. Entries past `count` are unused.
     kinds: []MarkdownTokenKind,
+    /// Number of markers written. The arrays are longer than this.
     count: usize,
 
+    /// Releases `indexes` and `kinds` into `allocator`, which must be the
+    /// allocator the indexer received. The index is unusable afterward, and a
+    /// second call through any copy is a double free.
     pub fn deinit(self: *MarkdownStructuralIndex, allocator: std.mem.Allocator) void {
         allocator.free(self.indexes);
         allocator.free(self.kinds);
         self.* = undefined;
     }
 
+    /// Marker bytes for `token_index`, or `null` when `token_index` is not
+    /// below `count`, the offset is past `input`, or the byte at the offset is
+    /// not the one this kind opens with.
+    ///
+    /// `input` is not matched against an owning source, so any slice of the
+    /// right length is read; the result borrows `input` and is invalidated
+    /// when the caller writes or releases it. A `null` here carries no
+    /// diagnostic — `validateMarkdownIndex` reports one.
     pub fn sourceSpan(
         self: *const MarkdownStructuralIndex,
         token_index: usize,
@@ -178,6 +231,13 @@ const MarkdownTapeValidationSink = struct {
     }
 };
 
+/// Builds the Stage 1 structural index for `input` at the default vector
+/// width.
+///
+/// `input` is read and not retained; it may be released when this returns.
+/// `error.InputTooLarge` when `input.len` exceeds `std.math.maxInt(u32)` is
+/// decided before the first allocation, and `error.OutOfMemory` leaves the
+/// caller owning nothing. The returned index owns its two arrays.
 pub fn indexMarkdown(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -185,6 +245,11 @@ pub fn indexMarkdown(
     return indexMarkdownImpl(simd.default_vector_len, allocator, input);
 }
 
+/// `indexMarkdown` with `vlen` as the SIMD candidate width.
+///
+/// Every width in the supported range produces the same offsets and kinds;
+/// `vlen` exists so a verification matrix can pin one. The ownership, error
+/// and residue contract is the one `indexMarkdown` documents.
 pub fn indexMarkdownImpl(
     comptime vlen: usize,
     allocator: std.mem.Allocator,
@@ -214,24 +279,52 @@ pub fn indexMarkdownImpl(
 ///
 /// The indexer owns only the unfinished line and the structural output. A
 /// completed line is consumed before `feed` returns, while `finish` consumes
-/// the final unterminated line and writes the structural sentinels.
+/// the final unterminated line and writes the structural sentinels. `data` is
+/// never retained, so a caller may reuse or release the chunk on return.
+///
+/// The indexer owns every array it allocates and stores the `allocator` it was
+/// given; `deinit` releases them, and one indexer is one document until
+/// `reset`. Neither `take` nor `deinit` copies the value, and two indexers
+/// built from the same allocator stay independent.
 pub const MarkdownStreamIndexer = struct {
+    /// Retained. Every array this indexer owns, and every later growth of
+    /// them, comes from this allocator, and `deinit` frees into it. It must
+    /// stay valid and unmodified for the indexer's whole lifetime.
     allocator: std.mem.Allocator,
+    /// Bytes of the unfinished line. Cleared as each completed line is
+    /// consumed; its capacity is retained across `reset`.
     line: std.ArrayList(u8) = .empty,
+    /// Source offset of `line.items[0]`, so emitted offsets stay absolute
+    /// across chunk boundaries.
     line_start_offset: usize = 0,
+    /// Bytes accepted so far, terminators included. `finish` writes it as the
+    /// trailing sentinel.
     input_len: usize = 0,
+    /// `true` after a `'\r'` whose next byte has not arrived. The terminator
+    /// counts as one byte unless that byte is `'\n'`.
     pending_carriage_return: bool = false,
+    /// Scan carry across lines: an open fenced code block, an unmatched
+    /// inline-code run, its length, and the active fence character and run
+    /// length. `reset` clears all five.
     in_code_fence: bool = false,
     in_inline_code: bool = false,
     inline_code_length: usize = 0,
     fence_character: u8 = 0,
     fence_length: usize = 0,
+    /// Structural output, `null` after `take` until storage is prepared again.
+    /// Even with no untaken index, `deinit` must free the retained line buffer.
     index: ?stage1.StructuralIndex = null,
+    /// Kind array paired with `index`. `null` on the same window as `index`.
     kinds: ?[]MarkdownTokenKind = null,
+    /// Set by a successful `finish`. A later `feed` returns
+    /// `error.AlreadyFinished` and `finish` becomes a no-op.
     finished: bool = false,
 
     const Self = MarkdownStreamIndexer;
     const initial_output_capacity: usize = 1;
+    /// Longest unfinished line the indexer retains, in bytes. `feed` returns
+    /// `error.LineTooLong` when the incoming chunk would push a single line
+    /// past this bound, before any byte of the chunk is consumed.
     pub const max_retained_line_length: usize = std.math.maxInt(u32);
 
     const ProcessError = std.mem.Allocator.Error || error{
@@ -240,7 +333,18 @@ pub const MarkdownStreamIndexer = struct {
         LineTooLong,
     };
 
+    /// Exactly `stage1.StructuralIndex.InitError`, so `error.OutOfMemory`,
+    /// `error.CapacityOverflow` and `error.InputTooLarge`; the reservation is
+    /// the only thing `init` can fail on and it happens before the indexer
+    /// exists. This is an alias, not a new set, and `stage1.StructuralIndex`
+    /// owns the contract.
     pub const InitError = stage1.StructuralIndex.InitError;
+    /// `feed`'s failures. `error.AlreadyFinished` after a successful `finish`,
+    /// and `error.CapacityOverflow`, `error.InputTooLarge` and
+    /// `error.LineTooLong`, are all decided before any byte of the chunk is
+    /// consumed, so the same chunk may be fed again. `error.OutOfMemory` from
+    /// the line or output growth can also arrive part-way through, which
+    /// `feed` describes.
     pub const FeedError = std.mem.Allocator.Error || error{
         AlreadyFinished,
         CapacityOverflow,
@@ -248,13 +352,30 @@ pub const MarkdownStreamIndexer = struct {
 
         LineTooLong,
     };
+    /// `finish`'s failures: the sizing and allocator tags from consuming the
+    /// final line and writing the structural sentinels. `error.AlreadyFinished`
+    /// is absent because `finish` is a no-op once it has succeeded, and
+    /// `finish` states what a failed call leaves behind.
     pub const FinishError = std.mem.Allocator.Error || error{
         CapacityOverflow,
         InputTooLarge,
         LineTooLong,
     };
+    /// `feedFrom`'s failures: every tag of `FeedError` and `FinishError`, plus
+    /// `std.Io.Reader.ShortError`, which is the reader's short-read set rather
+    /// than a tag and contributes exactly one of them, `error.ReadFailed`.
+    /// The other tag `reader.fill` can return, `error.EndOfStream`, is
+    /// consumed here and runs `finish` instead of reaching the caller.
     pub const FeedFromError = FeedError || FinishError || std.Io.Reader.ShortError;
 
+    /// Allocates the structural output at `chunk_len` entries and stores
+    /// `allocator` for the indexer's lifetime.
+    ///
+    /// `chunk_len` is an initial capacity, not a bound: the output grows
+    /// during `feed`, and a `chunk_len` of `0` still allocates one entry. The
+    /// line buffer starts empty and is allocated on the first `feed` that
+    /// needs one. On `error.OutOfMemory` both arrays are released and the
+    /// caller owns nothing.
     pub fn init(
         allocator: std.mem.Allocator,
         chunk_len: usize,
@@ -270,6 +391,12 @@ pub const MarkdownStreamIndexer = struct {
         };
     }
 
+    /// Releases the structural output and the retained line buffer into
+    /// `self.allocator`.
+    ///
+    /// An index already returned by `take` is unaffected and stays owned by
+    /// the caller. The indexer is unusable afterward, and a second call is a
+    /// double free.
     pub fn deinit(self: *Self) void {
         if (self.index) |*index| {
             index.deinit(self.allocator);
@@ -282,6 +409,20 @@ pub const MarkdownStreamIndexer = struct {
     }
     /// Adds bytes to the current document. Input bytes are never borrowed
     /// after this call returns.
+    ///
+    /// `error.AlreadyFinished` after a successful `finish`. The running
+    /// length is checked first: `error.CapacityOverflow` when `input_len +
+    /// data.len` overflows, and `error.InputTooLarge` past
+    /// `std.math.maxInt(u32)`; `error.LineTooLong` follows when the chunk
+    /// would carry one line past `max_retained_line_length`. All four, and
+    /// `error.OutOfMemory` from the line or output growth, are decided before
+    /// any byte of `data` is consumed, so the same chunk may be fed again.
+    ///
+    /// An `error.OutOfMemory` or `error.CapacityOverflow` raised later, while
+    /// a completed line is being turned into tokens, leaves the chunk partly
+    /// consumed and `input_len` already counting all of it. `reset` is then
+    /// required before another document; feeding more bytes would double
+    /// count the rest.
     pub fn feed(self: *Self, data: []const u8) FeedError!void {
         if (self.finished) return error.AlreadyFinished;
 
@@ -327,6 +468,18 @@ pub const MarkdownStreamIndexer = struct {
     }
 
     /// Drains a caller-owned reader and finishes at EOF.
+    ///
+    /// `reader` is not retained: it and the provider behind it must stay live
+    /// for the duration of the call, and this indexer stores no `std.Io`.
+    /// The call may block according to the reader's implementation. Provider
+    /// failures return `error.ReadFailed`; cancellation can reach this call
+    /// through that provider failure channel, not a separate cancellation tag.
+    /// `error.EndOfStream` is consumed and runs `finish` instead.
+    ///
+    /// An error from `feed` propagates before `reader.toss`, so the reader
+    /// still holds the chunk that failed and the residue is the one `feed`
+    /// documents. An error from `reader.fill` leaves every buffered byte
+    /// already consumed and fed.
     pub fn feedFrom(self: *Self, reader: *std.Io.Reader) FeedFromError!void {
         while (true) {
             const data = reader.buffered();
@@ -345,6 +498,12 @@ pub const MarkdownStreamIndexer = struct {
 
     /// Consumes pending line state and finalizes the owned structural index.
     /// Repeated calls do not duplicate output.
+    ///
+    /// On success `take` becomes legal and `feed` returns
+    /// `error.AlreadyFinished`. An `error.OutOfMemory` or
+    /// `error.CapacityOverflow` from the final line leaves the pending line,
+    /// the pending carriage return and every counter exactly as they were, so
+    /// `finish` may simply be called again.
     pub fn finish(self: *Self) FinishError!void {
         if (self.finished) return;
 
@@ -366,6 +525,13 @@ pub const MarkdownStreamIndexer = struct {
 
     /// Returns the finalized index without copying. The caller owns the
     /// returned arrays and must deinitialize them with the init allocator.
+    ///
+    /// Requires a successful `finish`. That precondition is asserted, so
+    /// `ReleaseFast` and `ReleaseSmall` enforce nothing here and an unfinished
+    /// indexer is undefined behaviour rather than a diagnosable error.
+    /// Ownership of the two arrays leaves the indexer with this call: the
+    /// indexer keeps its line buffer and releases only what it still holds,
+    /// so `deinit` after `take` is safe and does not free the returned index.
     pub fn take(self: *Self) MarkdownStructuralIndex {
         assert(self.finished);
         assert(self.index != null);
@@ -384,6 +550,13 @@ pub const MarkdownStreamIndexer = struct {
 
     /// Starts a new document while retaining reusable output and line
     /// allocations. A previously taken index is intentionally not restored.
+    ///
+    /// This is the only recovery from an errored `feed` or `finish`, and it is
+    /// valid before or after `finish` and after `take`: the output and line
+    /// capacities survive, the marker count returns to zero, and the scan
+    /// carry is cleared. Entries past the new count in `indexes` still hold
+    /// the previous document's sentinels until the next `finish` rewrites
+    /// them, so an unfinished index must not be taken or read.
     pub fn reset(self: *Self) void {
         if (self.index) |*index| {
             index.count = 0;
@@ -508,6 +681,12 @@ pub const MarkdownStreamIndexer = struct {
         self.fence_length = state.fence_length;
     }
 };
+/// `MarkdownStreamIndexer.init` for a caller that would only name this
+/// constructor. The returned value owns the output it allocated and is
+/// released by `MarkdownStreamIndexer.deinit`.
+///
+/// `chunk_len` is an initial capacity only, and the allocator must outlive
+/// the returned indexer.
 pub fn initStreamIndexer(
     allocator: std.mem.Allocator,
     chunk_len: usize,
@@ -833,6 +1012,14 @@ fn scanMarkdownLineContent(
     }
 }
 
+/// Invariant failures `validateMarkdownIndex` reports about a caller-supplied
+/// `MarkdownStructuralIndex`.
+///
+/// `InvalidIndexCount` when `count` exceeds an array or the input length,
+/// `InvalidTokenIndex` when an offset is past the input, `InvalidTokenOrder`
+/// when offsets do not strictly increase, and `InvalidTokenKind` when the byte
+/// at an offset is not the one its kind opens with. `validateMarkdown` reports
+/// the same four through `MarkdownDiagnostic` rather than as a tag.
 pub const MarkdownError = error{
     InvalidIndexCount,
     InvalidTokenIndex,
@@ -840,19 +1027,38 @@ pub const MarkdownError = error{
     InvalidTokenKind,
 };
 
+/// Errors the two `validateMarkdown` entry points return. Both build an index
+/// first, so `error.OutOfMemory` is reachable; `error.TapeTooLarge` means
+/// `input` is longer than `u32` offsets can address.
 pub const MarkdownValidationError = std.mem.Allocator.Error || error{TapeTooLarge};
+/// Errors `buildMarkdownTape` returns. `error.TapeTooLarge` covers an input
+/// longer than `u32` offsets and a marker run longer than the `u24` payload.
 pub const MarkdownBuildError = std.mem.Allocator.Error || MarkdownError || error{TapeTooLarge};
 
 /// A compact validated Markdown marker. `payload` stores the marker span length.
+///
+/// The fields are public, so a caller can replace words in
+/// `MarkdownDocument.tape`. Cursor and source-span access validate them against
+/// the source. `MarkdownDocument.word` checks only the tape index.
 pub const MarkdownTapeWord = packed struct(u64) {
+    /// Integer representation of a `MarkdownTokenKind` tag. Checked navigation
+    /// rejects an unknown tag with `error.InvalidTapeKind`.
     kind: u8,
+    /// Marker run length in bytes. The tape rejects a run longer than this
+    /// width.
     payload: u24,
+    /// Source offset of the marker.
     offset: u32,
 
+    /// Converts `kind` without a check. An unknown tag traps in Debug and
+    /// ReleaseSafe and is illegal behavior in ReleaseFast and ReleaseSmall.
+    /// For an untrusted word, use `std.enums.fromInt(MarkdownTokenKind, kind)`
+    /// and handle `null` before calling this method.
     pub fn tapeKind(self: MarkdownTapeWord) MarkdownTokenKind {
         return @enumFromInt(self.kind);
     }
 
+    /// `payload` widened to `usize`.
     pub fn sourceLength(self: MarkdownTapeWord) usize {
         return @intCast(self.payload);
     }
@@ -863,6 +1069,17 @@ comptime {
     assert(@sizeOf(MarkdownTapeWord) == 8);
 }
 
+/// Failures the tape and cursor methods return while walking
+/// `MarkdownDocument`.
+///
+/// `InvalidSource` when the caller's `input` is not the document's recorded
+/// source, `TapeOutOfBounds` for a `tape_index` at or past the tape length,
+/// `PositionOutOfBounds` once a cursor is past the last word,
+/// `SourceOutOfBounds` when a word's offset and length do not fit `input`,
+/// `InvalidTapeKind` when a word's `kind` is not a `MarkdownTokenKind` tag or
+/// the byte it addresses does not open with that kind, and
+/// `InvalidTapeOrder` when a word's length disagrees with the marker run at
+/// its offset or offsets do not strictly increase.
 pub const MarkdownNavigationError = error{
     PositionOutOfBounds,
     InvalidTapeKind,
@@ -887,15 +1104,39 @@ fn checkedMarkdownTapeKind(word: MarkdownTapeWord) MarkdownNavigationError!Markd
 }
 
 /// An owned Markdown marker tape. The source input remains borrowed.
+///
+/// One document owns `tape` and releases it in one `deinit`; `source` is a
+/// borrow of the `input` given to `buildMarkdownTape` and is never freed
+/// here. That source must stay alive and unmodified for as long as the
+/// document, any cursor made from it, or any span read through it is used —
+/// `root` and the cursor methods compare `input` against `source` by pointer
+/// and length, so a relocated copy is rejected rather than silently accepted.
+/// Copying a document copies the tape handle, so a copy is not a second owner
+/// and must not be `deinit`'d.
 pub const MarkdownDocument = struct {
+    /// One word per marker, in strictly increasing offset order.
     tape: []MarkdownTapeWord,
+    /// The borrowed source the tape was built from.
     source: []const u8,
 
+    /// Releases `tape` into `allocator`, which must be the allocator
+    /// `buildMarkdownTape` received. The borrowed source is untouched. The
+    /// document and every cursor over it are unusable afterward, and a
+    /// second call through any copy is a double free.
     pub fn deinit(self: *MarkdownDocument, allocator: std.mem.Allocator) void {
         allocator.free(self.tape);
         self.* = undefined;
     }
 
+    /// Cursor on the first marker, after re-validating the whole tape against
+    /// `input`.
+    ///
+    /// `input` must be the same slice `source` names — same pointer and
+    /// length — or this returns `error.InvalidSource`. Validation walks the
+    /// tape and rescans the source, so it costs a full pass; call it once and
+    /// walk the cursor. An empty tape returns `error.TapeOutOfBounds`. The
+    /// cursor borrows `self` and `input`, so neither may be released or
+    /// `deinit`'d while it is used.
     pub fn root(self: *const MarkdownDocument, input: []const u8) MarkdownNavigationError!MarkdownCursor {
         if (input.ptr != self.source.ptr or input.len != self.source.len) {
             return error.InvalidSource;
@@ -909,11 +1150,20 @@ pub const MarkdownDocument = struct {
         };
     }
 
+    /// The word at `tape_index`, or `error.TapeOutOfBounds`. The `kind` field
+    /// is returned unconverted and unchecked, so use `MarkdownTapeWord.tapeKind`
+    /// only on a word this document validated.
     pub fn word(self: *const MarkdownDocument, tape_index: usize) MarkdownNavigationError!MarkdownTapeWord {
         if (tape_index >= self.tape.len) return error.TapeOutOfBounds;
         return self.tape[tape_index];
     }
 
+    /// Marker bytes for `tape_index`, re-validated through `root` on the way.
+    ///
+    /// This runs the full `root` validation, so it is a whole-document check
+    /// rather than a single-word read; a cursor is cheaper for sequential
+    /// access. The result borrows `input` and is invalidated when the caller
+    /// writes or releases it.
     pub fn sourceSpan(
         self: *const MarkdownDocument,
         input: []const u8,
@@ -932,28 +1182,50 @@ pub const MarkdownDocument = struct {
     }
 };
 
+/// A positional walk over a validated `MarkdownDocument`.
+///
+/// Borrows the document pointer and original input. Keep the document alive and
+/// unmoved, and the input alive and unchanged, until the cursor is no longer used.
+/// Copies have independent positions; they still borrow the same storage.
+/// Methods check the accessed words, not every link or byte in the tape. Modified
+/// words can pass those checks; use an unmodified, validated document.
 pub const MarkdownCursor = struct {
+    /// The document this cursor walks. Borrowed for the cursor's lifetime.
     document: *const MarkdownDocument,
+    /// The source slice passed to `MarkdownDocument.root`. Borrowed.
     input: []const u8,
+    /// Index of the next word in `document.tape`. Equal to `document.tape.len`
+    /// once the walk is exhausted.
     position_index: usize = 0,
 
+    /// The word under the cursor, fully validated against `input`, or
+    /// `error.PositionOutOfBounds` once the walk is past the last word.
     pub fn peek(self: *const MarkdownCursor) MarkdownNavigationError!MarkdownTapeWord {
         return self.currentWord();
     }
 
+    /// Validates the word under the cursor and steps past it.
+    ///
+    /// Nothing moves when validation fails, so the cursor stays where it was
+    /// and may be advanced again after the caller repairs the cause.
     pub fn advance(self: *MarkdownCursor) MarkdownNavigationError!void {
         _ = try self.currentWord();
         self.position_index += 1;
     }
 
+    /// Index of the next word. Equal to `document.tape.len` when exhausted.
     pub fn position(self: *const MarkdownCursor) usize {
         return self.position_index;
     }
 
+    /// `span`.
     pub fn raw(self: *const MarkdownCursor) MarkdownNavigationError![]const u8 {
         return self.span();
     }
 
+    /// Marker bytes under the cursor, or the `MarkdownNavigationError` that
+    /// `peek` would return. The result borrows `input` and is invalidated when
+    /// the caller writes or releases it.
     pub fn span(self: *const MarkdownCursor) MarkdownNavigationError![]const u8 {
         const word_value = try self.currentWord();
         const start: usize = @intCast(word_value.offset);
@@ -964,6 +1236,7 @@ pub const MarkdownCursor = struct {
         return self.input[start .. start + length];
     }
 
+    /// `span`.
     pub fn sourceSpan(self: *const MarkdownCursor) MarkdownNavigationError![]const u8 {
         return self.span();
     }
@@ -1024,6 +1297,12 @@ fn validateMarkdownTape(
 }
 
 /// Builds a validated tape in one pass through the trusted marker scanner.
+///
+/// The returned document owns one tape allocation and borrows `input`, which
+/// must stay alive and unmodified. The tape holds at most `input.len` words
+/// and no marker run may exceed the `u24` payload; either bound, and an input
+/// longer than `u32` offsets, give `error.TapeTooLarge`. On
+/// `error.OutOfMemory` the caller owns nothing.
 pub fn buildMarkdownTape(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -1048,16 +1327,41 @@ pub fn buildMarkdownTape(
     };
 }
 
+/// The first invariant failure found in a caller-supplied index.
+///
+/// The value is a view, not an owner: `snippet` is a sub-slice of the `input`
+/// the validating entry point was given, so it stays valid only while those
+/// bytes do.
 pub const MarkdownDiagnostic = struct {
+    /// Which invariant failed. The four tags are `MarkdownError`'s.
     err: MarkdownError,
+    /// Byte offset into the input, clamped to `input.len`.
     byte_offset: usize,
+    /// One-based line number of `byte_offset`, clamped to
+    /// `std.math.maxInt(u32)`.
     line: u32,
+    /// One-based byte column of `byte_offset` inside its line, clamped to
+    /// `std.math.maxInt(u32)`. A line ending belongs to the line it
+    /// terminates, so a CRLF pair sits on that line's last two columns and no
+    /// line starts on one of its bytes.
     column: u32,
+    /// Up to 16 bytes of the input on each side of `byte_offset`, cut at the
+    /// line boundaries. The window holds line content only, so it never holds
+    /// a line ending.
     snippet: []const u8,
+    /// Offset of `snippet[0]` in the input, so the snippet can be located
+    /// with it.
     snippet_start: usize,
 };
 
 /// Validates the Stage1 stream and returns only its first invariant failure.
+///
+/// Builds an index from `input` and validates that index, so the index it
+/// checks always satisfies the invariants: a `MarkdownDiagnostic` needs an
+/// index the caller built or copied, and this entry point reports failures
+/// only as `error.OutOfMemory` and `error.TapeTooLarge`. `input` is not
+/// retained and the temporary index is released before this returns, so the
+/// diagnostic's `snippet` borrows `input` and nothing else.
 pub fn validateMarkdown(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -1070,7 +1374,28 @@ pub fn validateMarkdown(
     return validateMarkdownIndex(input, &structural_index);
 }
 
-/// Validates a copied or otherwise externally supplied Markdown index.
+/// Checks a copied or otherwise externally supplied `MarkdownStructuralIndex`
+/// against a fresh scan of `input`.
+///
+/// An index is accepted when its entries below `count` are, in order, exactly
+/// the markers `input` produces, so the index is never checked on its own: it
+/// is checked against the bytes it claims to describe. Entries at and past
+/// `count` are never read, so neither array has to be longer than `count` and
+/// the sentinel slots the indexer reserves past `count` are not read here.
+///
+/// Allocates nothing, so `error.OutOfMemory` is unreachable here even though
+/// `MarkdownValidationError` names it; the shared set is the one
+/// `validateMarkdown` returns. `structural_index` is read-only and
+/// `input` is borrowed for the duration, and the diagnostic's `snippet`
+/// borrows `input`.
+///
+/// Checks run in this order and stop at the first failure: the input and count
+/// ceilings and the tape size they imply as `error.TapeTooLarge`, then
+/// `MarkdownError.InvalidIndexCount` if `count` exceeds either array or the
+/// input length, then per entry `InvalidTokenIndex`, `InvalidTokenOrder` and
+/// `InvalidTokenKind`, then a rescan of the source whose extra markers,
+/// mismatched offsets and mismatched kinds surface as `InvalidTokenIndex` or
+/// `InvalidTokenKind`.
 pub fn validateMarkdownIndex(
     input: []const u8,
     structural_index: *const MarkdownStructuralIndex,
@@ -1120,6 +1445,16 @@ pub fn validateMarkdownIndex(
 }
 
 /// Creates a zero-copy diagnostic view into the source input.
+///
+/// Allocates nothing and cannot fail. `byte_offset` is clamped to `input.len`,
+/// so the returned `byte_offset` is the clamped value and an offset past the
+/// input reports the end of input rather than reading out of bounds. The
+/// result borrows `input` and is invalidated when the caller writes or
+/// releases it.
+///
+/// Lines break at CR, at LF and at a CRLF pair. A pair is one two-byte ending
+/// whose bytes both belong to the line it terminates, so `column` counts them
+/// and the next line starts after the pair.
 pub fn markdownDiagnosticAt(
     input: []const u8,
     err: MarkdownError,
@@ -1128,16 +1463,16 @@ pub fn markdownDiagnosticAt(
     const offset = @min(byte_offset, input.len);
     var line_start: usize = 0;
     var line_number: usize = 1;
-    var scan_offset: usize = 0;
-    while (scan_offset < offset) : (scan_offset += 1) {
-        if (input[scan_offset] == '\n') {
-            line_start = scan_offset + 1;
-            line_number += 1;
-        }
+    while (line_start < offset) {
+        const line_end = scalarLineEnd(input, line_start);
+        if (line_end >= offset) break;
+        const next_line_start = scalarNextLineStart(input, line_end);
+        if (next_line_start > offset) break;
+        line_start = next_line_start;
+        line_number += 1;
     }
 
-    var line_end = offset;
-    while (line_end < input.len and input[line_end] != '\n') : (line_end += 1) {}
+    const line_end = scalarLineEnd(input, line_start);
     const snippet_start = @max(line_start, offset -| 16);
     const snippet_limit = std.math.add(usize, offset, 16) catch input.len;
     const snippet_end = @min(line_end, snippet_limit);
@@ -1187,14 +1522,40 @@ fn markdownMarkerLength(
     };
 }
 
+/// The scanner's carry from one line to the next.
+///
+/// The type is published through `MarkdownStreamIndexer`, which holds these
+/// five values as its own fields rather than as one of this type, and it is
+/// the state every line pass reads and writes, so a consumer writing the
+/// indexer's five fields directly writes this. It owns nothing, holds no
+/// borrow, and a copy is a second independent carry; the indexer copies it in
+/// before a line and back out after one, so a value that is not the indexer's
+/// own is never consulted.
 const MarkdownScanState = struct {
+    /// `true` while a fenced code block is open; `fence_character` and
+    /// `fence_length` describe the fence that opened it.
     in_code_fence: bool,
+    /// `true` while an inline code run is open, and its run length in bytes is
+    /// `inline_code_length`.
     in_inline_code: bool,
+    /// Length in bytes of the unmatched inline code run, meaningful only while
+    /// `in_inline_code` is `true`.
     inline_code_length: usize,
+    /// The opening byte of the open fence, backtick or tilde, meaningful only
+    /// while `in_code_fence` is `true`.
     fence_character: u8,
+    /// Length in bytes of the open fence run, meaningful only while
+    /// `in_code_fence` is `true`.
     fence_length: usize,
 };
 
+/// The token sink the streaming scanner writes into, forwarding each marker to
+/// the indexer's own `line_start_offset`.
+///
+/// Reachable through the line pass `MarkdownStreamIndexer.processLineContents`
+/// builds one of, so a consumer reaching it sees a pointer to the indexer
+/// rather than a copy. It owns nothing, borrows the indexer, and must not
+/// outlive the line pass it was built for.
 const MarkdownStreamSink = struct {
     stream: *MarkdownStreamIndexer,
 
@@ -1258,6 +1619,15 @@ fn processMarkdownLineMarker(
     return false;
 }
 
+/// Errors the resident `Parser` family returns.
+///
+/// This is the shared resident vocabulary, so it is wider than any one call:
+/// the reader and cursor methods themselves produce `error.OutOfMemory`, the
+/// four `resident.Error` tags and `error.SourceOutOfBounds`, while
+/// `CapacityOverflow`, `CapacityExceeded` and `InputTooLarge` come from the
+/// document constructor. `InvalidTapeKind`, `InvalidTapeOrder` and
+/// `PositionOutOfBounds` belong to `MarkdownNavigationError` and are carried
+/// here only so one set names the family.
 pub const MarkdownOnDemandError = std.mem.Allocator.Error || resident.Error || error{
     CapacityOverflow,
     CapacityExceeded,
@@ -1268,18 +1638,51 @@ pub const MarkdownOnDemandError = std.mem.Allocator.Error || resident.Error || e
     SourceOutOfBounds,
 };
 
+/// A reusable resident Markdown parser: it indexes a document once and hands
+/// out a borrowed walk over the result.
+///
+/// The parser owns one candidate buffer and stores the `allocator` it was
+/// built with; `deinit` releases both and is the only release. It holds at
+/// most one active document — `initOnDemandDocument` returns
+/// `error.DocumentActive` while another is open — so it is not threadsafe and
+/// its own methods must not be reentered from one another. Copying a parser
+/// copies the buffer handle, so a copy is not a second owner.
 pub const Parser = struct {
+    /// The allocator passed to `init`. It is retained for the parser's
+    /// lifetime; `candidates` carries its own copy of it, so writing this
+    /// field redirects no allocation.
     allocator: std.mem.Allocator,
+    /// The shared offset and kind arrays every walk reads. The next
+    /// `initOnDemandDocument` overwrites them, which is why one document is
+    /// active at a time.
     candidates: resident.IndexBuffer(MarkdownTokenKind, false),
+    /// The single-document lease. Its generation advances on every document,
+    /// so a reader held across two documents fails instead of reading the
+    /// newer one's markers.
     resident_state: resident.State = .{},
+    /// Largest `input` accepted, in bytes. `0` means no ceiling: the candidate
+    /// buffer then grows to whatever each document needs.
     max_capacity: usize,
+    /// Whether `max_capacity` is enforced. `init` derives it from
+    /// `max_capacity == 0`, and writing it changes which documents are
+    /// accepted.
     grow_on_demand: bool,
 
+    /// Errors `init` returns: `error.InputTooLarge` for a `max_capacity`
+    /// beyond `u32`, `error.CapacityOverflow` for a reservation that
+    /// overflows, and `error.OutOfMemory` from it.
     pub const InitError = std.mem.Allocator.Error || error{
         CapacityOverflow,
         InputTooLarge,
     };
 
+    /// Builds a parser over `allocator`, reserving room for `max_capacity`
+    /// markers up front when it is nonzero.
+    ///
+    /// `max_capacity` above `std.math.maxInt(u32)` returns
+    /// `error.InputTooLarge` before any allocation, and `error.OutOfMemory`
+    /// releases the reservation so the caller owns nothing. The allocator
+    /// must outlive the parser.
     pub fn init(allocator: std.mem.Allocator, max_capacity: usize) InitError!Parser {
         if (max_capacity > std.math.maxInt(u32)) return error.InputTooLarge;
         var candidates = resident.IndexBuffer(MarkdownTokenKind, false).init(allocator);
@@ -1293,6 +1696,13 @@ pub const Parser = struct {
         };
     }
 
+    /// Releases the candidate buffer into the allocator it was built with.
+    ///
+    /// Asserts that no document is open, so Debug and ReleaseSafe diagnose a
+    /// missing `OnDemandDocument.deinit` while ReleaseFast and ReleaseSmall do
+    /// not. Every `OnDemandDocument`, `EventReader` and `TokenCursor` made
+    /// from this parser is unusable afterward, and a second call is a double
+    /// free.
     pub fn deinit(self: *Parser) void {
         self.resident_state.deinit();
         self.candidates.deinit();
@@ -1307,6 +1717,15 @@ pub const Parser = struct {
         try self.candidates.reserve(input.len);
     }
 
+    /// Indexes `input` once and returns a document that borrows it.
+    ///
+    /// `error.DocumentActive` while another document from this parser is open.
+    /// `error.InputTooLarge` past `std.math.maxInt(u32)` and, when
+    /// `max_capacity` is nonzero, `error.CapacityExceeded` past it are
+    /// decided before the scan; `error.OutOfMemory` from the reservation
+    /// releases the lease, so the parser is unchanged and the caller owns
+    /// nothing. `input` is not copied: it must stay alive and unmodified while
+    /// the document and every walk made from it are used.
     pub fn initOnDemandDocument(
         self: *Parser,
         input: []const u8,
@@ -1332,24 +1751,59 @@ pub const Parser = struct {
     }
 };
 
+/// One resident Markdown marker, borrowed from the document's source.
+///
+/// The value allocates nothing and owns no bytes: `raw` is a sub-slice of the
+/// `input` the document was opened with.
 pub const Event = struct {
+    /// Marker kind at `offset`.
     kind: MarkdownTokenKind,
+    /// Source offset of the marker.
     offset: u32,
+    /// Marker bytes. Borrows the document's input.
     raw: []const u8,
 };
 
+/// `Event`.
 pub const Token = Event;
 
+/// A borrowed resident Markdown document: one indexed source plus the lease
+/// that keeps it current.
+///
+/// The document owns nothing and reaches the parser's candidate buffer through
+/// its lease rather than by copy. `input` is borrowed and must stay alive and
+/// unmodified; `parser` must outlive the document and must not be `deinit`'d
+/// while it is open. Only one walk exists at a time — `eventReader` and
+/// `tokenCursor` return `error.FocusAlreadyClaimed` to a second caller — and
+/// any walk made from this document returns `error.DocumentReleased` once
+/// `deinit` runs or another document is opened.
 pub const OnDemandDocument = struct {
+    /// The parser whose candidate buffer this document reads.
+    ///
+    /// `eventReader` and `tokenCursor` hand this same pointer to the walk, so
+    /// the parser must stay at the same address while the document and any
+    /// walk from it are used: a moved or copied parser is a different candidate
+    /// buffer, and the next `initOnDemandDocument` overwrites this one's.
     parser: *Parser,
+    /// The borrowed source, invalidated when the caller writes or releases it.
     input: []const u8,
+    /// The document lease, released by `deinit`.
     lease: resident.Lease,
+    /// Number of markers indexed from `input`.
     count: usize,
 
+    /// Releases the lease, which frees no memory. The document is unusable
+    /// afterward, and every `EventReader` and `TokenCursor` made from it
+    /// starts returning `error.DocumentReleased`.
     pub fn deinit(self: *OnDemandDocument) void {
         self.lease.release();
         self.* = undefined;
     }
+    /// A reader over the markers. It claims the document's single focus, so
+    /// `error.FocusAlreadyClaimed` when another walk is open; on that error
+    /// the existing walk is unaffected. The reader borrows the parser's
+    /// candidate buffer and `input`, so both must stay live and unmodified
+    /// while it is used.
     pub fn eventReader(self: *OnDemandDocument) MarkdownOnDemandError!EventReader {
         return .{
             .parser = self.parser,
@@ -1359,6 +1813,8 @@ pub const OnDemandDocument = struct {
         };
     }
 
+    /// A cursor over the markers, with the same focus claim and borrows as
+    /// `eventReader`.
     pub fn tokenCursor(self: *OnDemandDocument) MarkdownOnDemandError!TokenCursor {
         return .{
             .parser = self.parser,
@@ -1369,8 +1825,12 @@ pub const OnDemandDocument = struct {
     }
 };
 
+/// `OnDemandDocument`.
 pub const MarkdownOnDemandDocument = OnDemandDocument;
 
+/// `Parser.initOnDemandDocument` for a caller that would only name this
+/// constructor. The returned document borrows `input` and owns only its
+/// lease, which `OnDemandDocument.deinit` releases.
 pub fn initOnDemandDocument(
     parser: *Parser,
     input: []const u8,
@@ -1404,12 +1864,31 @@ const MarkdownReaderBase = struct {
     }
 };
 
+/// A sequential reader over one `OnDemandDocument`'s markers.
+///
+/// The reader owns nothing: it borrows the parser's shared candidate buffer
+/// and the document's `input`, so both must stay live and unmodified while it
+/// is used. Every `Event` it returns borrows that `input`. It holds the
+/// document's single focus, so a second walk on the same document is refused
+/// at construction, and its position advances in lockstep with any other
+/// copy: a copied reader that lags returns `error.OutOfOrderIteration`, and
+/// both return `error.DocumentReleased` once the document closes. Copying the
+/// reader is free and the copies are independent values sharing one position.
 pub const EventReader = struct {
+    /// The parser whose candidate buffer is read.
     parser: *Parser,
+    /// The document's borrowed source; every `Event.raw` points into it.
     input: []const u8,
+    /// Marker count the walk ends at.
     count: usize,
+    /// The document focus and position. Copies of a reader share it.
     guard: resident.Guard,
 
+    /// The next `Event` without consuming it, or `null` at the end. Returns
+    /// `error.DocumentReleased` after the document closes,
+    /// `error.OutOfOrderIteration` when another copy of this reader has
+    /// advanced past it, and `error.SourceOutOfBounds` if a stored offset no
+    /// longer addresses `input`.
     pub fn peek(self: *const EventReader) MarkdownOnDemandError!?Event {
         var base: MarkdownReaderBase = .{
             .parser = self.parser,
@@ -1420,27 +1899,46 @@ pub const EventReader = struct {
         return base.event();
     }
 
+    /// The next `Event` and the position past it, or `null` at the end. The
+    /// position does not move when `peek` fails.
     pub fn next(self: *EventReader) MarkdownOnDemandError!?Event {
         const event = try self.peek() orelse return null;
         try self.guard.advance();
         return event;
     }
 
+    /// Consumes the next marker. Markdown has no nesting, so this is
+    /// `next` with the result discarded, and `null` at the end is not an
+    /// error.
     pub fn skip(self: *EventReader) MarkdownOnDemandError!void {
         _ = try self.next();
     }
 
+    /// Events already consumed. Equal to the document's `count` at the end.
     pub fn position(self: *const EventReader) usize {
         return self.guard.expected_position;
     }
 };
 
+/// A sequential cursor over one `OnDemandDocument`'s markers.
+///
+/// It borrows exactly what `EventReader` borrows and answers the same
+/// staleness errors: `error.DocumentReleased` once the document closes and
+/// `error.OutOfOrderIteration` for a copy another copy has advanced past.
+/// Markdown is a marker stream rather than a tree, so this cursor has no
+/// subtree to descend into.
 pub const TokenCursor = struct {
+    /// The parser whose candidate buffer is read.
     parser: *Parser,
+    /// The document's borrowed source; every `Token.raw` points into it.
     input: []const u8,
+    /// Marker count the walk ends at.
     count: usize,
+    /// The document focus and position. Copies of a cursor share it.
     guard: resident.Guard,
 
+    /// The next `Token` without consuming it, or `null` at the end, with the
+    /// same errors as `EventReader.peek`.
     pub fn peek(self: *const TokenCursor) MarkdownOnDemandError!?Token {
         var base: MarkdownReaderBase = .{
             .parser = self.parser,
@@ -1451,6 +1949,7 @@ pub const TokenCursor = struct {
         return base.event();
     }
 
+    /// The next `Token` and the position past it, or `null` at the end.
     pub fn advance(self: *TokenCursor) MarkdownOnDemandError!?Token {
         const token = try self.peek() orelse return null;
         try self.guard.advance();
@@ -1458,10 +1957,15 @@ pub const TokenCursor = struct {
     }
 
     /// Markdown is a sequential marker stream, not a CommonMark tree.
+    ///
+    /// This consumes the next marker and stops. It exists only to satisfy the
+    /// cursor shape shared with the tree-building formats; it never descends,
+    /// so it is `advance` with the token discarded.
     pub fn skipChild(self: *TokenCursor) MarkdownOnDemandError!void {
         _ = try self.advance();
     }
 
+    /// Tokens already consumed. Equal to the document's `count` at the end.
     pub fn position(self: *const TokenCursor) usize {
         return self.guard.expected_position;
     }
@@ -1768,6 +2272,53 @@ fn expectStreamMatchesReference(
         expected.kinds[0..expected.count],
         actual.kinds[0..actual.count],
     );
+}
+
+// Checks what a direct `markdownDiagnosticAt` call reports at `byte_offset`:
+// line, column, snippet and the snippet's start offset.
+fn expectDiagnosticAt(
+    input: []const u8,
+    byte_offset: usize,
+    line: u32,
+    column: u32,
+    snippet: []const u8,
+    snippet_start: usize,
+) !void {
+    const diagnostic = markdownDiagnosticAt(input, error.InvalidTokenIndex, byte_offset);
+    try testing.expectEqual(error.InvalidTokenIndex, diagnostic.err);
+    try testing.expectEqual(@min(byte_offset, input.len), diagnostic.byte_offset);
+    try testing.expectEqual(line, diagnostic.line);
+    try testing.expectEqual(column, diagnostic.column);
+    try testing.expectEqualStrings(snippet, diagnostic.snippet);
+    try testing.expectEqual(snippet_start, diagnostic.snippet_start);
+}
+
+// Checks what `validateMarkdownIndex` reports for a one-entry index that
+// claims a heading at `byte_offset` the scanner does not produce there.
+fn expectForgedIndexDiagnostic(
+    input: []const u8,
+    byte_offset: usize,
+    line: u32,
+    column: u32,
+    snippet: []const u8,
+    snippet_start: usize,
+) !void {
+    var indexes = [_]u32{@intCast(byte_offset)};
+    var kinds = [_]MarkdownTokenKind{.heading};
+    const forged: MarkdownStructuralIndex = .{
+        .indexes = &indexes,
+        .kinds = &kinds,
+        .count = 1,
+    };
+
+    const diagnostic = (try validateMarkdownIndex(input, &forged)) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(error.InvalidTokenIndex, diagnostic.err);
+    try testing.expectEqual(byte_offset, diagnostic.byte_offset);
+    try testing.expectEqual(line, diagnostic.line);
+    try testing.expectEqual(column, diagnostic.column);
+    try testing.expectEqualStrings(snippet, diagnostic.snippet);
+    try testing.expectEqual(snippet_start, diagnostic.snippet_start);
 }
 
 test "Markdown stream matches one-shot indexing at every partition" {
@@ -2461,6 +3012,94 @@ test "Markdown Stage2 rejects forged mid-line heading" {
         return error.TestUnexpectedResult;
     try testing.expectEqual(error.InvalidTokenKind, diagnostic.err);
     try testing.expectEqual(@as(usize, 5), diagnostic.byte_offset);
+}
+
+test "parser audit: markdown diagnostic counts CR, LF and CRLF line endings" {
+    const cr = "# a\r# b\r";
+    const lf = "# a\n# b\n";
+    const crlf = "# a\r\n# b\r\n";
+
+    // A line-ending byte belongs to the line it terminates, so the marker that
+    // opens the second line is line 2 column 1 in every style.
+    try expectDiagnosticAt(cr, 3, 1, 4, "# a", 0);
+    try expectDiagnosticAt(cr, 4, 2, 1, "# b", 4);
+    try expectDiagnosticAt(lf, 3, 1, 4, "# a", 0);
+    try expectDiagnosticAt(lf, 4, 2, 1, "# b", 4);
+
+    // A CRLF pair is one two-byte ending: offset 3 is its CR and offset 4 its
+    // LF, both still on line 1, and only offset 5 opens line 2.
+    try expectDiagnosticAt(crlf, 3, 1, 4, "# a", 0);
+    try expectDiagnosticAt(crlf, 4, 1, 5, "# a", 0);
+    try expectDiagnosticAt(crlf, 5, 2, 1, "# b", 5);
+
+    // Columns are one-based byte positions, so the marker that follows a
+    // two-byte scalar is column 3.
+    const multibyte = "é# b\r# c\r";
+    try expectDiagnosticAt(multibyte, 2, 1, 3, "é# b", 0);
+    try expectDiagnosticAt(multibyte, 6, 2, 1, "# c", 6);
+}
+
+test "parser audit: markdown diagnostic snippets exclude line-ending bytes" {
+    const cr = "# a\r# b\r";
+    const lf = "# a\n# b\n";
+    const crlf = "# a\r\n# b\r\n";
+
+    // The snippet holds line content only: no lone CR, and neither byte of a
+    // CRLF pair.
+    try expectDiagnosticAt(cr, 3, 1, 4, "# a", 0);
+    try expectDiagnosticAt(cr, 7, 2, 4, "# b", 4);
+    try expectDiagnosticAt(lf, 3, 1, 4, "# a", 0);
+    try expectDiagnosticAt(lf, 7, 2, 4, "# b", 4);
+    try expectDiagnosticAt(crlf, 3, 1, 4, "# a", 0);
+    try expectDiagnosticAt(crlf, 4, 1, 5, "# a", 0);
+    try expectDiagnosticAt(crlf, 8, 2, 4, "# b", 5);
+    try expectDiagnosticAt(crlf, 9, 2, 5, "# b", 5);
+}
+
+test "parser audit: markdown diagnostic bounds snippets at sixteen bytes each side" {
+    const long_line = "a" ** 40;
+    try expectDiagnosticAt(long_line, 0, 1, 1, long_line[0..16], 0);
+    try expectDiagnosticAt(long_line, 4, 1, 5, long_line[0..20], 0);
+    try expectDiagnosticAt(long_line, 20, 1, 21, long_line[4..36], 4);
+    try expectDiagnosticAt(long_line, 39, 1, 40, long_line[23..40], 23);
+
+    // The window stops at the line start, the line end, or the input end.
+    const two_lines = "0123456789\n" ++ "abcdefghijklmnopqrstuvwxyz0123456789";
+    try expectDiagnosticAt(two_lines, 11, 2, 1, two_lines[11..27], 11);
+    try expectDiagnosticAt(two_lines, 19, 2, 9, two_lines[11..35], 11);
+    try expectDiagnosticAt(two_lines, 41, 2, 31, two_lines[25..47], 25);
+}
+
+test "parser audit: markdown diagnostic reports end of input and clamps later offsets" {
+    const cr = "# a\r# b";
+    const lf = "# a\n# b";
+    const crlf = "# a\r\n# b";
+
+    // End of input is one past the last byte of the line it closes.
+    try expectDiagnosticAt(cr, cr.len, 2, 4, "# b", 4);
+    try expectDiagnosticAt(lf, lf.len, 2, 4, "# b", 4);
+    try expectDiagnosticAt(crlf, crlf.len, 2, 4, "# b", 5);
+
+    // An offset past the input reports that clamped end of input.
+    try expectDiagnosticAt(cr, cr.len + 1000, 2, 4, "# b", 4);
+    try expectDiagnosticAt(crlf, std.math.maxInt(usize), 2, 4, "# b", 5);
+
+    // A trailing line ending opens the empty line that follows it.
+    try expectDiagnosticAt("# a\n# b\n", 8, 3, 1, "", 8);
+    try expectDiagnosticAt("# a\r# b\r", 8, 3, 1, "", 8);
+    try expectDiagnosticAt("# a\r\n# b\r\n", 10, 3, 1, "", 10);
+}
+
+test "parser audit: markdown diagnostic from a forged index counts CR line endings" {
+    const cr = "# a\r# b\r";
+    const lf = "# a\n# b\n";
+    const crlf = "# a\r\n# b\r\n";
+
+    // The validator fails on the supplied offset, so the diagnostic it builds
+    // carries the same coordinates a direct call reports.
+    try expectForgedIndexDiagnostic(cr, 4, 2, 1, "# b", 4);
+    try expectForgedIndexDiagnostic(lf, 4, 2, 1, "# b", 4);
+    try expectForgedIndexDiagnostic(crlf, 5, 2, 1, "# b", 5);
 }
 
 test "Markdown marker source spans preserve fences and ordered markers" {

@@ -1,38 +1,91 @@
+//! Strict JSON string and number decoding into caller-provided storage.
+//!
+//! `decodeString` turns escaped string content into bytes and `parseNumber`
+//! classifies and converts a complete number token. Neither allocates: one
+//! writes into a slice the caller supplies, the other returns a value and a
+//! borrowed view of the caller's own bytes, so there is nothing to release
+//! afterwards. Callers reach this as `json_value` from the package root.
+//!
+//! The module validates and converts values that are already delimited. It does
+//! not find them in a document: locating tokens, structural indexing and tape
+//! building live in `stream`, `stage1` and `stage2`.
+
 const std = @import("std");
 const simd = @import("simd.zig");
 
-/// Errors returned while decoding strict JSON string content into caller storage.
+/// Every way `decodeString` can fail.
+///
+/// All four are decided before the first output byte is written, so no tag
+/// leaves a partially decoded buffer behind.
 pub const StringDecodeError = error{
+    /// A `"` or a byte below `0x20` inside the content, an escape outside the
+    /// strict JSON set, or a `\uXXXX` that is not a complete code unit or a
+    /// complete surrogate pair.
     InvalidEscape,
+    /// The content is not valid UTF-8.
     InvalidUtf8,
+    /// The decoded form does not fit in the output slice.
     CapacityExceeded,
+    /// `raw` and `output` share bytes, so decoding would overwrite input it
+    /// has not read yet.
     OverlappingBuffers,
 };
 
-/// The typed representation of a strict JSON number.
+/// The three forms a validated strict JSON number can take.
+///
+/// Which one `parseNumber` produces follows from the token's shape rather than
+/// its magnitude.
 pub const NumberValue = union(enum) {
+    /// An integral token starting with `-`.
     signed: i64,
+    /// An integral token starting with a digit.
     unsigned: u64,
+    /// A token carrying a fraction or an exponent, or the spelling `-0`.
     float: f64,
 };
 
-/// A number view borrows both its source span and no converted storage.
+/// A validated number together with the exact token it came from.
+///
+/// `raw` is the caller's own slice, returned by identity rather than copied, so
+/// the value borrows whatever memory `raw` pointed at. A copy of the struct is
+/// independent of the original and shares that memory.
 pub const NumberView = struct {
+    /// The token exactly as written, borrowed from the caller's input.
     raw: []const u8,
+    /// Its converted value; the variant follows the token's shape.
     value: NumberValue,
 };
 
-/// Errors returned while validating and converting a strict JSON number.
+/// The single failure `parseNumber` reports.
+///
+/// A grammar violation and a value that does not convert both arrive as
+/// `error.InvalidNumber`, so a caller that only needs to know whether the
+/// token is usable as written does not have to separate them.
 pub const NumberParseError = error{
     InvalidNumber,
 };
 
-/// Decodes JSON string contents into caller-provided storage without allocating.
+/// Decodes strict JSON string content into caller-provided storage, without
+/// allocating.
 ///
-/// `raw` excludes the surrounding quotes but remains strict JSON escaped content.
-/// The returned slice borrows `output`; `raw` and `output` must not overlap. The
-/// complete input and required output length are validated before any output byte
-/// is written, so every error leaves `output` unchanged.
+/// `raw` is the content between the delimiters and stays escaped as written; a
+/// `"` or any byte below `0x20` inside it is `error.InvalidEscape`, as is an
+/// escape outside the strict set. `\uXXXX` produces one to four UTF-8 bytes,
+/// and a surrogate pair must be complete in both halves.
+///
+/// The checks run in a fixed order, all before any output is written: overlap
+/// first, then UTF-8, then the grammar and the required length. So
+/// `error.OverlappingBuffers` is reported even when the content is also
+/// malformed, and `error.InvalidUtf8` before any escape is examined. On every
+/// error `output` keeps the bytes it had.
+///
+/// `output` must be at least as long as the decoded form, which may be shorter
+/// than `raw` because escapes collapse, and no terminator is appended.
+/// `error.CapacityExceeded` reports the shortfall; the value needed is exactly
+/// the length the successful call returns.
+///
+/// The result is `output[0..decoded_len]`, so it borrows `output` and is
+/// invalidated when the caller writes to or releases it.
 pub fn decodeString(raw: []const u8, output: []u8) StringDecodeError![]u8 {
     if (rangesOverlap(raw, output)) return error.OverlappingBuffers;
 
@@ -46,12 +99,24 @@ pub fn decodeString(raw: []const u8, output: []u8) StringDecodeError![]u8 {
     return output[0..decoded_len];
 }
 
-/// Validates and converts a complete strict JSON number without allocating.
+/// Validates and converts one complete strict JSON number, without allocating.
 ///
-/// `raw` is returned by identity as a borrowed slice. Integral input is retained
-/// as signed or unsigned 64-bit data at the same boundaries as the benchmark
-/// conversion policy. Integer overflow is rejected instead of truncating. A
-/// decimal/exponent input, and the spelling `-0`, is converted to finite f64.
+/// `raw` is the whole token. The grammar is exactly
+/// `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`: no leading `+`, no
+/// leading zeros, no leading-dot fraction, and nothing after the number.
+/// Anything else is `error.InvalidNumber`, as is a token the conversion cannot
+/// represent.
+///
+/// The shape of the token selects the variant, not its magnitude. A fraction or
+/// an exponent converts to `f64`, and so does the spelling `-0`; a value that
+/// comes out non-finite is rejected rather than returned. A token that starts
+/// with `-` converts to `i64` and one that starts with a digit to `u64`, and a
+/// value outside either range is rejected instead of truncated. So
+/// `18446744073709551616` is `error.InvalidNumber` rather than a wrapped `0`.
+///
+/// `NumberView.raw` is `raw` itself, so nothing is copied: the returned value
+/// borrows the caller's slice and is invalidated when the caller writes to or
+/// releases it.
 pub fn parseNumber(raw: []const u8) NumberParseError!NumberView {
     const has_fraction_or_exponent = try validateNumberGrammar(raw);
 

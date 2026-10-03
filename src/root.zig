@@ -1,3 +1,19 @@
+//! Native Zig byte primitives, structural indexes and parsing over caller-owned input.
+//!
+//! Zig 0.16.0 is the development compiler. Import this root through the registered
+//! `simd` module: add `dependency.module("simd")` to the consumer's import table.
+//! `simd`, `stage1`, `stage2`, `json_value`, `ondemand`, `stream` and `debug` expose
+//! the core contracts; `formats` selects each format without changing its dialect.
+//! The short root aliases name the same declarations, not independent implementations.
+//!
+//! For eager JSON, build a tape with `formats.json.buildJsonTape`, immediately defer
+//! `document.deinit(allocator)`, then call `document.root(input)` with the exact original
+//! immutable source. Tapes own allocations; source bytes remain the caller's.
+//! Resident readers require live, address-stable owners and one traversal focus.
+//! Streaming produces indexes, not source-safe streaming Stage 2 documents.
+//! Semantic CommonMark and extended YAML are separate opt-in contracts and do not stream.
+//! This library opens no files and provides no C ABI; see README.md for package routes.
+
 const std = @import("std");
 const testing = std.testing;
 
@@ -34,6 +50,7 @@ const yaml_extended_format = @import("formats/yaml_extended.zig");
 
 pub const StructuralIndex = stage1.StructuralIndex;
 
+/// Format-specific indexing, tape and resident APIs, plus separate semantic profiles.
 pub const formats = struct {
     pub const json = json_format;
     pub const jsonl = jsonl_format;

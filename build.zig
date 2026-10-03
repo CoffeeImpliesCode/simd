@@ -1,3 +1,7 @@
+//! Build and publication routes for the native Zig `simd` package on Zig 0.16.0.
+//! `dependency.module("simd")` carries its generated width options; installed artifacts
+//! are the build-only `simd-static` archive and the `simd` sample visualizer.
+
 const std = @import("std");
 
 /// SIMD widths exercised by `zig build check`.
@@ -25,6 +29,7 @@ const fmt_paths = [_][]const u8{
     "src",
     "test",
     "scripts",
+    "examples",
     "library_test.zig",
     "bench.zig",
     "kernel_bench.zig",
@@ -254,9 +259,9 @@ fn addSemanticContract(
     });
 }
 
-// Although this function looks imperative, note that its job is to
-// declaratively construct a build graph that will be executed by an external
-// runner.
+/// Registers the native module, installed artifacts and named development checks.
+/// Graph construction records no benchmark archive. Consumers obtain the configured
+/// module through `dependency.module("simd")`, including its generated width options.
 pub fn build(b: *std.Build) void {
     // Standard target options allows the person running `zig build` to choose
     // what target to build for. Here we do not override the defaults, which
@@ -288,14 +293,8 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption(?usize, "vector_len", vector_len);
 
-    // This creates a "module", which represents a collection of source files alongside
-    // some compilation options, such as optimization mode and linked system libraries.
-    // Every executable or library we compile will be based on one or more modules.
-    const lib_mod = b.createModule(.{
-        // `root_source_file` is the Zig "entry point" of the module. If a module
-        // only contains e.g. external object files, you can make this `null`.
-        // In this case the main source file is merely a path, however, in more
-        // complicated build scripts, this could be a generated file.
+    // The registered module is the native consumer route, with its build options attached.
+    const lib_mod = b.addModule("simd", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -398,7 +397,7 @@ pub fn build(b: *std.Build) void {
     // for actually invoking the compiler.
     const lib = b.addLibrary(.{
         .linkage = .static,
-        .name = "simd",
+        .name = "simd-static",
         .root_module = lib_mod,
     });
 
@@ -441,6 +440,19 @@ pub fn build(b: *std.Build) void {
     // This will evaluate the `run` step rather than the default, which is "install".
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
+
+    const consumer_exe = b.addExecutable(.{
+        .name = "simd-consumer-example",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/consumer.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    consumer_exe.root_module.addImport("simd", lib_mod);
+    const consumer_run = b.addRunArtifact(consumer_exe);
+    const consumer_step = b.step("example", "Run the native consumer ownership example");
+    consumer_step.dependOn(&consumer_run.step);
 
     // Creates test executables for the public root, source-local library
     // declarations, executable, and deterministic fuzz roots.
@@ -783,6 +795,7 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&semantic_bench_exe.step);
     check_step.dependOn(&semantic_bench_runner_exe.step);
     check_step.dependOn(&visualizer_smoke.step);
+    check_step.dependOn(&consumer_run.step);
     addWidthMatrix(b, check_step, target, optimize, vector_len);
     check_step.dependOn(&zig_gate.step);
     check_step.dependOn(&zbc.step);

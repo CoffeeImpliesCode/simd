@@ -9,32 +9,77 @@ pub const Mode = enum {
     json5,
 };
 
+/// Which comment body a scan is currently inside.
 pub const CommentState = enum {
+    /// Not inside a comment.
     none,
+    /// Inside `// ...`, which ends at a line terminator.
     line,
+    /// Inside `/* ... */`, which ends at `*/`.
     block,
 };
 
 /// The bounded lexical state carried between scanner feeds.
 ///
-/// The state contains no input bytes and owns no allocation. Prefix buffers are
-/// limited to one UTF-8 sequence or one comment terminator.
+/// The state holds no input bytes and owns no allocation: the prefix buffers
+/// below are fixed-size and hold at most one UTF-8 sequence or one comment
+/// terminator. `.{}` is the start state for an input beginning at offset `0`,
+/// and the scanner moves it forward from there.
+///
+/// The value is a plain struct. It needs no stable address, and copying one
+/// copies the whole scan position, so two copies then describe the same point
+/// of the same input and neither observes the other.
+///
+/// Most fields are internal bookkeeping for the scanner and are meaningless
+/// to a caller that has not fed anything. `next_offset` and `comment` are the
+/// two a caller may reasonably read.
 pub const State = struct {
+    /// Whether the scan sits inside a quoted string.
     in_string: bool = false,
+    /// Whether the byte just consumed belongs to a bare atom. This is what
+    /// keeps two adjacent atom bytes in one token rather than two.
     in_atom: bool = false,
+    /// The delimiter of the string being scanned, or `0` when not in one.
+    /// Strict modes always use `'"'`; a dialect mode records the byte that was
+    /// actually opened, which is how `'` and `"` are told apart.
     quote_delimiter: u8 = 0,
+    /// Which comment body the scan sits in, if any.
     comment: CommentState = .none,
+    /// Whether the last valid lane of the previous block was a backslash, so a
+    /// backslash run may still be open across the block boundary.
     ends_in_backslash: bool = false,
+    /// Whether that open run had odd length at the end of the previous block.
     backslash_run_odd: bool = false,
+    /// A `/` ended the previous block, so whether it opens a comment depends on
+    /// the byte that follows.
     pending_slash: bool = false,
+    /// A `\` ended the previous block.
     pending_escape: bool = false,
+    /// Absolute offset of that `\`, which is where a JSON5 identifier escape
+    /// starts if the next byte turns out to be `u`.
     pending_escape_offset: usize = 0,
+    /// How many bytes of a possible multi-byte UTF-8 sequence are buffered, `0`
+    /// when none is. A JSON5-only feature: other modes treat those bytes as
+    /// ordinary atoms.
     pending_unicode_len: u2 = 0,
+    /// Those buffered bytes, in order. Only the first `pending_unicode_len`
+    /// entries are live; the rest keep their previous values.
     pending_unicode: [3]u8 = .{ 0, 0, 0 },
+    /// Absolute offset of the first buffered byte.
     pending_unicode_offset: usize = 0,
+    /// Whether a block comment's last byte was `*`, so the next byte may close
+    /// it.
     block_comment_ends_in_star: bool = false,
+    /// How many bytes of a possible U+2028 or U+2029 are buffered at the end of
+    /// a line comment, `0` when none is. At most two, because the byte that
+    /// decides whether it is one of those two is the one being read now.
     pending_line_comment_unicode_len: u2 = 0,
+    /// The first two bytes of that sequence, in order. Which of them are live
+    /// is what the count above says.
     pending_line_comment_unicode: [2]u8 = .{ 0, 0 },
+    /// Absolute offset the next feed must begin at. A feed that disagrees is
+    /// `error.NonContiguousInput`, so this is what proves a feed continues the
+    /// same source rather than starting another one.
     next_offset: usize = 0,
 };
 

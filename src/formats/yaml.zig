@@ -1,3 +1,25 @@
+//! YAML indexing, validation and navigation for one restricted profile.
+//!
+//! This module implements the `yaml-basic-1.2.2` grammar and refuses the rest
+//! of YAML with `error.Unsupported`: directives, tags, anchors, aliases,
+//! explicit `?` keys, block `|` and folded `>` scalars, the reserved `@` and
+//! `` ` `` indicators, flow collections where a key is expected, `\N` and the
+//! other non-basic escapes, a second `---` document, and any construct that
+//! would need a second line to finish. Malformed input inside the profile is
+//! `error.Invalid` instead, so the two are distinguishable without parsing.
+//! The extended grammar lives in `formats.yaml_extended`, which selects
+//! `Profile.extended`.
+//!
+//! A consumer reaches this module as `simd.formats.yaml`, or by importing
+//! `formats/yaml.zig` relatively.
+//!
+//! `indexYaml` and `validateYaml` read `input` in one call and copy offsets
+//! and lengths, so `input` may be released when they return. `buildYamlTape`
+//! and `YamlDocument.root` borrow `input`, which must stay alive and
+//! unmodified while the document, its cursors and its spans are read. Every
+//! allocating entry point takes the caller's allocator; the resident `Parser`
+//! allocates nothing and ignores the allocator its `init` is handed.
+
 const std = @import("std");
 const simd = @import("../core/simd.zig");
 const stage1 = @import("../core/stage1.zig");
@@ -6,17 +28,35 @@ const source = @import("yaml_source.zig");
 
 const testing = std.testing;
 const max_u24: usize = std.math.maxInt(u24);
+/// U+FEFF in UTF-8. A byte order mark at the head of a stream, and the one
+/// character the shared source check reads only as quoted content.
+const bom = "\xef\xbb\xbf";
+/// Deepest block and flow nesting this module accepts, in collections. A
+/// document that would nest further fails with `error.DepthExceeded` rather
+/// than growing a frame stack, because every engine here holds its frames in
+/// a fixed `yaml_max_depth` array.
 pub const yaml_max_depth: usize = 1024;
 
 /// Named parser profiles. The default remains the restricted basic grammar.
+///
+/// The tag names the grammar, not a switch this module reads: `basic` is what
+/// `profile` selects here, and `extended` names the grammar implemented by
+/// `formats.yaml_extended`, which reuses this enum and this module's
+/// `profileLabel`.
 pub const Profile = enum {
     basic,
     extended,
 };
 
+/// The profile this module implements. A sibling module may redeclare its own
+/// value of the same type; a caller compares labels, not this binding.
 pub const profile: Profile = .basic;
+/// `profileLabel(profile)`, for a caller that needs a string next to the
+/// profile itself.
 pub const profile_label = "yaml-basic-1.2.2";
 
+/// The published label for `selected`, for a corpus or report header. The
+/// result is a static string that is never freed.
 pub fn profileLabel(selected: Profile) []const u8 {
     return switch (selected) {
         .basic => "yaml-basic-1.2.2",
@@ -49,24 +89,36 @@ pub const YamlError = error{
     DepthExceeded,
 };
 
+/// Errors `indexYaml`, `indexYamlImpl` and `scalarIndexYaml` return. They
+/// allocate an index, so `error.OutOfMemory` is reachable; `TapeTooLarge` is
+/// an unrepresentable offset or span, and the `YamlError` tags are the
+/// profile verdicts.
 pub const YamlIndexError = std.mem.Allocator.Error || YamlError || error{
     CapacityOverflow,
     InputTooLarge,
     TapeTooLarge,
 };
 
+/// Errors `validateYaml` and `validateYamlIndex` return. No `YamlError` tag
+/// appears in it: both entry points report a grammar or profile failure as a
+/// `YamlDiagnostic`, so only the allocator and sizing tags surface as errors.
 pub const YamlValidationError = std.mem.Allocator.Error || error{
     CapacityOverflow,
     InputTooLarge,
     TapeTooLarge,
 };
 
+/// Errors `buildYamlTape` returns. It runs the same grammar as `indexYaml`, so
+/// the `YamlError` tags reach it directly rather than through a diagnostic.
 pub const YamlBuildError = std.mem.Allocator.Error || YamlError || error{
     CapacityOverflow,
     InputTooLarge,
     TapeTooLarge,
 };
 
+/// How a diagnostic should be read: `syntax` for malformed input inside the
+/// profile, `unsupported` for recognizable YAML outside it, and `invalid_index`
+/// for a supplied `YamlStructuralIndex` that does not match a fresh parse.
 pub const YamlDiagnosticKind = enum(u8) {
     syntax,
     unsupported,
@@ -74,13 +126,28 @@ pub const YamlDiagnosticKind = enum(u8) {
 };
 
 /// A source-backed first-failure diagnostic. `snippet` borrows `input`.
+///
+/// The value is a view, not an owner: every slice in it comes from the `input`
+/// the validating entry point was given, so it stays valid only while those
+/// bytes do.
 pub const YamlDiagnostic = struct {
+    /// The verdict. `kind` says how to read it.
     err: YamlError,
+    /// One of `YamlDiagnosticKind`.
     kind: YamlDiagnosticKind,
+    /// Byte offset into the input, clamped to `input.len`.
     byte_offset: usize,
+    /// One-based line number of `byte_offset`, clamped to
+    /// `std.math.maxInt(u32)`.
     line: u32,
+    /// One-based column of `byte_offset` inside its line, clamped to
+    /// `std.math.maxInt(u32)`.
     column: u32,
+    /// Up to 16 bytes of the input on each side of `byte_offset`, cut at the
+    /// line boundaries. Borrows the input.
     snippet: []const u8,
+    /// Offset of `snippet[0]` in the input, so the snippet can be located
+    /// with it.
     snippet_start: usize,
 };
 
@@ -92,21 +159,50 @@ pub const YamlSourceSpan = struct {
 };
 
 /// A format-local structural index. The index owns all three arrays.
+///
+/// It stores offsets and span lengths only, so the source bytes may be
+/// released as soon as the indexer returns. One index owns `indexes`,
+/// `kinds` and `lengths` and releases all three in one `deinit`, from the
+/// same allocator the indexer was given. Copying an index copies the three
+/// slice handles, so a copy is not a second owner and must not be `deinit`'d.
 pub const YamlStructuralIndex = struct {
+    /// Token offsets of `indexes[0..count]`. Three entries past `count` hold
+    /// the sentinels `stage1.StructuralIndex.finish` writes: the input length
+    /// twice and then `0`.
     indexes: []u32,
+    /// Kind of each of `kinds[0..count]`. Entries past `count` are unused.
     kinds: []YamlTokenKind,
+    /// Span length in bytes of each of `lengths[0..count]`. For a container
+    /// token this is the semantic length the grammar assigned, not a byte
+    /// range the caller may slice.
     lengths: []u32,
+    /// Number of tokens written. The arrays are longer than this.
     count: usize,
 
+    /// Releases all three arrays into `allocator`, which must be the allocator
+    /// the indexer received. The index is unusable afterward, and a second
+    /// call through any copy is a double free.
     pub fn deinit(self: *YamlStructuralIndex, allocator: std.mem.Allocator) void {
         allocator.free(self.indexes);
         allocator.free(self.kinds);
         allocator.free(self.lengths);
         self.* = undefined;
     }
+
+    /// `indexes[0..count]`. Excludes the sentinels, so a caller that reads
+    /// offsets sees exactly the tokens.
     pub fn slice(self: *const YamlStructuralIndex) []const u32 {
         return self.indexes[0..self.count];
     }
+
+    /// The offset and length recorded for `token_index`, or `null` when
+    /// `token_index` is not below `count`.
+    ///
+    /// Nothing is read from the source, so the answer cannot be wrong about
+    /// the source's current contents. For a `key` or `scalar` the pair is a
+    /// real byte range of the input; for a container token it is the grammar's
+    /// own extent and only `YamlCursor.sourceSpan` on a `key` or `scalar`
+    /// yields bytes.
     pub fn sourceSpan(self: *const YamlStructuralIndex, token_index: usize) ?YamlSourceSpan {
         if (token_index >= self.count) return null;
         return .{
@@ -117,16 +213,32 @@ pub const YamlStructuralIndex = struct {
 };
 /// A compact validated YAML token. Scalar and key payloads are source lengths;
 /// container payloads are zero and are interpreted by token kind.
+///
+/// The fields are public, so a caller may write a word into
+/// `YamlDocument.tape`; `YamlDocument.root` re-parses the source and compares
+/// every word against it, so a forged word is rejected there rather than read.
 pub const YamlTapeWord = packed struct(u64) {
+    /// `std.meta.intToEnum(YamlTokenKind, kind)`. Navigation compares it against
+    /// the enum rather than converting, so a value no tag has gives
+    /// `error.InvalidTapeKind`.
     kind: u8,
+    /// Source span length in bytes for a `key` or `scalar`, and `0` for a
+    /// container token, whose extent is implied by its position. The tape
+    /// rejects a span longer than this width.
     payload: u24,
+    /// Source offset of the token: the first byte of a container or document
+    /// marker, or the first byte of the span for a `key` or `scalar`.
     offset: u32,
 
     /// Converts a known-valid tape tag to its public enum. Callers that receive
     /// mutable or external tape words must use the checked navigation methods.
+    /// An invalid tag is diagnosed in Debug and ReleaseSafe; ReleaseFast and
+    /// ReleaseSmall treat it as unchecked illegal behavior, not a returned error.
     pub fn tapeKind(self: YamlTapeWord) YamlTokenKind {
         return @enumFromInt(self.kind);
     }
+
+    /// `payload` widened to `usize`.
     pub fn sourceLength(self: YamlTapeWord) usize {
         return @intCast(self.payload);
     }
@@ -165,15 +277,44 @@ comptime {
 }
 
 /// An owned validated YAML tape. `source` is borrowed from the caller.
+///
+/// One document owns `tape` and releases it in one `deinit`; `source` is never
+/// freed here. That source must stay alive and unmodified for as long as the
+/// document, any cursor made from it, and any span read through one are used —
+/// `root` and `sourceSpan` compare `input` against `source` by pointer and
+/// length, so a relocated copy is rejected rather than silently accepted.
+/// Copying a document copies the tape handle, so a copy is not a second owner
+/// and must not be `deinit`'d.
 pub const YamlDocument = struct {
+    /// One word per token, in the order the grammar emitted them.
     tape: []YamlTapeWord,
+    /// The borrowed source the tape was built from.
     source: []const u8,
 
+    /// Releases `tape` into `allocator`, which must be the allocator
+    /// `buildYamlTape` received. The borrowed source is untouched. The
+    /// document and every cursor over it are unusable afterward, and a second
+    /// call through any copy is a double free.
     pub fn deinit(self: *YamlDocument, allocator: std.mem.Allocator) void {
         allocator.free(self.tape);
         self.* = undefined;
     }
 
+    /// Cursor on the first token, after re-parsing `input` and checking that
+    /// the tape matches it exactly.
+    ///
+    /// `input` must be the same slice `source` names — same pointer and length
+    /// — or this returns `error.SourceOutOfBounds`. The check replays the whole
+    /// grammar and compares every word's kind, offset and payload, and it
+    /// requires the engine to produce no further events, so it costs a full
+    /// pass; call it once and walk the cursor. `error.InvalidStructure` when
+    /// the tape and the source disagree, and `error.TapeOutOfBounds` for an
+    /// empty tape. A profile or grammar failure in `input` surfaces here as
+    /// `error.InvalidStructure` too, so this is a "does the tape match" check
+    /// rather than a diagnostic; `validateYaml` is the entry point that
+    /// distinguishes `error.Invalid` from `error.Unsupported`. The cursor
+    /// borrows `self.tape` and `input`, so neither may be released or
+    /// `deinit`'d while it is used.
     pub fn root(self: *const YamlDocument, input: []const u8) YamlNavigationError!YamlCursor {
         if (self.tape.len == 0) return error.TapeOutOfBounds;
         if (input.ptr != self.source.ptr or input.len != self.source.len) {
@@ -200,6 +341,16 @@ pub const YamlDocument = struct {
         }
         return .{ .tape = self.tape, .input = input };
     }
+
+    /// The source bytes of a `key` or `scalar` token.
+    ///
+    /// `error.TypeMismatch` for a container token, which has no byte range to
+    /// return; `error.TapeOutOfBounds` for `tape_index` at or past the tape
+    /// length; `error.InvalidTapeKind` for a word whose `kind` is not a
+    /// `YamlTokenKind` tag; and `error.SourceOutOfBounds` when `input` is not
+    /// the recorded source or offset and length do not fit it. This checks one
+    /// word and does not replay the grammar; `root` is the whole-document
+    /// check. The result borrows `input`.
     pub fn sourceSpan(
         self: *const YamlDocument,
         input: []const u8,
@@ -220,6 +371,16 @@ pub const YamlDocument = struct {
         return input[offset .. offset + length];
     }
 };
+
+/// Failures the YAML tape and cursor methods return.
+///
+/// `TapeOutOfBounds` for a `tape_index` at or past the tape length and for a
+/// cursor past the last word, `SourceOutOfBounds` when `input` is not the
+/// document's recorded source or a span does not fit it, `InvalidTapeKind` for
+/// a word whose `kind` is not a `YamlTokenKind` tag, `TypeMismatch` when a
+/// span is asked for a token that has none, `UnexpectedEnd` when a skipped
+/// collection never closes, and `InvalidStructure` when the tape and a fresh
+/// parse of the source disagree.
 pub const YamlNavigationError = error{
     TapeOutOfBounds,
     SourceOutOfBounds,
@@ -230,11 +391,25 @@ pub const YamlNavigationError = error{
 };
 
 /// A zero-allocation cursor over an owned YAML tape and borrowed source.
+///
+/// The cursor holds the tape and the source slice `YamlDocument.root` was
+/// given, and owns neither: it borrows the document's tape and the caller's
+/// `input`, so the document must outlive every cursor over it and must not be
+/// `deinit`'d while one is used. A cursor is a plain value, so copying one is
+/// free and the copy advances independently. Only `peek` re-checks the word's
+/// `kind`; the tape was checked against the source once, in `root`.
 pub const YamlCursor = struct {
+    /// The document's tape. Borrowed.
     tape: []const YamlTapeWord,
+    /// The source slice passed to `YamlDocument.root`. Borrowed.
     input: []const u8,
+    /// Index of the next word in `tape`. Equal to `tape.len` once the walk is
+    /// exhausted.
     position_index: usize = 0,
 
+    /// The word under the cursor, with its `kind` checked against
+    /// `YamlTokenKind`, or `error.TapeOutOfBounds` once the walk is past the
+    /// last word.
     pub fn peek(self: *const YamlCursor) YamlNavigationError!YamlTapeWord {
         if (self.position_index >= self.tape.len) return error.TapeOutOfBounds;
         const word = self.tape[self.position_index];
@@ -242,15 +417,24 @@ pub const YamlCursor = struct {
         return word;
     }
 
+    /// Validates the word under the cursor and steps past it. Nothing moves
+    /// when `peek` fails.
     pub fn advance(self: *YamlCursor) YamlNavigationError!void {
         _ = try self.peek();
         self.position_index += 1;
     }
 
+    /// Index of the next word. Equal to `tape.len` when exhausted.
     pub fn position(self: *const YamlCursor) usize {
         return self.position_index;
     }
 
+    /// The source bytes under the cursor, for a `key` or `scalar`.
+    ///
+    /// `error.TypeMismatch` for a container or document token, which has no
+    /// byte range, and `error.SourceOutOfBounds` when offset and length do not
+    /// fit `input`. The result borrows `input` and is invalidated when the
+    /// caller writes or releases it.
     pub fn sourceSpan(self: *const YamlCursor) YamlNavigationError![]const u8 {
         const word = try self.peek();
         const kind = try checkedYamlTapeKind(word);
@@ -263,16 +447,25 @@ pub const YamlCursor = struct {
         return self.input[start .. start + length];
     }
 
+    /// `sourceSpan`.
     pub fn span(self: *const YamlCursor) YamlNavigationError![]const u8 {
         return self.sourceSpan();
     }
 
+    /// `sourceSpan`.
     pub fn raw(self: *const YamlCursor) YamlNavigationError![]const u8 {
         return self.sourceSpan();
     }
 
     /// Skips one complete collection while checking every public tape word.
     /// YAML container end offsets are semantic line ends and need not increase.
+    ///
+    /// The cursor must be on a `mapping_start` or `sequence_start`, or this
+    /// returns `error.TypeMismatch` and does not move. Every word it steps over
+    /// has its `kind` checked, and `error.UnexpectedEnd` when the matching end
+    /// token never arrives — which a tape from `buildYamlTape` cannot do, so it
+    /// marks a hand-built tape. On success the cursor sits after the closing
+    /// token of the skipped collection.
     pub fn skipChild(self: *YamlCursor) YamlNavigationError!void {
         const first = try self.peek();
         const first_kind = try checkedYamlTapeKind(first);
@@ -296,11 +489,28 @@ pub const YamlCursor = struct {
         }
     }
 };
+
+/// One resident YAML token, borrowed from the document's source.
+///
+/// The value allocates nothing and owns no bytes: `raw` is a sub-slice of the
+/// `input` the document was opened with, and is empty for a container token
+/// whose extent is positional.
 pub const Event = struct {
+    /// Token kind at `offset`.
     kind: YamlTokenKind,
+    /// Source offset of the token.
     offset: u32,
+    /// Token bytes; empty for a container token. Borrows the document's input.
     raw: []const u8,
 };
+
+/// Errors the resident `Parser` family returns.
+///
+/// This is the shared resident vocabulary and is wider than any one call. The
+/// parser holds fixed frame arrays and allocates nothing, so the allocator tags
+/// in the set are carried for shape rather than reached; what a walk actually
+/// produces is the `YamlError` tags, `resident.Error`'s four tags,
+/// `error.InputTooLarge` and `error.CapacityExceeded`.
 pub const ResidentError = std.mem.Allocator.Error || YamlError || resident.Error || error{
     CapacityExceeded,
     InputTooLarge,
@@ -308,11 +518,40 @@ pub const ResidentError = std.mem.Allocator.Error || YamlError || resident.Error
     TapeTooLarge,
 };
 
+/// A reusable resident YAML parser: it walks one borrowed document at a time
+/// and allocates nothing.
+///
+/// The parser holds a fixed `yaml_max_depth` block and flow frame array and
+/// one document lease; it owns no heap allocation, which is why `init` ignores
+/// its `allocator` argument and `deinit` frees nothing. It holds at most one
+/// active document — `initOnDemandDocument` returns `error.DocumentActive`
+/// while another is open — so it is not threadsafe and its own methods must not
+/// be reentered from one another. Copying a parser copies the frame arrays, so
+/// a copy is a second parser with its own state and both may be `deinit`'d.
 pub const Parser = struct {
+    /// Largest `input` accepted, in bytes. `0` means no ceiling beyond the
+    /// `std.math.maxInt(u32)` offset limit the events require.
     max_capacity: usize,
+    /// The grammar state a walk advances. Its frame arrays are reused by the
+    /// next document.
+    ///
+    /// `EventReader.engine` and `TokenCursor.engine` are pointers to this
+    /// field rather than to a copy, so it must stay at the same address for as
+    /// long as any walk is open. Copying the parser copies the engine and
+    /// gives a second independent walk; the open walks keep using the original.
     engine: YamlResidentEngine,
+    /// The single-document lease. Its generation advances on every document, so
+    /// a reader held across two documents fails instead of reading the newer
+    /// one's tokens.
     state: resident.State = .{},
 
+    /// Builds a parser with no heap storage.
+    ///
+    /// `allocator` is accepted so a caller can use one parser-construction
+    /// shape across formats, and it is discarded: this parser allocates
+    /// nothing, stores nothing from it, and must not be paired with a `free`.
+    /// `max_capacity` above `std.math.maxInt(u32)` returns
+    /// `error.InputTooLarge`.
     pub fn init(_: std.mem.Allocator, max_capacity: usize) ResidentError!Parser {
         if (max_capacity > std.math.maxInt(u32)) return error.InputTooLarge;
         return .{
@@ -321,6 +560,12 @@ pub const Parser = struct {
         };
     }
 
+    /// Releases nothing and asserts that no document is open.
+    ///
+    /// The assertion is what diagnoses a missing `OnDemandDocument.deinit`:
+    /// Debug and ReleaseSafe trap, ReleaseFast and ReleaseSmall do not. Every
+    /// document, `EventReader` and `TokenCursor` made from this parser is
+    /// unusable afterward, and a second call is invalid.
     pub fn deinit(self: *Parser) void {
         self.engine.deinit();
         self.state.deinit();
@@ -328,16 +573,42 @@ pub const Parser = struct {
     }
 };
 
+/// A borrowed resident YAML document: one unparsed source plus the lease that
+/// keeps the parser's engine current for it.
+///
+/// The document owns nothing and reaches the parser's engine through its
+/// lease. `input` must stay alive and unmodified, and `parser` must outlive
+/// the document and must not be `deinit`'d while it is open. Only one walk
+/// exists at a time — `eventReader` and `tokenCursor` return
+/// `error.FocusAlreadyClaimed` to a second caller — and any walk made from
+/// this document returns `error.DocumentReleased` once `deinit` runs or
+/// another document is opened.
 pub const OnDemandDocument = struct {
+    /// The parser whose engine this document drives.
+    ///
+    /// `eventReader` and `tokenCursor` take `&parser.engine`, so this pointer
+    /// and the parser's address must both hold for the document's whole life:
+    /// moving or copying the parser leaves these walks on the original, and
+    /// `deinit` on the parser while this document is open invalidates them.
     parser: *Parser,
+    /// The borrowed source. Every `Event.raw` points into it.
     input: []const u8,
+    /// The document lease, released by `deinit`.
     lease: resident.Lease,
 
+    /// Releases the lease, which frees no memory. The document is unusable
+    /// afterward, and every walk made from it starts returning
+    /// `error.DocumentReleased`.
     pub fn deinit(self: *OnDemandDocument) void {
         self.lease.release();
         self.* = undefined;
     }
 
+    /// A reader over the document's tokens. Claims the document's single
+    /// focus, so `error.FocusAlreadyClaimed` when another walk is open; on
+    /// that error the existing walk is unaffected. The reader borrows the
+    /// parser's engine and `input`, so both must stay live and unmodified while
+    /// it is used.
     pub fn eventReader(self: *OnDemandDocument) ResidentError!EventReader {
         return .{
             .engine = &self.parser.engine,
@@ -346,6 +617,8 @@ pub const OnDemandDocument = struct {
         };
     }
 
+    /// A cursor over the document's tokens, with the same focus claim and
+    /// borrows as `eventReader`.
     pub fn tokenCursor(self: *OnDemandDocument) ResidentError!TokenCursor {
         return .{
             .engine = &self.parser.engine,
@@ -355,6 +628,17 @@ pub const OnDemandDocument = struct {
     }
 };
 
+/// Opens `input` for a lazy walk on `parser` and returns a document that
+/// borrows it.
+///
+/// Nothing is parsed here: the engine is reset and the first grammar rule runs
+/// on the first `EventReader.next`, so a malformed or out-of-profile document
+/// is reported by the walk, not by this call. `error.InputTooLarge` past
+/// `std.math.maxInt(u32)`, `error.CapacityExceeded` past a nonzero
+/// `parser.max_capacity`, and `error.DocumentActive` while another document is
+/// open are all decided before the document exists. `input` is not copied: it
+/// must stay alive and unmodified while the document and every walk made from
+/// it are used.
 pub fn initOnDemandDocument(
     parser: *Parser,
     input: []const u8,
@@ -371,11 +655,38 @@ pub fn initOnDemandDocument(
         .lease = lease,
     };
 }
+/// A sequential reader over one `OnDemandDocument`'s tokens.
+///
+/// The reader owns nothing: it borrows the parser's engine and the document's
+/// `input`, so both must stay live and unmodified while it is used, and every
+/// `Event` it returns borrows that `input`. It holds the document's single
+/// focus and position, which a copied reader shares: a copy that lags returns
+/// `error.OutOfOrderIteration`, and both return `error.DocumentReleased` once
+/// the document closes. The grammar runs as the walk advances, so the first
+/// `error.Invalid`, `error.Unsupported` or `error.DepthExceeded` comes from
+/// the position that reached it, not from the start of the document.
 pub const EventReader = struct {
+    /// The parser's grammar state, driven forward by this walk.
+    ///
+    /// This is a pointer to `Parser.engine`, so it names that field rather than
+    /// a copy and must keep naming it: replacing it, or moving the parser, takes
+    /// this walk off the grammar state the document's lease covers. The engine's
+    /// `consumed` count and this reader's `guard` position must advance together
+    /// through `next` and `skip`; `next` passes the guard position to the
+    /// engine, which reports `error.Invalid` at any other value, so advancing
+    /// `consumed` by hand is reported rather than obeyed.
     engine: *YamlResidentEngine,
+    /// The document's borrowed source; every `Event.raw` points into it.
     input: []const u8,
+    /// The document focus and position. Copies of a reader share it.
     guard: resident.Guard,
 
+    /// The next `Event` and the position past it, or `null` at the end of the
+    /// document. The position does not move on an error or at the end.
+    ///
+    /// `error.DocumentReleased`, `error.OutOfOrderIteration`, the `YamlError`
+    /// tags and `error.InputTooLarge` are what a walk can return; the parser
+    /// allocates nothing, so no allocator tag reaches here.
     pub fn next(self: *EventReader) ResidentError!?Event {
         try self.guard.check();
         const event = try self.engine.next(self.guard.expected_position);
@@ -386,11 +697,21 @@ pub const EventReader = struct {
         return null;
     }
 
+    /// The next `Event` without consuming it, or `null` at the end, with the
+    /// same errors as `next`.
     pub fn peek(self: *const EventReader) ResidentError!?Event {
         try self.guard.check();
         return self.engine.peek(self.guard.expected_position);
     }
 
+    /// Consumes one whole collection and leaves the reader after it.
+    ///
+    /// A `mapping_start` or `sequence_start` walks to its matching end token;
+    /// any other first token is consumed on its own. An exhausted document is
+    /// not an error and consumes nothing. `error.Invalid` when a collection
+    /// ends without its closing token, which a well-formed document cannot do,
+    /// so it marks a document whose events were produced out of order. The
+    /// reader is left where the walk stopped.
     pub fn skip(self: *EventReader) ResidentError!void {
         const first = try self.next() orelse return;
         var depth: usize = switch (first.kind) {
@@ -408,11 +729,24 @@ pub const EventReader = struct {
     }
 };
 
+/// A sequential cursor over one `OnDemandDocument`'s tokens.
+///
+/// It borrows exactly what `EventReader` borrows and reports the same
+/// staleness and grammar errors. `advance` is `next`; both names exist so a
+/// caller can use the cursor or the reader spelling without translating.
 pub const TokenCursor = struct {
+    /// The parser's grammar state, driven forward by this walk. The borrow and
+    /// the `consumed`/`guard` position invariant `EventReader.engine` carries
+    /// apply here unchanged, because this cursor drives the same engine through
+    /// the same checks.
     engine: *YamlResidentEngine,
+    /// The document's borrowed source; every `Event.raw` points into it.
     input: []const u8,
+    /// The document focus and position. Copies of a cursor share it.
     guard: resident.Guard,
 
+    /// The next `Event` and the position past it, or `null` at the end, with
+    /// the same errors as `EventReader.next`.
     pub fn next(self: *TokenCursor) ResidentError!?Event {
         try self.guard.check();
         const event = try self.engine.next(self.guard.expected_position);
@@ -423,15 +757,24 @@ pub const TokenCursor = struct {
         return null;
     }
 
+    /// `next`.
     pub fn advance(self: *TokenCursor) ResidentError!?Event {
         return self.next();
     }
 
+    /// `EventReader.peek`.
     pub fn peek(self: *const TokenCursor) ResidentError!?Event {
         try self.guard.check();
         return self.engine.peek(self.guard.expected_position);
     }
 
+    /// `EventReader.skip`, run over this cursor's position.
+    ///
+    /// The walk runs on a temporary reader and its position is copied back
+    /// only when `skip` succeeds, so on any error this cursor keeps the
+    /// position it had on entry and the events consumed by the attempt are not
+    /// reachable through it. Open a new document on the parser rather than
+    /// retrying this call after a failure.
     pub fn skipChild(self: *TokenCursor) ResidentError!void {
         var reader: EventReader = .{
             .engine = self.engine,
@@ -446,6 +789,12 @@ pub const TokenCursor = struct {
 /// SIMD candidate metadata used by the YAML line and punctuation scanners.
 /// The metadata is ephemeral: it borrows no input and is discarded after one
 /// index pass. Scalar callers intentionally bypass it.
+///
+/// Reachable through `YamlResidentEngine.metadata`, which is a borrowed
+/// optional pointer rather than a value. Only the newline array is reachable
+/// through it: that array is owned by whoever built this value and freed by
+/// its `deinit`, so a consumer that reads it borrows it and must neither free
+/// it nor outlive it.
 const YamlLexicalMetadata = struct {
     allocator: std.mem.Allocator,
     newline_offsets: []u32,
@@ -495,6 +844,13 @@ const YamlLexicalMetadata = struct {
     }
 };
 
+/// One latched verdict with the position it was found at.
+///
+/// Reachable through `YamlResidentEngine.diagnostic`, which is `null` while
+/// the walk is clean. `offset` is clamped to the end of the input, and
+/// `kind` is `.syntax` or `.unsupported` derived from `err`, so a consumer
+/// reading the field learns where the walk stopped and how to read it. The
+/// value owns nothing and a copy is a second name for the same verdict.
 const Failure = struct {
     err: YamlError,
     kind: YamlDiagnosticKind,
@@ -516,6 +872,12 @@ const ParseContext = enum {
     flow_value,
 };
 
+/// The token kind a plain or quoted scalar in `context` emits. A key slot is
+/// a key wherever it sits, block or flow, and every other slot is a scalar.
+fn slotKind(context: ParseContext) YamlTokenKind {
+    return if (context == .block_key or context == .flow_key) .key else .scalar;
+}
+
 const YamlParser = struct {
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -523,6 +885,8 @@ const YamlParser = struct {
     index: *YamlStructuralIndex,
     failure: *?Failure,
     line_cursor: usize = 0,
+    /// Open block and flow frames together. `enterFrame` is the only writer, so
+    /// the two stacks cannot each spend a whole budget of their own.
     depth: usize = 0,
 
     const Self = YamlParser;
@@ -662,12 +1026,26 @@ const YamlParser = struct {
         return true;
     }
 
-    fn parseBlock(self: *Self, indent: usize) YamlIndexError!void {
+    /// Charges one open frame, block or flow, against the single depth budget.
+    ///
+    /// Block collections and flow collections share this counter, because a
+    /// document that nests both spends one budget and `yaml_max_depth` names
+    /// the total nesting any route allows. `YamlResidentEngine.pushBlock` and
+    /// `pushFlow` already test `block_len + flow_len` the same way.
+    fn enterFrame(self: *Self, offset: usize) YamlIndexError!void {
         if (self.depth >= yaml_max_depth) {
-            return self.fail(error.DepthExceeded, .syntax, self.input.len);
+            return self.fail(error.DepthExceeded, .syntax, offset);
         }
         self.depth += 1;
-        defer self.depth -= 1;
+    }
+
+    /// Parses the block collection or the inline value at `indent`.
+    ///
+    /// The budget is charged by `parseBlockMapping` and `parseBlockSequence`
+    /// rather than here, because only those open a block frame. An inline
+    /// value at the document root opens none, which is what
+    /// `YamlResidentEngine.pushBlock` counts as well.
+    fn parseBlock(self: *Self, indent: usize) YamlIndexError!void {
         const current = self.nextMeaningful(self.line_cursor) orelse {
             return self.fail(error.Invalid, .syntax, self.input.len);
         };
@@ -698,6 +1076,8 @@ const YamlParser = struct {
     }
 
     fn parseBlockMapping(self: *Self, indent: usize) YamlIndexError!void {
+        try self.enterFrame(self.input.len);
+        defer self.depth -= 1;
         const first = self.nextMeaningful(self.line_cursor) orelse {
             return self.fail(error.Invalid, .syntax, self.input.len);
         };
@@ -770,6 +1150,8 @@ const YamlParser = struct {
     }
 
     fn parseBlockSequence(self: *Self, indent: usize) YamlIndexError!void {
+        try self.enterFrame(self.input.len);
+        defer self.depth -= 1;
         const first = self.nextMeaningful(self.line_cursor) orelse {
             return self.fail(error.Invalid, .syntax, self.input.len);
         };
@@ -845,7 +1227,7 @@ const YamlParser = struct {
             .end = end,
             .context = context,
         };
-        try inline_parser.parseValue();
+        try inline_parser.parseValue(slotKind(context));
         inline_parser.skipSpaces();
         if (inline_parser.pos != end) {
             return self.fail(error.Invalid, .syntax, inline_parser.pos);
@@ -859,7 +1241,6 @@ const InlineParser = struct {
     pos: usize,
     end: usize,
     context: ParseContext,
-    depth: usize = 0,
     const Self = InlineParser;
 
     fn fail(self: *Self, err: YamlError, kind: YamlDiagnosticKind, offset: usize) YamlError {
@@ -878,7 +1259,28 @@ const InlineParser = struct {
         return self.fail(error.Invalid, .syntax, offset);
     }
 
-    fn parseValue(self: *Self) YamlIndexError!void {
+    /// Whether the plain scalar at `start` opens a construct outside the
+    /// profile, so the slot it sits in has to refuse it.
+    ///
+    /// Every slot that can hold a plain scalar answers to
+    /// `startsUnsupportedConstruct`. A flow key waits for the `:` that gives
+    /// it a value, because a key the flow never completes is a source error
+    /// and a source error outranks a profile error.
+    fn unsupportedInSlot(self: *Self, start: usize) bool {
+        if (!startsUnsupportedConstruct(self.owner.input, start, self.end)) return false;
+        if (self.context != .flow_key) return true;
+        var scan = start;
+        while (scan < self.end) : (scan += 1) {
+            const byte = self.owner.input[scan];
+            if (byte == ':') return true;
+            if (byte == ',' or byte == ']' or byte == '}') return false;
+        }
+        return false;
+    }
+
+    /// Parses the value at `pos` and emits it as `kind`. `context` selects the
+    /// plain scalar rules and the token the slot emits.
+    fn parseValue(self: *Self, kind: YamlTokenKind) YamlIndexError!void {
         self.skipSpaces();
         if (self.pos >= self.end) {
             return self.fail(error.Invalid, .syntax, self.pos);
@@ -896,22 +1298,22 @@ const InlineParser = struct {
                 }
                 try self.parseFlowMapping();
             },
-            '\'', '"' => try self.parseQuoted(.scalar),
+            '\'', '"' => try self.parseQuoted(kind),
             else => {
-                if (startsUnsupportedConstruct(self.owner.input, self.pos, self.end)) {
+                if (self.unsupportedInSlot(self.pos)) {
                     return self.fail(error.Unsupported, .unsupported, self.pos);
                 }
-                try self.parsePlain(if (self.context == .block_key or self.context == .flow_key) .key else .scalar);
+                try self.parsePlain(kind);
             },
         }
     }
 
+    /// Flow frames are charged to `YamlParser.enterFrame`, so a flow collection
+    /// nested inside a block collection spends the same budget and neither
+    /// stack can reach `yaml_max_depth` on its own.
     fn parseFlowSequence(self: *Self) YamlIndexError!void {
-        if (self.depth >= yaml_max_depth) {
-            return self.fail(error.DepthExceeded, .syntax, self.pos);
-        }
-        self.depth += 1;
-        defer self.depth -= 1;
+        try self.owner.enterFrame(self.pos);
+        defer self.owner.depth -= 1;
         const open = self.pos;
         self.pos += 1;
         try self.owner.emit(.sequence_start, open, 0);
@@ -929,7 +1331,7 @@ const InlineParser = struct {
             }
             const previous_context = self.context;
             self.context = .flow_value;
-            try self.parseValue();
+            try self.parseValue(.scalar);
             self.context = previous_context;
             self.skipSpaces();
             if (self.pos >= self.end) {
@@ -955,11 +1357,8 @@ const InlineParser = struct {
     }
 
     fn parseFlowMapping(self: *Self) YamlIndexError!void {
-        if (self.depth >= yaml_max_depth) {
-            return self.fail(error.DepthExceeded, .syntax, self.pos);
-        }
-        self.depth += 1;
-        defer self.depth -= 1;
+        try self.owner.enterFrame(self.pos);
+        defer self.owner.depth -= 1;
         const open = self.pos;
         self.pos += 1;
         try self.owner.emit(.mapping_start, open, 0);
@@ -976,11 +1375,7 @@ const InlineParser = struct {
                 return self.failUnclosed(open);
             }
             self.context = .flow_key;
-            switch (self.owner.input[self.pos]) {
-                '\'', '"' => try self.parseQuoted(.key),
-                '[', '{' => return self.fail(error.Unsupported, .unsupported, self.pos),
-                else => try self.parsePlain(.key),
-            }
+            try self.parseValue(slotKind(self.context));
             self.skipSpaces();
             if (self.pos >= self.end or self.owner.input[self.pos] != ':') {
                 return self.fail(error.Invalid, .syntax, self.pos);
@@ -991,7 +1386,7 @@ const InlineParser = struct {
                 try self.owner.emit(.scalar, self.pos, 0);
             } else {
                 self.context = .flow_value;
-                try self.parseValue();
+                try self.parseValue(.scalar);
             }
             self.skipSpaces();
             if (self.pos >= self.end) {
@@ -1114,6 +1509,14 @@ const InlineParser = struct {
 
 const stage1_sentinel_count = 3;
 
+/// Builds the Stage 1 structural index for `input` at the default vector
+/// width.
+///
+/// `input` is read and not retained, so it may be released when this returns.
+/// `error.Invalid` and `error.Unsupported` are the profile verdicts and
+/// `error.InputTooLarge` an offset past `u32`; each is decided without
+/// publishing an index, and on any error the caller owns nothing. The returned
+/// index owns three arrays.
 pub fn indexYaml(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -1134,6 +1537,12 @@ pub fn indexYamlImpl(
     return parseYamlIndex(allocator, input, null, &metadata);
 }
 
+/// `indexYaml` without the SIMD candidate scan: the same tokens, produced by
+/// the scalar parser alone.
+///
+/// This is the independent oracle the vectorized path is checked against, so
+/// it is the entry point a caller uses to settle a disagreement. The
+/// ownership, error and residue contract is the one `indexYaml` documents.
 pub fn scalarIndexYaml(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -1254,6 +1663,51 @@ fn validateTapeInputCapacity(input_len: usize) !void {
     if (token_capacity > std.math.maxInt(u32)) return error.InputTooLarge;
 }
 
+/// The shared character check for one line of a source, against the context
+/// the lines above it left behind.
+///
+/// `state` is the caller's and is carried from line to line, so an open quote,
+/// a block scalar header and a token that began on an earlier line all reach
+/// this line and a quote on it is read where a scalar can really start. The
+/// offsets it reports are relative to `line`; a caller with a document behind
+/// it adds the line's own offset.
+fn validateYamlSourceLine(
+    state: *source.SourceState,
+    line: []const u8,
+    has_newline: bool,
+    failure: *?Failure,
+) error{ Invalid, InputTooLarge }!void {
+    if (line.len > std.math.maxInt(u32)) return error.InputTooLarge;
+    if (source.failureOffsetInLine(state, line, has_newline)) |offset| {
+        failure.* = .{ .err = error.Invalid, .kind = .syntax, .offset = offset };
+        return error.Invalid;
+    }
+}
+
+/// The line framing this profile refuses: a break that is not part of a CRLF,
+/// and a tab where a line expects its indentation. `start` is the first byte
+/// of the line that is content rather than a document byte order mark.
+fn validateYamlLineFraming(
+    line: []const u8,
+    start: usize,
+    failure: *?Failure,
+) error{Invalid}!void {
+    var indentation = true;
+    for (line[start..], start..) |byte, offset| {
+        if ((byte == '\r' and (offset + 1 == line.len or line[offset + 1] != '\n')) or
+            (indentation and byte == '\t'))
+        {
+            failure.* = .{ .err = error.Invalid, .kind = .syntax, .offset = offset };
+            return error.Invalid;
+        }
+        if (byte == '\n') {
+            indentation = true;
+        } else if (byte != ' ') {
+            indentation = false;
+        }
+    }
+}
+
 fn validateYamlInput(
     input: []const u8,
     failure: *?Failure,
@@ -1288,23 +1742,15 @@ fn validateYamlInputScalar(
     }
 }
 
+/// The shared source check over a complete input: the characters it can read,
+/// then the framing of the lines they make. The character walk reads the whole
+/// source at once, so a quote that spans lines and a block scalar body are read
+/// with the lines around them, and a caller that reads the same source one line
+/// at a time reaches the same verdict.
 fn validateYamlSource(input: []const u8, failure: *?Failure) error{ Invalid, InputTooLarge }!void {
     try validateYamlInput(input, failure);
-    const start: usize = if (std.mem.startsWith(u8, input, "\xef\xbb\xbf")) 3 else 0;
-    var indentation = true;
-    for (input[start..], start..) |byte, offset| {
-        if ((byte == '\r' and (offset + 1 == input.len or input[offset + 1] != '\n')) or
-            (indentation and byte == '\t'))
-        {
-            failure.* = .{ .err = error.Invalid, .kind = .syntax, .offset = offset };
-            return error.Invalid;
-        }
-        if (byte == '\n') {
-            indentation = true;
-        } else if (byte != ' ') {
-            indentation = false;
-        }
-    }
+    const start: usize = if (std.mem.startsWith(u8, input, bom)) bom.len else 0;
+    try validateYamlLineFraming(input, start, failure);
 }
 
 fn collectLines(
@@ -1459,6 +1905,12 @@ fn isSequenceEntry(input: []const u8, start: usize, end: usize) bool {
     return input[start + 1] == ' ' or input[start + 1] == '#';
 }
 
+/// Whether the byte at `start` opens a construct outside `yaml-basic-1.2.2`.
+///
+/// This is the one first-byte rule for plain scalars. Every slot that can hold
+/// one answers to it, a flow key included, through `unsupportedInSlot`.
+/// Quoting the byte is how a caller spells it as data, and both parsers answer
+/// to a quote before they reach here.
 fn startsUnsupportedConstruct(input: []const u8, start: usize, end: usize) bool {
     if (start >= end) return false;
     return switch (input[start]) {
@@ -1504,10 +1956,27 @@ fn yamlDiagnosticAtKind(
 }
 
 /// Creates a source-backed YAML diagnostic with syntax classification.
+///
+/// Allocates nothing and cannot fail. `byte_offset` is clamped to `input.len`,
+/// so an offset past the input reports the end of input rather than reading out
+/// of bounds, and the returned `byte_offset` is the clamped value. The result
+/// borrows `input` and is invalidated when the caller writes or releases it.
+/// The kind is always `.syntax`, which is right for a `YamlError.Invalid` and
+/// understates a caller-supplied `Unsupported`; the validating entry points
+/// set the kind themselves.
 pub fn yamlDiagnosticAt(input: []const u8, err: YamlError, byte_offset: usize) YamlDiagnostic {
     return yamlDiagnosticAtKind(input, err, .syntax, byte_offset);
 }
 
+/// Parses `input` as `yaml-basic-1.2.2` and returns the first failure, or
+/// `null` when the document is inside the profile.
+///
+/// Allocates an index from `allocator` and releases it before returning;
+/// `input` is not retained. A profile or grammar failure comes back as a
+/// `YamlDiagnostic` with `kind` `.syntax` or `.unsupported`, so no `YamlError`
+/// tag is returned as an error; only `error.OutOfMemory`,
+/// `error.CapacityOverflow`, `error.InputTooLarge` and `error.TapeTooLarge`
+/// are. The diagnostic's `snippet` borrows `input` and nothing else.
 pub fn validateYaml(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -1537,6 +2006,22 @@ pub fn validateYaml(
     return null;
 }
 
+/// Checks a copied or externally supplied `YamlStructuralIndex` against a
+/// fresh parse of `input`.
+///
+/// Allocates a second index from `allocator` and releases it before
+/// returning. A supplied index that does not match comes back as a
+/// `YamlDiagnostic` with `kind` `.invalid_index` — never as an error tag — and
+/// a grammar or profile failure in `input` as `.syntax` or `.unsupported`.
+/// Only `error.OutOfMemory`, `error.CapacityOverflow`, `error.InputTooLarge`
+/// and `error.TapeTooLarge` are returned as errors.
+///
+/// Checks run in this order and stop at the first failure: the `u32` input
+/// ceiling as `error.InputTooLarge`, then `count` against the three arrays and
+/// the three sentinel entries as `.invalid_index`, then every entry's kind,
+/// offset and length against `input` as `.invalid_index`, then a fresh parse
+/// whose own failure is reported first, and finally a token-by-token
+/// comparison whose mismatch is reported at the offending offset.
 pub fn validateYamlIndex(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -1615,6 +2100,18 @@ pub fn validateYamlIndex(
     return null;
 }
 
+/// Parses `input` as `yaml-basic-1.2.2` and returns the tape its events
+/// produce.
+///
+/// The resident events are the tape authority here: no structural index is
+/// materialized, so the tape is built in one pass. `error.Invalid` and
+/// `error.Unsupported` are the profile verdicts and are returned directly
+/// rather than through a diagnostic; `error.DepthExceeded` is nesting past
+/// `yaml_max_depth`, `error.TapeTooLarge` an unrepresentable offset or span,
+/// and `error.InputTooLarge` a document `u32` offsets cannot address. On any
+/// failure the caller owns nothing. On success it owns one tape allocation
+/// released by `YamlDocument.deinit`, and it borrows `input`, which must stay
+/// alive and unmodified.
 pub fn buildYamlTape(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -1659,12 +2156,25 @@ pub fn buildYamlTape(
     return .{ .tape = owned_tape, .source = input };
 }
 
+/// One open block collection in the resident engine's inline stack.
+///
+/// `end_offset` is the absolute source offset the matching end token will be
+/// emitted at, not a length, and `indent` is the block's indentation column.
+/// The value owns nothing and is written by `pushBlock` before `block_len`
+/// exposes it, so no slot above `block_len` has ever been initialized.
 const StreamFrame = struct {
     kind: YamlTokenKind,
     indent: usize,
     end_offset: usize,
 };
 
+/// An empty value the last line left behind, awaiting a nested child line or
+/// its own resolution as a `scalar` token.
+///
+/// `offset` is the absolute source offset that token will carry and `indent`
+/// the column a following line must exceed to nest under it. The value owns
+/// nothing, and `YamlResidentEngine.pending_empty` is `null` when no line has
+/// left one pending.
 const StreamPendingEmpty = struct {
     offset: usize,
     indent: usize,
@@ -1680,38 +2190,115 @@ fn streamMarker(line: []const u8, start: usize, end: usize, marker: []const u8) 
 }
 
 /// A bounded-line YAML Stage 1 indexer. Completed lines are parsed and
-/// discarded; only the unfinished line, stack, and output offsets remain.
+/// discarded; only the unfinished line, the source context the lines above
+/// leave behind, the stack, and the output offsets remain.
+///
+/// `data` is never retained: every byte is copied into the unfinished line or
+/// consumed with its line before `feed` returns, so a caller may reuse or
+/// release the chunk on return. The indexer stores the `allocator` it was
+/// given; `deinit` releases every array it owns and is the only release. One
+/// indexer is one document until `reset`.
+///
+/// A grammar or profile failure found on a line is latched rather than
+/// returned: `feed` keeps consuming, records no further tokens, and `finish`
+/// reports the latched verdict. An `error.Invalid` anywhere in the document
+/// wins over an `error.Unsupported` found earlier; two `Unsupported` verdicts
+/// keep the first. A failure that is not one of the three grammar tags —
+/// allocation failure and the sizing tags — is returned from `feed` or
+/// `finish` and leaves the indexer mid-document; `reset` is then the only
+/// supported recovery.
 pub const YamlStreamIndexer = struct {
+    /// Retained. Every array this indexer owns, and every later growth of
+    /// them, comes from this allocator, and `deinit` frees into it. It must
+    /// stay valid and unmodified for the indexer's whole lifetime.
     allocator: std.mem.Allocator,
+    /// Bytes of the unfinished line, cleared as each completed line is
+    /// consumed. A line may not exceed `max_u24` bytes; its capacity is
+    /// retained across `reset`.
     pending_line: std.ArrayList(u8) = .empty,
+    /// Token offsets recorded so far. `finish` appends the three sentinels
+    /// and transfers this buffer to the taken index.
     index_offsets: std.ArrayList(u32) = .empty,
+    /// One kind per real token offset; sentinel offsets have no kind entries.
     index_kinds: std.ArrayList(YamlTokenKind) = .empty,
+    /// Token span lengths, one per offset. `finish` transfers this buffer to
+    /// the taken index.
     index_lengths: std.ArrayList(u32) = .empty,
+    /// The finished index. `null` until a successful `finish`, and again after
+    /// `take`.
     index: ?YamlStructuralIndex = null,
+    /// The grammar state a windowed walk advances. Each completed line is
+    /// offered to it as a window, so it never holds more than one line.
     engine: YamlResidentEngine,
+    /// Source offset of `pending_line.items[0]`.
     pending_start: usize = 0,
+    /// What the shared source check carries from one line to the next: the
+    /// open quote, the block scalar header whose body the next line may be,
+    /// and the flow collections the lines above opened. `processLine` feeds it
+    /// every completed line, whether or not the grammar still wants the line,
+    /// and `reset` returns it to a document that has not been read. It is
+    /// bounded by one line, so the indexer never holds more source than the
+    /// unfinished line it already keeps.
+    source_state: source.SourceState = .{},
+    /// Bytes accepted so far. `finish` writes it as the trailing sentinel.
     input_len: usize = 0,
+    /// Set by a successful `finish`. A later `feed` returns
+    /// `error.AlreadyFinished` and `finish` becomes a no-op.
     finished: bool = false,
+    /// The latched verdict, or `null` while the document is still clean.
+    /// `feed` never clears it and `reset` is the only way to.
     failure: ?FinishError = null,
     const Self = YamlStreamIndexer;
 
+    /// `init`'s failures. `error.InputTooLarge` when `chunk_len` exceeds
+    /// `std.math.maxInt(u32)`, decided before any allocation, and
+    /// `error.OutOfMemory` from the unfinished-line reservation, which leaves
+    /// the caller owning nothing. This indexer refuses nothing of its own
+    /// beyond that reservation.
     pub const InitError = std.mem.Allocator.Error || error{
         CapacityOverflow,
         InputTooLarge,
     };
+    /// `feed`'s failures. `error.AlreadyFinished`, `error.CapacityOverflow`,
+    /// `error.InputTooLarge`, `error.TapeTooLarge` and `error.OutOfMemory` are
+    /// all reachable here; the three `YamlError` tags are carried for shape,
+    /// because a grammar or profile verdict found on a completed line is
+    /// latched in `failure` and returned by `finish` rather than by `feed`.
+    /// `feed` states which of these leave the chunk re-feedable and which
+    /// leave it partly consumed.
     pub const FeedError = std.mem.Allocator.Error || YamlError || error{
         AlreadyFinished,
         CapacityOverflow,
         InputTooLarge,
         TapeTooLarge,
     };
+    /// `finish`'s failures: the latched verdict in `failure` returned as-is,
+    /// `error.Invalid` for a trailing `'\r'`, and the sizing and allocator tags
+    /// from the final walk and the array hand-off. `error.AlreadyFinished` is
+    /// absent because `finish` is a no-op once it has succeeded, and
+    /// `finish` states what each residue leaves behind.
     pub const FinishError = std.mem.Allocator.Error || YamlError || error{
         CapacityOverflow,
         InputTooLarge,
         TapeTooLarge,
     };
+    /// `feedFrom`'s failures: every tag of `FeedError` and `FinishError`, plus
+    /// `std.Io.Reader.ShortError`, which is the reader's short-read set rather
+    /// than a tag and contributes exactly one of them, `error.ReadFailed`.
+    /// The other tag `reader.fill` can return, `error.EndOfStream`, is
+    /// consumed here and runs `finish` instead of reaching the caller.
     pub const FeedFromError = FeedError || FinishError || std.Io.Reader.ShortError;
 
+    /// Allocates the unfinished-line buffer at `chunk_len` bytes and stores
+    /// `allocator` for the indexer's lifetime.
+    ///
+    /// `chunk_len` is an initial capacity only: the line buffer grows to the
+    /// longest line up to `max_u24` bytes, and a `chunk_len` above that is
+    /// clamped rather than rejected. `chunk_len` above
+    /// `std.math.maxInt(u32)` returns `error.InputTooLarge` before any
+    /// allocation. The token arrays start empty and grow during `feed`. On
+    /// `error.OutOfMemory` the reservation is released and the caller owns
+    /// nothing.
     pub fn init(allocator: std.mem.Allocator, chunk_len: usize) InitError!YamlStreamIndexer {
         if (chunk_len > std.math.maxInt(u32)) return error.InputTooLarge;
         var pending_line = std.ArrayList(u8).empty;
@@ -1722,6 +2309,12 @@ pub const YamlStreamIndexer = struct {
             .engine = YamlResidentEngine.init(),
         };
     }
+    /// Releases every array the indexer still owns into `self.allocator`,
+    /// including a finished index not yet taken.
+    ///
+    /// An index already returned by `take` is unaffected and stays owned by
+    /// the caller. The indexer is unusable afterward, and a second call is a
+    /// double free.
     pub fn deinit(self: *Self) void {
         if (self.index) |*index| index.deinit(self.allocator);
         self.pending_line.deinit(self.allocator);
@@ -1732,6 +2325,9 @@ pub const YamlStreamIndexer = struct {
         self.* = undefined;
     }
 
+    /// Bytes of the unfinished line currently retained. This is the memory a
+    /// caller must expect the indexer to hold between `feed` calls; it is `0`
+    /// at a line boundary and after `finish`.
     pub fn retainedByteCount(self: *const Self) usize {
         return self.pending_line.items.len;
     }
@@ -1761,17 +2357,40 @@ pub const YamlStreamIndexer = struct {
             try self.appendToken(value.kind, value.offset, value.raw.len);
         }
     }
+    /// Reads one completed line against the source context the lines above left
+    /// behind, then hands it to the grammar as a window.
+    ///
+    /// The source check runs on every line, including the ones after a latched
+    /// verdict, so a document that is invalid anywhere is invalid as a whole
+    /// and `error.Invalid` still wins over the `error.Unsupported` a block
+    /// scalar header latched earlier. The context moves with the lines whether
+    /// or not the grammar takes them, so the check on the last line of a
+    /// document reads the same document as the check over all of it.
     fn processLine(self: *Self, has_newline: bool) FinishError!void {
         var line = self.pending_line.items;
         if (line.len > 0 and line[line.len - 1] == '\r') {
             if (!has_newline) return error.Invalid;
             line = line[0 .. line.len - 1];
         }
+        // The document byte order mark is the head of the stream and not
+        // content, so it is the one U+FEFF no line has to read as anything.
+        // Every other one is left to the check below, which reads it against
+        // the quote, the comment and the block body the lines above left: a
+        // U+FEFF at the head of a line is quoted content only where the line
+        // above ended inside a quoted scalar.
+        const bom_len: usize = if (self.pending_start == 0 and
+            std.mem.startsWith(u8, line, bom))
+            bom.len
+        else
+            0;
         var source_failure: ?Failure = null;
-        try validateYamlSource(line, &source_failure);
-        if (self.pending_start != 0 and std.mem.startsWith(u8, line, "\xef\xbb\xbf")) {
-            return error.Invalid;
-        }
+        try validateYamlSourceLine(
+            &self.source_state,
+            line[bom_len..],
+            has_newline,
+            &source_failure,
+        );
+        try validateYamlLineFraming(line, bom_len, &source_failure);
         if (self.failure != null) return;
         try self.engine.beginWindow(line, self.pending_start, has_newline);
         try self.appendEngineEvents();
@@ -1779,6 +2398,23 @@ pub const YamlStreamIndexer = struct {
         try self.appendEngineEvents();
     }
 
+    /// Adds bytes to the current document, one line at a time.
+    ///
+    /// `error.AlreadyFinished` after a successful `finish`.
+    /// `error.CapacityOverflow` when the running length overflows and
+    /// `error.InputTooLarge` past `std.math.maxInt(u32)` are decided before
+    /// any byte of `data` is consumed, so the same chunk may be fed again.
+    /// A grammar or profile verdict on a completed line is latched in
+    /// `failure` instead of returned, and `feed` keeps consuming; see the type
+    /// comment for the precedence between them.
+    ///
+    /// `error.TapeTooLarge` when a single line would pass `max_u24` bytes, and
+    /// `error.OutOfMemory` from the line buffer or a token array, are both
+    /// raised part-way through `data`: the bytes before the failure are
+    /// consumed and recorded and the rest of the chunk is not, so the chunk
+    /// must not be fed again. `error.CapacityOverflow` and `error.InputTooLarge`
+    /// from inside the walk leave the same residue. `reset` is the only
+    /// supported recovery from any of them.
     pub fn feed(self: *Self, data: []const u8) FeedError!void {
         if (self.finished) return error.AlreadyFinished;
         const new_len = std.math.add(usize, self.input_len, data.len) catch return error.CapacityOverflow;
@@ -1802,6 +2438,19 @@ pub const YamlStreamIndexer = struct {
         }
     }
 
+    /// Drains `reader` into `feed` and calls `finish` at end of stream.
+    ///
+    /// `reader` is not retained: it and the provider behind it must stay live
+    /// for the duration of the call, and this indexer stores no `std.Io`.
+    /// The call may block according to the reader's implementation. Provider
+    /// failures return `error.ReadFailed`; cancellation can reach this call
+    /// through that provider failure channel, not a separate cancellation tag.
+    /// `error.EndOfStream` is consumed and runs `finish` instead.
+    ///
+    /// An error from `feed` propagates before `reader.toss`, so the reader
+    /// still holds the chunk that failed and the residue is the one `feed`
+    /// documents. An error from `reader.fill` leaves every buffered byte
+    /// already consumed and fed, and the caller may still call `finish`.
     pub fn feedFrom(self: *Self, reader: *std.Io.Reader) FeedFromError!void {
         while (true) {
             const buffered = reader.buffered();
@@ -1817,6 +2466,18 @@ pub const YamlStreamIndexer = struct {
         }
     }
 
+    /// Consumes the final unterminated line, closes the walk and transfers the
+    /// three token arrays into a finished index. Repeated calls do nothing.
+    ///
+    /// A latched grammar verdict is returned as-is, before any index is
+    /// built. A trailing `'\r'` is `error.Invalid`. On success `take` becomes
+    /// legal and `feed` returns `error.AlreadyFinished`.
+    ///
+    /// Allocation failure can leave advanced grammar state and partial arrays.
+    /// Transferred buffers are released on error; untaken lists retain their
+    /// buffers, so `deinit` remains valid. A failure during hand-off can empty
+    /// one or two lists before a later transfer fails. Use `reset` to recover;
+    /// do not retry `finish` or take the partial index.
     pub fn finish(self: *Self) FinishError!void {
         if (self.finished) return;
         if (self.pending_line.items.len > 0) {
@@ -1846,6 +2507,17 @@ pub const YamlStreamIndexer = struct {
         self.finished = true;
     }
 
+    /// Returns the finished index without copying, moving all three arrays to
+    /// the caller.
+    ///
+    /// Requires a successful `finish` and no prior `take` since the last `reset`.
+    /// Both preconditions are asserted: Debug and ReleaseSafe diagnose a
+    /// violation; ReleaseFast and ReleaseSmall treat it as unchecked illegal
+    /// behavior. A second `take` does not return an empty index.
+    /// Ownership of the arrays leaves the indexer with this call; `deinit`
+    /// afterwards frees only what it still holds. The result's `count` is the
+    /// number of tokens and its `indexes` carries the three trailing
+    /// sentinels, as `YamlStructuralIndex` documents.
     pub fn take(self: *Self) YamlStructuralIndex {
         std.debug.assert(self.finished);
         std.debug.assert(self.index != null);
@@ -1854,6 +2526,15 @@ pub const YamlStreamIndexer = struct {
         return result;
     }
 
+    /// Starts a new document, retaining every reusable capacity.
+    ///
+    /// This is the only recovery from an errored `feed` or `finish`, including
+    /// a failed hand-off in `finish`: a finished index not yet taken is
+    /// released here, the line buffer and the three token arrays are cleared
+    /// without shrinking, the engine is reset, the counters return to zero, the
+    /// source context returns to a document that has not been read and the
+    /// latched verdict is cleared. It is valid before or after `finish` and
+    /// after `take`.
     pub fn reset(self: *Self) void {
         if (self.index) |*index| index.deinit(self.allocator);
         self.index = null;
@@ -1863,12 +2544,21 @@ pub const YamlStreamIndexer = struct {
         self.index_lengths.clearRetainingCapacity();
         self.engine.reset(&.{});
         self.pending_start = 0;
+        self.source_state = .{};
         self.input_len = 0;
         self.finished = false;
         self.failure = null;
     }
 };
 
+/// What the resident engine still owes the line it is holding.
+///
+/// `.initial` is the default a line starts in, before any byte of it has been
+/// classified; `.done` is the terminal phase and is the only one that leaves
+/// the line consumed. The other tags name the construct the line opened and
+/// what the engine expects next, so a consumer reading
+/// `YamlResidentEngine.line.?.phase` learns which continuation step the next
+/// `next` will take.
 const ResidentLinePhase = enum {
     initial,
     scalar,
@@ -1881,6 +2571,15 @@ const ResidentLinePhase = enum {
     document_end,
 };
 
+/// One line the resident engine holds, borrowed from the engine's `input`.
+///
+/// `start`, `end`, `content_start` and `visible_end` are offsets into that
+/// `input`, so a windowed walk reports the same line at different offsets from
+/// a whole-input walk; `end` is the one the grammar turns into an absolute
+/// source offset by adding the engine's `input_base`. `colon` is `null` when
+/// the line has no block mapping colon. The value owns nothing, copies with no
+/// teardown, and `YamlResidentEngine.line` is `null` between lines and at the
+/// end of a document.
 const ResidentLine = struct {
     start: usize,
     end: usize,
@@ -1895,11 +2594,17 @@ const ResidentLine = struct {
     phase: ResidentLinePhase = .initial,
 };
 
+/// Whether a flow frame is a `[...]` sequence or a `{...}` mapping, which is
+/// what decides its closing delimiter and whether a `:` is legal inside it.
 const ResidentFlowKind = enum {
     sequence,
     mapping,
 };
 
+/// What the flow frame's next byte must be. The `_after_comma` tags are the
+/// same expectations as their base tags, reached once a separator has been
+/// consumed; `after_value` is the state in which only `,` or the closing
+/// delimiter is legal.
 const ResidentFlowExpect = enum {
     value,
     value_after_comma,
@@ -1910,26 +2615,58 @@ const ResidentFlowExpect = enum {
     after_value,
 };
 
+/// One open flow collection in the resident engine's inline stack.
+///
+/// `open_offset` is the offset of the `[` or `{` within the engine's current
+/// `input`, not an absolute source offset. The value owns nothing and is
+/// written by `pushFlow` before `flow_len` exposes it.
 const ResidentFlowFrame = struct {
     kind: ResidentFlowKind,
     open_offset: usize,
     expect: ResidentFlowExpect,
 };
 
+/// The span a scalar parse produced, in offsets relative to the engine's
+/// current `input`. `next` is where the scalar walk stopped, not a span
+/// endpoint, so `start + length` and `next` need not agree.
 const ResidentSpan = struct {
     start: usize,
     length: usize,
     next: usize,
 };
 
-/// A resumable YAML grammar cursor. It retains only source positions,
-/// bounded collection frames, and one event. It never constructs a tape or a
-/// semantic token list before the caller asks for the next event.
+/// The failures the resident grammar can report: the three profile verdicts
+/// plus an unrepresentable offset or span and a position addition that
+/// overflows. It is what every `YamlResidentEngine` step returns, and it is
+/// narrower than the published `ResidentError` that a walk widens it into.
 const YamlEngineError = YamlError || error{
     InputTooLarge,
     TapeTooLarge,
     CapacityOverflow,
 };
+
+/// A resumable YAML grammar cursor. It retains only source positions,
+/// bounded collection frames, and one event. It never constructs a tape or a
+/// semantic token list before the caller asks for the next event.
+///
+/// The type is published through the fields that hold it rather than by name:
+/// `Parser.engine`, `EventReader.engine`, `TokenCursor.engine` and
+/// `YamlStreamIndexer.engine` all have this type, so a consumer that reaches
+/// one of those fields reads and writes every field here. It allocates nothing
+/// and owns no bytes: `input` is the borrowed source it was reset with and
+/// `metadata` a borrowed optional newline index. Its two frame arrays are
+/// inline and fixed at `yaml_max_depth`, so a copy is a full second cursor
+/// with its own state and needs no teardown, and no address has to stay
+/// stable, because a walk borrows its parser's engine in place rather than a
+/// copy of it. Nothing here synchronizes and no method calls back into caller
+/// code.
+///
+/// Its methods are the grammar's own steps, not an entry point a caller is
+/// expected to drive. `EventReader.next`, `TokenCursor.next` and the walk
+/// behind `YamlStreamIndexer.feed` and `finish` are the supported ways to
+/// advance one, and each checks its own position before the grammar sees it:
+/// a consumer that advances `consumed` or writes the borrowed source by hand
+/// desynchronizes the walk from its guard rather than reaching the grammar.
 const YamlResidentEngine = struct {
     input: []const u8 = &.{},
     input_base: usize = 0,
@@ -1938,6 +2675,10 @@ const YamlResidentEngine = struct {
     metadata_cursor: usize = 0,
     // Complete-input callers set this only after validateYamlSource succeeds.
     source_checked: bool = false,
+    // The source context `prepareLine` reads each line against, for a walk
+    // over a complete input. A windowed walk keeps its context in the caller
+    // that owns the lines, which is `YamlStreamIndexer.source_state`.
+    source_state: source.SourceState = .{},
     line: ?ResidentLine = null,
     close_pending: usize = 0,
     resolve_pending: ?usize = null,
@@ -2001,6 +2742,9 @@ const YamlResidentEngine = struct {
         self.metadata = metadata;
     }
 
+    /// Offers one completed line as the window the walk advances. The caller
+    /// has read the line against the source context it carries, because only
+    /// the caller knows the lines above it; see `prepareWindow`.
     fn beginWindow(
         self: *Self,
         input: []const u8,
@@ -2029,18 +2773,19 @@ const YamlResidentEngine = struct {
         self.window_eof = false;
     }
 
+    /// Reads the line the caller offers as a window.
+    ///
+    /// The caller has already read the window against the source context it
+    /// carries, because only the caller knows the lines above it; see
+    /// `YamlStreamIndexer.processLine`. What is left here is the grammar's own
+    /// reading of one line.
     fn prepareWindow(self: *Self) YamlEngineError!void {
         const end = self.input.len;
-        const bom_prefix: usize = if (self.input_base == 0 and end >= 3 and
+        const bom_prefix: usize = if (self.input_base == 0 and end >= bom.len and
             self.input[0] == 0xef and self.input[1] == 0xbb and self.input[2] == 0xbf)
-            3
+            bom.len
         else
             0;
-        var failure: ?Failure = null;
-        validateYamlInput(self.input[bom_prefix..end], &failure) catch |err| switch (err) {
-            error.Invalid => return self.record(error.Invalid),
-            error.InputTooLarge => return error.InputTooLarge,
-        };
         var content_start = bom_prefix;
         while (content_start < end and self.input[content_start] == ' ') : (content_start += 1) {}
         if (content_start < end and self.input[content_start] == '\t') {
@@ -2178,17 +2923,23 @@ const YamlResidentEngine = struct {
                 if (!has_newline and end < self.input.len) return self.record(error.Invalid);
             }
 
-            const bom_prefix: usize = if (start == 0 and end >= 3 and
+            const bom_prefix: usize = if (start == 0 and end >= bom.len and
                 self.input[0] == 0xef and self.input[1] == 0xbb and self.input[2] == 0xbf)
-                3
+                bom.len
             else
                 0;
-            if (start != 0 and std.mem.startsWith(u8, self.input[start..end], "\xef\xbb\xbf")) {
-                return self.record(error.Invalid);
-            }
             if (!self.source_checked) {
+                // Read against the lines above rather than against this slice
+                // alone: an open quote and a block scalar body both belong to
+                // the source, and this is the same check a walk over the whole
+                // input reached from `validateYamlSource`.
                 var failure: ?Failure = null;
-                validateYamlInput(self.input[start + bom_prefix .. end], &failure) catch |err| switch (err) {
+                validateYamlSourceLine(
+                    &self.source_state,
+                    self.input[start + bom_prefix .. end],
+                    has_newline,
+                    &failure,
+                ) catch |err| switch (err) {
                     error.Invalid => return self.record(error.Invalid),
                     error.InputTooLarge => return error.InputTooLarge,
                 };
@@ -2368,6 +3119,25 @@ const YamlResidentEngine = struct {
         return .{ .start = start, .length = value_end - start, .next = value_end };
     }
 
+    /// Whether the plain scalar at `start` opens a construct outside the
+    /// profile, so the slot it sits in has to refuse it.
+    ///
+    /// Every slot that can hold a plain scalar answers to
+    /// `startsUnsupportedConstruct`. A flow key waits for the `:` that gives
+    /// it a value, because a key the flow never completes is a source error
+    /// and a source error outranks a profile error.
+    fn unsupportedInSlot(self: *Self, start: usize, end: usize, context: ParseContext) bool {
+        if (!startsUnsupportedConstruct(self.input, start, end)) return false;
+        if (context != .flow_key) return true;
+        var scan = start;
+        while (scan < end) : (scan += 1) {
+            const byte = self.input[scan];
+            if (byte == ':') return true;
+            if (byte == ',' or byte == ']' or byte == '}') return false;
+        }
+        return false;
+    }
+
     fn parseScalar(
         self: *Self,
         start: usize,
@@ -2379,7 +3149,7 @@ const YamlResidentEngine = struct {
         return switch (self.input[start]) {
             '\'', '"' => self.parseQuoted(start, end, kind),
             '[', '{' => self.record(error.Unsupported),
-            else => if (context != .flow_key and startsUnsupportedConstruct(self.input, start, end))
+            else => if (self.unsupportedInSlot(start, end, context))
                 self.record(error.Unsupported)
             else
                 self.parsePlain(start, end, context, kind),
@@ -2793,6 +3563,10 @@ const YamlResidentEngine = struct {
     }
 };
 
+/// `YamlStreamIndexer.init` for a caller that would only name this
+/// constructor. The returned value owns the arrays it allocated and is
+/// released by `YamlStreamIndexer.deinit`; `chunk_len` is an initial capacity
+/// only, and the allocator must outlive the returned indexer.
 pub fn initStreamIndexer(
     allocator: std.mem.Allocator,
     chunk_len: usize,
@@ -3505,4 +4279,150 @@ test "YAML owned root rejects forged scalar spans" {
     defer document.deinit(testing.allocator);
     document.tape[2].payload = 0;
     try testing.expectError(error.InvalidStructure, document.root(input));
+}
+
+/// Drives every yaml-basic route from one input: the validating entry point,
+/// the independent scalar oracle, the vectorized index at each supported
+/// width, the eager tape, the resident walk and the stream indexer.
+/// `expected` is the error every route has to report, or `null` when every
+/// route has to accept `input`. A route that accepts where the others refuse,
+/// or the reverse, fails here rather than in the profile of the caller that
+/// happened to use it first.
+fn expectYamlEveryRouteVerdict(input: []const u8, expected: ?YamlError) !void {
+    if (expected) |expected_error| {
+        const diagnostic = (try validateYaml(testing.allocator, input)) orelse
+            return error.ExpectedYamlDiagnostic;
+        try testing.expectEqual(expected_error, diagnostic.err);
+        if (expected_error == error.Unsupported) {
+            try testing.expectEqual(YamlDiagnosticKind.unsupported, diagnostic.kind);
+        }
+        try testing.expectError(expected_error, scalarIndexYaml(testing.allocator, input));
+        inline for (.{ 4, 16, 32, 64 }) |vector_len| {
+            try testing.expectError(expected_error, indexYamlImpl(vector_len, testing.allocator, input));
+        }
+        try testing.expectError(expected_error, buildYamlTape(testing.allocator, input));
+    } else {
+        try testing.expect((try validateYaml(testing.allocator, input)) == null);
+        var oracle = try scalarIndexYaml(testing.allocator, input);
+        defer oracle.deinit(testing.allocator);
+        inline for (.{ 4, 16, 32, 64 }) |vector_len| {
+            var indexed = try indexYamlImpl(vector_len, testing.allocator, input);
+            defer indexed.deinit(testing.allocator);
+            try testing.expectEqual(oracle.count, indexed.count);
+        }
+        var tape = try buildYamlTape(testing.allocator, input);
+        defer tape.deinit(testing.allocator);
+        try testing.expectEqual(oracle.count, tape.tape.len);
+    }
+
+    var parser = try Parser.init(testing.allocator, 0);
+    defer parser.deinit();
+    var document = try initOnDemandDocument(&parser, input);
+    defer document.deinit();
+    var reader = try document.eventReader();
+    var resident_refused = false;
+    while (true) {
+        const event = reader.next() catch |err| {
+            if (expected) |expected_error| try testing.expectEqual(expected_error, err);
+            resident_refused = true;
+            break;
+        };
+        if (event == null) break;
+    }
+    try testing.expectEqual(expected != null, resident_refused);
+
+    var stream = try initStreamIndexer(testing.allocator, 1);
+    defer stream.deinit();
+    for (input, 0..) |_, offset| try stream.feed(input[offset..][0..1]);
+    if (expected) |expected_error| {
+        try testing.expectError(expected_error, stream.finish());
+    } else {
+        try stream.finish();
+        var streamed = stream.take();
+        defer streamed.deinit(testing.allocator);
+        try testing.expect(streamed.count > 0);
+    }
+}
+
+/// Builds `flow_depth` flow sequences nested over one scalar, with no block
+/// frame above them. `buffer` has to hold `2 + 2 * flow_depth` bytes.
+fn yamlFlowOnlySource(buffer: []u8, flow_depth: usize) []const u8 {
+    @memset(buffer[0..flow_depth], '[');
+    buffer[flow_depth] = 'x';
+    @memset(buffer[flow_depth + 1 .. 1 + 2 * flow_depth], ']');
+    buffer[1 + 2 * flow_depth] = '\n';
+    return buffer[0 .. 2 + 2 * flow_depth];
+}
+
+/// Builds `a: ` followed by `flow_depth` flow sequences nested over one
+/// scalar, so the document nests one block mapping plus `flow_depth` flow
+/// frames. `buffer` has to hold `5 + 2 * flow_depth` bytes.
+fn yamlBlockWrappedFlowSource(buffer: []u8, flow_depth: usize) []const u8 {
+    @memcpy(buffer[0..3], "a: ");
+    @memset(buffer[3 .. 3 + flow_depth], '[');
+    buffer[3 + flow_depth] = 'x';
+    @memset(buffer[4 + flow_depth .. 4 + flow_depth * 2], ']');
+    buffer[4 + flow_depth * 2] = '\n';
+    return buffer[0 .. 5 + flow_depth * 2];
+}
+
+test "parser audit: Y04 flow keys reject reserved and out-of-profile indicators" {
+    // A flow mapping key is a plain scalar, so its first byte answers to the
+    // same reserved-indicator rule a block key already answers to.
+    const reserved = [_][]const u8{
+        "{@: 1}\n",
+        "{`: 1}\n",
+        "{%: 1}\n",
+        "{?: 1}\n",
+        "{|: 1}\n",
+        "{>: 1}\n",
+        "{a: 1, @: 2}\n",
+    };
+    for (reserved) |input| {
+        try expectYamlEveryRouteVerdict(input, error.Unsupported);
+    }
+
+    // Quoting is how a caller spells any of those bytes as data, and it keeps
+    // working in the first key slot and after a comma.
+    const quoted = [_][]const u8{
+        "{\"@\": 1}\n",
+        "{\"`\": 1}\n",
+        "{\"%\": 1}\n",
+        "{\"?\": 1}\n",
+        "{\"|\": 1}\n",
+        "{\">\": 1}\n",
+        "{a: 1, \"@\": 2}\n",
+    };
+    for (quoted) |input| {
+        try expectYamlEveryRouteVerdict(input, null);
+    }
+
+    // The block key and flow value slots already refused the same bytes, so
+    // this is one rule rather than three.
+    try expectYamlEveryRouteVerdict("@: 1\n", error.Unsupported);
+    try expectYamlEveryRouteVerdict("[@]\n", error.Unsupported);
+    try expectYamlEveryRouteVerdict("root: {a: b, \"c\": [d, e]}\n", null);
+}
+
+test "parser audit: Y06 scalar oracle spends one combined block and flow depth budget" {
+    var buffer: [5 + 2 * yaml_max_depth]u8 = undefined;
+
+    // A block mapping around 1023 flow sequences nests 1024 levels, which is
+    // the ceiling every route shares.
+    try expectYamlEveryRouteVerdict(
+        yamlBlockWrappedFlowSource(buffer[0..], yaml_max_depth - 1),
+        null,
+    );
+
+    // One sequence more nests 1025 levels. The oracle kept a separate budget
+    // for block and flow nesting and accepted this; production counts both
+    // frame stacks together and refuses it.
+    try expectYamlEveryRouteVerdict(
+        yamlBlockWrappedFlowSource(buffer[0..], yaml_max_depth),
+        error.DepthExceeded,
+    );
+
+    // A bare flow sequence reaches the same 1024 levels with no block frame
+    // above it, and stays inside the budget.
+    try expectYamlEveryRouteVerdict(yamlFlowOnlySource(buffer[0..], yaml_max_depth), null);
 }

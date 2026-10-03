@@ -739,7 +739,9 @@ fn copyIntoArchive(
         error.PathAlreadyExists => return error.ArchiveEntryExists,
         else => return err,
     };
-    errdefer output.close(io);
+    // `streamDigest` writes through the borrowed sink and never closes it, so
+    // this function owns the handle on every exit including the success one.
+    defer output.close(io);
 
     return streamDigest(io, &input, &output, limit);
 }

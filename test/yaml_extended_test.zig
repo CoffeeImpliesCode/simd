@@ -57,6 +57,21 @@ fn expectScalarValue(input: []const u8, expected: []const u8) !void {
     return error.ExpectedScalar;
 }
 
+/// Like `expectScalarValue`, but for a value that is not the first scalar in
+/// the document: the assertion is that the document cooks it, not where it
+/// sits in the tape.
+fn expectSomeScalarValue(input: []const u8, expected: []const u8) !void {
+    var document = try yaml.buildYamlTape(testing.allocator, input, yaml.default_limits);
+    defer document.deinit(testing.allocator);
+
+    for (document.tape, 0..) |word, event_index| {
+        if (word.tapeKind() != .scalar) continue;
+        const value = try document.value(input, event_index);
+        if (std.mem.eql(u8, expected, value.bytes())) return;
+    }
+    return error.ExpectedScalar;
+}
+
 fn expectResourceOutcome(
     input: []const u8,
     limits: yaml.Limits,
@@ -1307,4 +1322,572 @@ test "quoted folding preserves escaped whitespace before line breaks" {
         defer document.deinit(testing.allocator);
         try testing.expectEqualStrings(case.expected, (try document.value(case.source, 2)).bytes());
     }
+}
+
+/// Drives every yaml-basic route from one input: the validating entry point,
+/// the independent scalar oracle, the vectorized index at each supported
+/// width, the eager tape, the resident walk and the stream indexer. The shared
+/// source check is reached from all six, so one verdict has to come back from
+/// all six. `expected` is the error every route has to report, or `null` when
+/// every route has to accept `input`.
+fn expectBasicYamlRoutes(input: []const u8, expected: ?basic.YamlError) !void {
+    if (expected) |expected_error| {
+        const diagnostic = (try basic.validateYaml(testing.allocator, input)) orelse
+            return error.ExpectedBasicDiagnostic;
+        try testing.expectEqual(expected_error, diagnostic.err);
+        try testing.expectError(expected_error, basic.scalarIndexYaml(testing.allocator, input));
+        inline for (.{ 4, 16, 32, 64 }) |vector_len| {
+            try testing.expectError(expected_error, basic.indexYamlImpl(vector_len, testing.allocator, input));
+        }
+        try testing.expectError(expected_error, basic.buildYamlTape(testing.allocator, input));
+    } else {
+        try testing.expect((try basic.validateYaml(testing.allocator, input)) == null);
+        var oracle = try basic.scalarIndexYaml(testing.allocator, input);
+        defer oracle.deinit(testing.allocator);
+        inline for (.{ 4, 16, 32, 64 }) |vector_len| {
+            var indexed = try basic.indexYamlImpl(vector_len, testing.allocator, input);
+            defer indexed.deinit(testing.allocator);
+            try testing.expectEqual(oracle.count, indexed.count);
+        }
+        var tape = try basic.buildYamlTape(testing.allocator, input);
+        defer tape.deinit(testing.allocator);
+        try testing.expectEqual(oracle.count, tape.tape.len);
+    }
+
+    var parser = try basic.Parser.init(testing.allocator, 0);
+    defer parser.deinit();
+    var document = try basic.initOnDemandDocument(&parser, input);
+    defer document.deinit();
+    var reader = try document.eventReader();
+    var refused = false;
+    while (true) {
+        const event = reader.next() catch |err| {
+            if (expected) |expected_error| try testing.expectEqual(expected_error, err);
+            refused = true;
+            break;
+        };
+        if (event == null) break;
+    }
+    try testing.expectEqual(expected != null, refused);
+
+    var stream = try basic.initStreamIndexer(testing.allocator, 1);
+    defer stream.deinit();
+    for (input, 0..) |_, offset| try stream.feed(input[offset..][0..1]);
+    if (expected) |expected_error| {
+        try testing.expectError(expected_error, stream.finish());
+    } else {
+        try stream.finish();
+        var streamed = stream.take();
+        defer streamed.deinit(testing.allocator);
+        try testing.expect(streamed.count > 0);
+    }
+}
+
+fn expectExtendedYamlRefusal(
+    input: []const u8,
+    expected: yaml.Error,
+    kind: yaml.DiagnosticKind,
+) !void {
+    const diagnostic = (try yaml.validateYaml(testing.allocator, input, yaml.default_limits)) orelse
+        return error.ExpectedExtendedDiagnostic;
+    try testing.expectEqual(expected, diagnostic.err);
+    try testing.expectEqual(kind, diagnostic.kind);
+    try testing.expectError(expected, yaml.buildYamlTape(testing.allocator, input, yaml.default_limits));
+}
+
+test "parser audit: Y01 folded scalars keep blank breaks beside more-indented lines" {
+    // A blank line next to more-indented content is a line break rather than a
+    // fold, and it survives before, after and between the more-indented lines.
+    const cases = [_]struct { source: []const u8, cooked: []const u8 }{
+        .{ .source = ">2\n  a\n\n    b\n", .cooked = "a\n\n  b\n" },
+        .{ .source = ">2\n    a\n\n  b\n", .cooked = "  a\n\nb\n" },
+        .{ .source = ">2\n    a\n\n    b\n", .cooked = "  a\n\n  b\n" },
+    };
+    for (cases) |case| {
+        try expectScalarValue(case.source, case.cooked);
+        var document = try yaml.buildYamlTape(testing.allocator, case.source, yaml.default_limits);
+        defer document.deinit(testing.allocator);
+        try testing.expectEqual(yaml.ScalarStyle.folded, (try document.scalarInfo(0)).style);
+        try testing.expectEqual(yaml.Chomping.clip, (try document.scalarInfo(0)).chomping);
+        try testing.expect((try yaml.validateYaml(testing.allocator, case.source, yaml.default_limits)) == null);
+    }
+
+    // Ordinary folding still collapses the same blank line, a literal block
+    // already kept it, and the break before a following ordinary line stays a
+    // break, so only the more-indented neighbour changes.
+    try expectScalarValue(">2\n  a\n\n  b\n", "a\nb\n");
+    try expectScalarValue("|2\n  a\n\n    b\n", "a\n\n  b\n");
+    try expectScalarValue(">2\n  a\n\n    b\n  c\n", "a\n\n  b\nc\n");
+}
+
+test "parser audit: Y02 complex keys stay out of profile in block and flow slots" {
+    // Basic delegation: nothing here selects the extended parser, so the basic
+    // profile answers, and a container in a key slot is not a key.
+    const delegated = [_][]const u8{
+        "[a]: b\n",
+        "{a: b}: c\n",
+        "{[a]: b}\n",
+    };
+    for (delegated) |input| {
+        try expectExtendedYamlRefusal(input, error.Unsupported, yaml.DiagnosticKind.unsupported);
+        try testing.expectError(error.Unsupported, basic.buildYamlTape(testing.allocator, input));
+        try testing.expectError(error.Unsupported, basic.scalarIndexYaml(testing.allocator, input));
+    }
+
+    // Forced extended: a block scalar elsewhere in the document routes it
+    // through the extended parser, which owns its own key-slot rule and has to
+    // reach the same verdict rather than accept a container as a key.
+    const forced = [_][]const u8{
+        "k: |\n  x\n[a]: b\n",
+        "k: |\n  x\nm: {[a]: b}\n",
+        "k: |\n  x\nm: {{a: b}: c}\n",
+    };
+    for (forced) |input| {
+        try expectExtendedYamlRefusal(input, error.Unsupported, yaml.DiagnosticKind.unsupported);
+    }
+}
+
+test "parser audit: Y03 block scalar headers keep their indicators contiguous" {
+    // The header production admits the two indicators in either order and
+    // then a comment; a space between them is not one of those forms.
+    const spaced = [_][]const u8{
+        "| +\n  a\n\n",
+        "| 2\n  a\n",
+        "|+ 2\n  a\n",
+        "> +\n  a\n\n",
+        "> 2\n  a\n",
+        ">+ 2\n  a\n",
+    };
+    for (spaced) |input| {
+        try expectExtendedYamlRefusal(input, error.Invalid, yaml.DiagnosticKind.syntax);
+    }
+
+    // Contiguous modifiers and the legal trailing whitespace or comment the
+    // same production allows after them stay valid.
+    try expectScalarValue("|2+\n  a\n\n", "a\n\n");
+    try expectScalarValue("|+2\n  a\n", "a\n");
+    try expectScalarValue("|2-\n  a\n", "a");
+    try expectScalarValue("|  \n  a\n", "a\n");
+    try expectScalarValue("|2 # keep\n  a\n", "a\n");
+    try expectScalarValue(">2  \n  a\n", "a\n");
+
+    // A comment still has to be separated from the header by a space, so
+    // accepting a space elsewhere did not become accepting it anywhere.
+    try expectExtendedYamlRefusal("|2#keep\n  a\n", error.Invalid, yaml.DiagnosticKind.syntax);
+}
+
+test "parser audit: Y04 extended routes apply the flow-key profile guard" {
+    // Delegated: the basic profile decides, so the guard has to be the one it
+    // already applies to a block key.
+    const delegated = [_][]const u8{
+        "{@: 1}\n",
+        "{`: 1}\n",
+        "{%: 1}\n",
+        "{?: 1}\n",
+        "{|: 1}\n",
+        "{>: 1}\n",
+        "{a: 1, @: 2}\n",
+    };
+    for (delegated) |input| {
+        try expectExtendedYamlRefusal(input, error.Unsupported, yaml.DiagnosticKind.unsupported);
+    }
+
+    // Forced: the extended parser scans the key itself and keeps refusing the
+    // same bytes once the delegation path stops accepting them.
+    const forced = [_][]const u8{
+        "k: |\n  x\nn: {@: 1}\n",
+        "k: |\n  x\nn: {`: 1}\n",
+        "k: |\n  x\nn: {%: 1}\n",
+        "k: |\n  x\nn: {?: 1}\n",
+        "k: |\n  x\nn: {|: 1}\n",
+        "k: |\n  x\nn: {>: 1}\n",
+    };
+    for (forced) |input| {
+        try expectExtendedYamlRefusal(input, error.Unsupported, yaml.DiagnosticKind.unsupported);
+    }
+
+    // A quoted key is data, on either route. The forced document spends the
+    // block scalar pair, the sibling key and the flow mapping start before it.
+    const quoted_keys = [_]struct { input: []const u8, event_index: usize }{
+        .{ .input = "{\"@\": 1}\n", .event_index = 1 },
+        .{ .input = "k: |\n  x\nn: {\"@\": 1}\n", .event_index = 5 },
+    };
+    for (quoted_keys) |case| {
+        try testing.expect((try yaml.validateYaml(testing.allocator, case.input, yaml.default_limits)) == null);
+        var document = try yaml.buildYamlTape(testing.allocator, case.input, yaml.default_limits);
+        defer document.deinit(testing.allocator);
+        try expectScalars(&document, case.input, &.{.{
+            .event_index = case.event_index,
+            .raw = "\"@\"",
+            .value = "@",
+            .style = .double_quoted,
+            .ownership = .document_owned,
+        }});
+    }
+}
+
+test "parser audit: Y05 quoted scalars accept literal U+FEFF on every route" {
+    // YAML allows U+FEFF inside quoted content, so the shared source check has
+    // to read the quote state instead of refusing every interior BOM.
+    const accepted = [_]struct {
+        input: []const u8,
+        event_index: usize,
+        cooked: []const u8,
+    }{
+        .{ .input = "k: \"a\xef\xbb\xbfb\"\n", .event_index = 2, .cooked = "a\xef\xbb\xbfb" },
+        .{ .input = "k: 'a\xef\xbb\xbfb'\n", .event_index = 2, .cooked = "a\xef\xbb\xbfb" },
+        .{ .input = "k: \"\xef\xbb\xbfab\"\n", .event_index = 2, .cooked = "\xef\xbb\xbfab" },
+        .{ .input = "k: \"ab\xef\xbb\xbf\"\n", .event_index = 2, .cooked = "ab\xef\xbb\xbf" },
+        .{ .input = "a: 1\nk: \"a\xef\xbb\xbfb\"\n", .event_index = 4, .cooked = "a\xef\xbb\xbfb" },
+        .{ .input = "root:\n  \"a\xef\xbb\xbfb\"\n", .event_index = 2, .cooked = "a\xef\xbb\xbfb" },
+        .{ .input = "root:\n  'a\xef\xbb\xbfb'\n", .event_index = 2, .cooked = "a\xef\xbb\xbfb" },
+        // A doubled quote and an escaped quote each open no new scalar, so the
+        // bytes after them are still inside the one that is open.
+        .{ .input = "k: 'a''\xef\xbb\xbfb'\n", .event_index = 2, .cooked = "a'\xef\xbb\xbfb" },
+        .{ .input = "k: \"a\\\"\xef\xbb\xbfb\"\n", .event_index = 2, .cooked = "a\"\xef\xbb\xbfb" },
+        // A flow collection is a value slot, not a plain scalar, so its quoted
+        // key and value are quoted scalars too.
+        .{ .input = "k: [\"\xef\xbb\xbfv\"]\n", .event_index = 3, .cooked = "\xef\xbb\xbfv" },
+        // The escape and a stream-leading BOM cook the same three bytes.
+        .{ .input = "k: \"a\\uFEFFb\"\n", .event_index = 2, .cooked = "a\xef\xbb\xbfb" },
+        .{ .input = "\xef\xbb\xbfk: \"ab\"\n", .event_index = 2, .cooked = "ab" },
+    };
+    for (accepted) |case| {
+        try expectBasicYamlRoutes(case.input, null);
+        try testing.expect((try yaml.validateYaml(testing.allocator, case.input, yaml.default_limits)) == null);
+        var document = try yaml.buildYamlTape(testing.allocator, case.input, yaml.default_limits);
+        defer document.deinit(testing.allocator);
+        try testing.expectEqualStrings(case.cooked, (try document.value(case.input, case.event_index)).bytes());
+    }
+
+    // A comma ends an entry only inside a flow collection, so the quoted value
+    // after one is a scalar of its own however many plain entries precede it,
+    // and a quoted key closes at a bare colon the way a JSON-style pair writes
+    // one rather than needing a space after it.
+    const flow_entries = [_][]const u8{
+        "k: [a, \"\xef\xbb\xbfv\"]\n",
+        "k: [a, b, \"\xef\xbb\xbfv\"]\n",
+        "k: {a: b, c: \"\xef\xbb\xbfv\"}\n",
+        "{\"k\":\"\xef\xbb\xbfv\"}\n",
+    };
+    for (flow_entries) |input| {
+        try expectBasicYamlRoutes(input, null);
+        try testing.expect((try yaml.validateYaml(testing.allocator, input, yaml.default_limits)) == null);
+        try expectSomeScalarValue(input, "\xef\xbb\xbfv");
+    }
+
+    // This one is extended-only because it contains a block scalar, so it is
+    // asserted here rather than in the accepted list the loop above drives
+    // through the basic routes.
+    const block = "k: |\n  x\nn: \"a\xef\xbb\xbfb\"\n";
+    try testing.expectError(error.Unsupported, basic.buildYamlTape(testing.allocator, block));
+    try testing.expect((try yaml.validateYaml(testing.allocator, block, yaml.default_limits)) == null);
+    var block_document = try yaml.buildYamlTape(testing.allocator, block, yaml.default_limits);
+    defer block_document.deinit(testing.allocator);
+    try testing.expectEqualStrings("a\xef\xbb\xbfb", (try block_document.value(block, 4)).bytes());
+
+    // A key's quoted content is quoted content too.
+    const keys = [_]struct {
+        input: []const u8,
+        raw: []const u8,
+        style: yaml.ScalarStyle,
+    }{
+        .{ .input = "\"\xef\xbb\xbfk\": v\n", .raw = "\"\xef\xbb\xbfk\"", .style = .double_quoted },
+        .{ .input = "'\xef\xbb\xbfk': v\n", .raw = "'\xef\xbb\xbfk'", .style = .single_quoted },
+        .{ .input = "{\"\xef\xbb\xbfk\": v}\n", .raw = "\"\xef\xbb\xbfk\"", .style = .double_quoted },
+    };
+    for (keys) |case| {
+        try expectBasicYamlRoutes(case.input, null);
+        var document = try yaml.buildYamlTape(testing.allocator, case.input, yaml.default_limits);
+        defer document.deinit(testing.allocator);
+        try expectScalars(&document, case.input, &.{.{
+            .event_index = 1,
+            .raw = case.raw,
+            .value = "\xef\xbb\xbfk",
+            .style = case.style,
+            .ownership = .document_owned,
+        }});
+    }
+
+    // A multiline quoted scalar is outside the basic profile, so this one is
+    // the extended route alone, and the BOM sits on a continuation line rather
+    // than on the line that opens the quotes.
+    const multiline = "k: \"a\n  b\xef\xbb\xbfc\"\n";
+    try testing.expectError(error.Unsupported, basic.buildYamlTape(testing.allocator, multiline));
+    try testing.expect((try yaml.validateYaml(testing.allocator, multiline, yaml.default_limits)) == null);
+    var multiline_document = try yaml.buildYamlTape(testing.allocator, multiline, yaml.default_limits);
+    defer multiline_document.deinit(testing.allocator);
+    try testing.expectEqualStrings("a b\xef\xbb\xbfc", (try multiline_document.value(multiline, 2)).bytes());
+
+    // The same multiline scalar with the U+FEFF at the head of the content on
+    // its continuation line, where it is quoted content only because the line
+    // above left the quotes open and the line cannot be read on its own.
+    const multiline_head = "k: \"a\n  \xef\xbb\xbfb\"\n";
+    try testing.expectError(error.Unsupported, basic.buildYamlTape(testing.allocator, multiline_head));
+    try testing.expect((try yaml.validateYaml(testing.allocator, multiline_head, yaml.default_limits)) == null);
+    try expectSomeScalarValue(multiline_head, "a \xef\xbb\xbfb");
+
+    // Nothing else opens up. Plain content, a comment, a line that starts with
+    // a BOM and a block body keep failing, a quoted U+FFFE is still a character
+    // this profile cannot read, and a quote byte that is only content is not a
+    // scalar opener.
+    const rejected = [_][]const u8{
+        "k: a\xef\xbb\xbfb\n",
+        "a: 1\n\xef\xbb\xbfb: 2\n",
+        "k: v # \xef\xbb\xbf\n",
+        "k: |\n  a\xef\xbb\xbfb\n",
+        "k: \"a\xef\xbf\xbeb\"\n",
+        "k: 'a\xef\xbf\xbeb'\n",
+        // Quote bytes that are only content. A check that toggled on every
+        // quote would open a scalar at each of these and wave the BOM through,
+        // so they pin the allowance to a real quoted scalar and nothing else.
+        "k: plain \"\xef\xbb\xbf\"\n",
+        "k: v # \"\xef\xbb\xbf\"\n",
+        "k: |\n  \"\xef\xbb\xbf\"\n",
+        "k: |\n  a: \"\xef\xbb\xbf\"\n",
+        "k: >\n  [\"\xef\xbb\xbf\"]\n",
+        // Punctuation inside a plain scalar is its content, so a comma and a
+        // hyphen between words do not open the value slot behind them.
+        "k: a, \"\xef\xbb\xbf\"\n",
+        "k: a- \"\xef\xbb\xbf\"\n",
+        // A plain scalar runs onto the lines below it that are indented under
+        // its block, so a quote on one of them is content and a U+FEFF there is
+        // the character this profile cannot read.
+        "k: a\n  \"\xef\xbb\xbf\"\n",
+        "k: a\n \xef\xbb\xbfb\n",
+        // A `\` takes the line break with it and nothing else, so the quote that
+        // closes the scalar on the next line still closes it, and what follows
+        // is read on its own rather than inside the quotes.
+        "\"a\\\n\"\nk: \xef\xbb\xbfb\n",
+        "\"a\\\n\"\n# \xef\xbb\xbf\n",
+        // A U+FEFF at the head of a later line is no more readable than one in
+        // the middle of it when no quote is open, and a line that is nothing
+        // else is still a line.
+        "k: v\n\xef\xbb\xbf\n",
+        // The continuation line of the value above, at a column a walk that
+        // compared indents against whole-source offsets would read as a node.
+        "root:\n  k: x\n    \"\xef\xbb\xbf\"\n",
+    };
+    for (rejected) |input| {
+        try expectBasicYamlRoutes(input, error.Invalid);
+        try expectExtendedYamlRefusal(input, error.Invalid, yaml.DiagnosticKind.syntax);
+    }
+
+    // The same quoted value indented under a key is a value, and only the
+    // lines above it say so: a walk holding one line at a time has to be told
+    // whether the header above opened a block body or the line is a node.
+    const indented = [_][]const u8{
+        "root:\n    \"a\xef\xbb\xbfb\"\n",
+        "root:\n  - \"a\xef\xbb\xbfb\"\n",
+        "\xef\xbb\xbfroot:\n  \"a\xef\xbb\xbfb\"\n",
+        "root:\r\n  \"a\xef\xbb\xbfb\"\r\n",
+        "root:\n  - \"a\xef\xbb\xbfb\"\n  - tail\n",
+    };
+    for (indented) |input| {
+        try expectBasicYamlRoutes(input, null);
+        try testing.expect((try yaml.validateYaml(testing.allocator, input, yaml.default_limits)) == null);
+        try expectScalarValue(input, "a\xef\xbb\xbfb");
+    }
+
+    // A plain scalar runs only onto the lines indented under the entry it
+    // belongs to. Beside that entry the line is the next node again, so the
+    // quoted key here and the quoted sequence entry below are their own
+    // scalars and not the tail of the value above them.
+    const beside = [_][]const u8{
+        "root:\n  a: x\n  \"\xef\xbb\xbf\": z\n",
+        "root:\n  - a\n  - \"\xef\xbb\xbf\"\n",
+    };
+    for (beside) |input| {
+        try expectBasicYamlRoutes(input, null);
+        try testing.expect((try yaml.validateYaml(testing.allocator, input, yaml.default_limits)) == null);
+    }
+    try expectSomeScalarValue(beside[1], "\xef\xbb\xbf");
+
+    // The same pairing inside a compact mapping, which is the extended route's:
+    // the quoted key beside the entry is a key rather than the tail of its
+    // value.
+    const compact = "root:\n  - a: x\n    \"\xef\xbb\xbf\": z\n";
+    try testing.expect((try yaml.validateYaml(testing.allocator, compact, yaml.default_limits)) == null);
+
+    // A plain value that is not beside an entry of its own still runs, so this
+    // one is content and keeps failing.
+    try expectBasicYamlRoutes("root:\n  a\n  \"\xef\xbb\xbf\"\n", error.Invalid);
+    try expectExtendedYamlRefusal("root:\n  a\n  \"\xef\xbb\xbf\"\n", error.Invalid, yaml.DiagnosticKind.syntax);
+
+    // A body the header above opened stays text however much of it looks like
+    // YAML, and an empty line inside a block does not close the body.
+    const bodies = [_][]const u8{
+        "k: |\n\n  \"\xef\xbb\xbf\"\n",
+        "k: |+\n  a: \"\xef\xbb\xbf\"\n",
+        "k: >-\n  \"\xef\xbb\xbf\"\n",
+        "k: |\n  # \"\xef\xbb\xbf\"\n",
+        "root:\n  k: |\n   \"\xef\xbb\xbf\"\n",
+        "root:\n  k: >\n   [\"\xef\xbb\xbf\"]\n",
+        "k: |\n  x\n  \"\xef\xbb\xbf\"\n",
+        "k: >\n  x\n  a: \"\xef\xbb\xbf\"\n",
+    };
+    for (bodies) |input| {
+        try expectBasicYamlRoutes(input, error.Invalid);
+        try expectExtendedYamlRefusal(input, error.Invalid, yaml.DiagnosticKind.syntax);
+    }
+}
+
+/// Drives the stream indexer over `input` cut into chunks of `chunk_len` bytes,
+/// and settles the index it produces against the one the whole-input route
+/// produces. `expected` is the error `finish` has to report, or `null` when the
+/// document has to be indexed.
+fn expectStreamChunks(input: []const u8, chunk_len: usize, expected: ?basic.YamlError) !void {
+    var stream = try basic.initStreamIndexer(testing.allocator, chunk_len);
+    defer stream.deinit();
+    var offset: usize = 0;
+    while (offset < input.len) {
+        const end = @min(input.len, offset + chunk_len);
+        try stream.feed(input[offset..end]);
+        offset = end;
+    }
+    if (expected) |expected_error| {
+        try testing.expectError(expected_error, stream.finish());
+        return;
+    }
+    try stream.finish();
+
+    var oracle = try basic.indexYaml(testing.allocator, input);
+    defer oracle.deinit(testing.allocator);
+    var actual = stream.take();
+    defer actual.deinit(testing.allocator);
+    try testing.expectEqual(oracle.count, actual.count);
+    for (oracle.slice(), actual.slice(), 0..) |expected_offset, actual_offset, token| {
+        try testing.expectEqual(expected_offset, actual_offset);
+        try testing.expectEqual(oracle.kinds[token], actual.kinds[token]);
+        try testing.expectEqual(oracle.lengths[token], actual.lengths[token]);
+    }
+}
+
+/// Drives `expectStreamChunks` at every chunk size, which is what splits a line
+/// break, the three bytes of a U+FEFF or a quoted scalar differently.
+fn expectStreamEveryChunk(input: []const u8, expected: ?basic.YamlError) !void {
+    for (1..input.len + 2) |chunk_len| {
+        try expectStreamChunks(input, chunk_len, expected);
+    }
+}
+
+test "parser audit: Y06 stream source context spans lines, chunks and resets" {
+    // The indexer reads one line at a time, so the shared check has to carry
+    // what the lines above left behind: a quoted value indented under a key is
+    // a node, not the body of a header it cannot see.
+    const accepted = [_][]const u8{
+        "root:\n  \"a\xef\xbb\xbfb\"\n",
+        "root:\n    \"a\xef\xbb\xbfb\"\n",
+        "root:\n  'a\xef\xbb\xbfb'\n",
+        "root:\n  - \"a\xef\xbb\xbfb\"\n",
+        "\xef\xbb\xbfroot:\n  \"a\xef\xbb\xbfb\"\n",
+        "root:\r\n  \"a\xef\xbb\xbfb\"\r\n",
+        "root:\n  a: x\n  \"\xef\xbb\xbf\": z\n",
+        "root:\n  - a\n  - \"\xef\xbb\xbf\"\n",
+        "{\"k\":\"\xef\xbb\xbfv\"}\n",
+    };
+    for (accepted) |input| try expectStreamEveryChunk(input, null);
+
+    // The same bytes under a header that opened a block body are text, so the
+    // U+FEFF is a character this profile cannot read however the chunks split
+    // it. The later lines also pin the context across a latched verdict: the
+    // header refuses the document first, and the body still decides that it is
+    // invalid rather than merely out of profile.
+    const rejected = [_][]const u8{
+        "k: |\n  \"\xef\xbb\xbf\"\n",
+        "k: |\n  a: \"\xef\xbb\xbf\"\n",
+        "k: >\n  [\"\xef\xbb\xbf\"]\n",
+        "k: |\n\n  \"\xef\xbb\xbf\"\n",
+        "k: |\n  x\n  \"\xef\xbb\xbf\"\n",
+        "k: >\n  x\n  a: \"\xef\xbb\xbf\"\n",
+        "root:\n  k: |\n   \"\xef\xbb\xbf\"\n",
+        "k: plain \"\xef\xbb\xbf\"\n",
+        "k: v # \xef\xbb\xbf\n",
+        "a: 1\n\xef\xbb\xbfb: 2\n",
+        // Punctuation inside a plain scalar is its content, so neither a comma
+        // nor a hyphen between words opens the value slot behind them.
+        "k: a, \"\xef\xbb\xbf\"\n",
+        "k: a- \"\xef\xbb\xbf\"\n",
+        // A plain scalar runs onto the lines below it that are indented under
+        // its block, so a quote on one of them is its content.
+        "k: a\n  \"\xef\xbb\xbf\"\n",
+        "k: a\n \xef\xbb\xbfb\n",
+        "root:\n  a\n  \"\xef\xbb\xbf\"\n",
+        // An escape takes the line break with it and nothing else, so the quote
+        // on the next line still closes the scalar.
+        "\"a\\\n\"\nk: \xef\xbb\xbfb\n",
+        "\"a\\\n\"\n# \xef\xbb\xbf\n",
+        // A U+FEFF at the head of a later line is no more readable than one in
+        // the middle of it when no quote is open, and a line that is nothing
+        // else is still a line.
+        "k: v\n\xef\xbb\xbf\n",
+        // The continuation line of the value above, at a column a walk that
+        // compared indents against whole-source offsets would read as a node.
+        "root:\n  k: x\n    \"\xef\xbb\xbf\"\n",
+    };
+    for (rejected) |input| try expectStreamEveryChunk(input, error.Invalid);
+
+    // A quoted scalar that spans lines is outside the basic profile, and the
+    // source check has to leave that to the profile: the U+FEFF sits inside the
+    // quotes the line above opened, so the verdict is the profile's refusal
+    // rather than a source failure. The same holds for a `\` that takes the
+    // break with it, because a walk that held one line at a time could not tell
+    // it from a quote that opens a node here.
+    const out_of_profile = [_][]const u8{
+        "k: \"a\n  b\xef\xbb\xbfc\"\n",
+        "k: \"a\\\n  b\xef\xbb\xbfc\"\n",
+    };
+    for (out_of_profile) |input| {
+        try expectStreamEveryChunk(input, error.Unsupported);
+        try testing.expect((try yaml.validateYaml(testing.allocator, input, yaml.default_limits)) == null);
+    }
+
+    // A U+FEFF at the very first byte of a continuation line is quoted content
+    // only because the line above left the quotes open, so the basic profile is
+    // what refuses this document and the shared check is not.
+    try expectStreamEveryChunk("\"a\n\xef\xbb\xbfb\"\n", error.Unsupported);
+
+    // `reset` is the only recovery, and it returns the context to a document
+    // that has not been read: a body the header above opened is a node in the
+    // next document, and a node in one document is a body in the next.
+    var stream = try basic.initStreamIndexer(testing.allocator, 1);
+    defer stream.deinit();
+
+    try stream.feed("k: |\n  \"\xef\xbb\xbf\"\n");
+    try testing.expectError(error.Invalid, stream.finish());
+
+    stream.reset();
+    try stream.feed("root:\n  \"a\xef\xbb\xbfb\"\n");
+    try stream.finish();
+    var first = stream.take();
+    defer first.deinit(testing.allocator);
+    try testing.expect(first.count > 0);
+
+    stream.reset();
+    try stream.feed("root:\n  \"a\xef\xbb\xbfb\"\n");
+    try stream.finish();
+    var second = stream.take();
+    defer second.deinit(testing.allocator);
+    try testing.expectEqual(first.count, second.count);
+
+    // The same for a plain scalar left open at the end of its line: the
+    // document after it starts with nothing carried over, so its indented
+    // quoted value is a node again rather than the tail of that scalar.
+    stream.reset();
+    try stream.feed("k: a\n");
+    try stream.finish();
+    var third = stream.take();
+    defer third.deinit(testing.allocator);
+    try testing.expect(third.count > 0);
+
+    stream.reset();
+    try stream.feed("root:\n  \"a\xef\xbb\xbfb\"\n");
+    try stream.finish();
+    var fourth = stream.take();
+    defer fourth.deinit(testing.allocator);
+    try testing.expect(fourth.count > 0);
+
+    stream.reset();
+    try stream.feed("k: |\n  \"\xef\xbb\xbf\"\n");
+    try testing.expectError(error.Invalid, stream.finish());
 }

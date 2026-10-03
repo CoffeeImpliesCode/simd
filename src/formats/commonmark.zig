@@ -1,3 +1,29 @@
+//! CommonMark 0.31.2 semantic parser and HTML renderer.
+//!
+//! The module is reached as `simd.formats.commonmark`. Everything a consumer
+//! needs is exported here: `parseCommonMark`, `renderCommonMarkHtml`,
+//! `CommonMarkDocument` and its `ChildIterator`, the node, text and reference
+//! types, the option types, and the two error sets. The sibling files under
+//! `commonmark/` are entity, case-folding and punctuation tables reached only by
+//! relative import and are not part of that surface.
+//!
+//! ```
+//! var document = try commonmark.parseCommonMark(gpa, source, .{});
+//! defer document.deinit();
+//! const html = try commonmark.renderCommonMarkHtml(gpa, &document, .{});
+//! defer gpa.free(html);
+//! ```
+//!
+//! The caller owns `gpa` and `source` for as long as the document lives, and
+//! releases the document with `CommonMarkDocument.deinit` and each rendered
+//! buffer with the same allocator.
+//!
+//! This is not the marker-only `formats.markdown` tape and not an extension of
+//! it, and it exposes no stream indexer. It performs no I/O of its own: it takes
+//! no `std.Io`, opens nothing, and needs no clock or randomness. The trust
+//! boundary in `HtmlRenderMode.conformance` belongs to the caller, because that
+//! mode reproduces the specification's expected output, raw HTML included.
+
 const std = @import("std");
 const entity_table = @import("commonmark/entities.zig");
 const casefold = @import("commonmark/unicode_casefold.zig");
@@ -5,28 +31,52 @@ const categories = @import("commonmark/unicode_categories.zig");
 const max_u32 = std.math.maxInt(u32);
 const max_usize = std.math.maxInt(usize);
 
+/// Document-local index into `CommonMarkDocument.nodes`.
+///
+/// `root` is the `.document` node every parse appends first, and `none` marks an
+/// absent parent, child or sibling. Every other value is the node's own
+/// position in `nodes`, so an id means nothing outside the document that
+/// produced it and is not a liveness proof: `CommonMarkDocument.node` answers
+/// for any in-range id, including a node the child links no longer reach from
+/// the root.
+///
+/// The enum is non-exhaustive, so a consumer switching over one needs an `else`.
 pub const NodeId = enum(u32) {
     root = 0,
     none = max_u32,
     _,
 };
 
+/// Document-local index into `CommonMarkDocument.texts`, resolved by
+/// `CommonMarkDocument.text`.
+///
+/// `none` marks an absent text: a link or image title the document carries no
+/// value for, and the info string of an indented code block. The enum is
+/// non-exhaustive, so a consumer switching over one needs an `else`.
 pub const TextId = enum(u32) {
     none = max_u32,
     _,
 };
 
+/// Block or inline structure that one `Node` records.
 pub const NodeKind = enum(u8) {
+    /// The one root node of a document. It carries `NodeData.none` and renders
+    /// nothing of its own.
     document,
     block_quote,
     list,
     list_item,
     paragraph,
+    /// A block that held only link reference definitions. It stays in the tree
+    /// carrying `NodeData.none` and renders nothing; the definitions themselves
+    /// are in `CommonMarkDocument.references`.
     reference_definition,
     heading,
     thematic_break,
     code_block,
     html_block,
+    /// One inline run of literal text, with its entity references, backslash
+    /// escapes and line endings already resolved into `NodeData.raw`.
     text,
     softbreak,
     linebreak,
@@ -39,127 +89,353 @@ pub const NodeKind = enum(u8) {
     html_inline,
 };
 
+/// Half-open byte range `[start, end)` of one node inside the `source` slice
+/// given to `parseCommonMark`.
+///
+/// Both fields are byte offsets: `start` is included, `end` is one past the last
+/// byte. A block node carries the range it occupies, from the start of the line
+/// it began on to the end of the line that closed or last extended it, and the
+/// root carries `0..source.len`. Every inline node carries `0..0`, so a zero span
+/// means this record does not map to source, not that the node sits at offset
+/// zero.
 pub const SourceSpan = struct {
     start: u32,
     end: u32,
 };
 
+/// Orderedness and tightness of one `.list` node.
 pub const ListData = struct {
     ordered: bool,
+    /// First number of an ordered list, read from its marker and cut off after
+    /// nine digits; always `1` for an unordered list.
     start: u32,
+    /// `'.'` or `')'` after an ordered marker, and the bullet character
+    /// (`'-'`, `'+'` or `'*'`) before an unordered one.
     delimiter: u8,
+    /// Decided after parsing: a list is tight when no blank line separates two
+    /// of its blocks or two of its items. A tight list renders the paragraphs
+    /// directly inside it without the `<p>` wrapper.
     tight: bool,
 };
 
+/// Level and unparsed text of one `.heading` node.
 pub const HeadingData = struct {
+    /// `1` through `6`, from a run of `#` or from a `=`/`-` setext underline.
     level: u8,
+    /// The heading's text before inline parsing, so its backslash escapes and
+    /// entity references are still in source form.
     raw: TextId,
 };
 
+/// Fence and content of one `.code_block` node.
 pub const CodeBlockData = struct {
     fenced: bool,
+    /// The fence character opening and closing a fenced block, and `0` for an
+    /// indented one.
     fence: u8,
+    /// Length in characters of the opening fence run, and `0` for an indented
+    /// block.
     fence_length: usize,
+    /// Info string of a fenced block after link-destination cleaning, so its
+    /// entity references and backslash escapes are resolved; `.none` when the
+    /// block is indented.
     info: TextId,
+    /// The code lines themselves, each terminated by '\n', with the block's own
+    /// indentation and trailing blank lines removed. This is the block's
+    /// content, not a byte range of `source`.
     raw: TextId,
 };
 
+/// Destination and title shared by `.link` and `.image` nodes.
 pub const LinkData = struct {
+    /// Destination after entity and backslash-escape resolution. A link or
+    /// image reachable from the root always names one: an inline pair that
+    /// resolved to nothing is removed from the tree instead of being left here
+    /// with `.none`.
     destination: TextId,
+    /// Title text, or `.none` when the document carries no title for it.
     title: TextId,
 };
 
+/// The payload one `Node` carries. The variant corresponds to the node's
+/// `Node.kind`, though not always under the same name: every kind that carries
+/// no payload uses `.none`, and every `.text`, `.code_span`, `.html_inline`,
+/// `.paragraph` and `.html_block` node uses `.raw`.
+///
+/// A `TextId` here names the document's own semantic bytes and never a byte range
+/// of `CommonMarkDocument.source`. What those bytes have been through depends on
+/// the kind:
+///
+///   - A `.paragraph` and a `.heading` hold pre-inline text, so backslash
+///     escapes, entity references and emphasis delimiters are still in source
+///     form; the inline pass consumes that text afterwards.
+///   - A `.text` node holds literal text whose entity references and backslash
+///     escapes are already resolved, and an `.autolink` destination has the same
+///     treatment.
+///   - A `.code_span` and a `.code_block` keep literal content: escapes and
+///     entities are not resolved, and a code span only folds line endings into
+///     spaces.
+///   - A `.html_block` and a `.html_inline` keep the literal tag text.
+///
+/// `CommonMarkOptions.invalid_utf8` and `.replace_nul` apply to every byte the
+/// document records.
 pub const NodeData = union(enum) {
+    /// For every kind that carries no payload.
     none,
+    /// Semantic bytes named by `TextId`, resolved to whatever extent the node's
+    /// own `NodeKind` resolves them; see the type comment.
     raw: TextId,
     heading: HeadingData,
     list: ListData,
     code_block: CodeBlockData,
     link: LinkData,
     image: LinkData,
+    /// The destination of an `.autolink`, without the `<>` that delimited it and
+    /// without any `mailto:` prefix.
     autolink: TextId,
 };
 
+/// One node of a parsed document, obtained from `CommonMarkDocument.node`.
 pub const Node = struct {
     kind: NodeKind,
+    /// Containing node, or `.none` for the root and for a node no child link
+    /// reaches any more.
     parent: NodeId,
+    /// First child in document order, or `.none` for a leaf.
     first_child: NodeId,
+    /// Last child in document order, or `.none` for a leaf.
     last_child: NodeId,
+    /// Next sibling in document order, or `.none` at the end of the chain.
     next_sibling: NodeId,
+    /// Range in `CommonMarkDocument.source`, and `0..0` for every inline node.
     source: SourceSpan,
     data: NodeData,
 };
 
+/// One entry of `CommonMarkDocument.texts`: a byte range inside `text_bytes`,
+/// indexed by the `TextId` that names it.
 pub const TextRecord = struct {
     start: u32,
     len: u32,
 };
 
+/// One link reference definition, collected in definition order.
 pub const Reference = struct {
+    /// Label after case folding and whitespace collapsing, so a consumer can
+    /// compare bytes instead of normalizing a label again.
     label: TextId,
+    /// Destination after entity and backslash-escape resolution.
     destination: TextId,
+    /// Title, or `.none` when the definition carried none.
     title: TextId,
 };
 
+/// What `parseCommonMark` does with input bytes that are not valid UTF-8.
 pub const InvalidUtf8Policy = enum {
+    /// Copy such bytes through unchanged. The document may then hold a text that
+    /// is not valid UTF-8.
     preserve,
+    /// Substitute U+FFFD for each byte that does not begin a valid sequence, and
+    /// keep every byte of one that does.
     replace,
+    /// Reject the whole input with `error.InvalidUtf8` before parsing starts.
     reject,
 };
 
+/// Bounds and normalisation applied by one `parseCommonMark` call.
+///
+/// The defaults assume a caller that parses one document at a time from a
+/// source buffer it already holds whole. No field is a hint: each one either
+/// rejects the input or bounds the work. The struct is copied into the parser at
+/// the call, so changing the caller's value afterwards does not affect it.
 pub const CommonMarkOptions = struct {
+    /// Largest accepted `source` length in bytes; a longer input fails with
+    /// `error.InputTooLarge` before parsing starts, so `0` admits only empty
+    /// input. Raise it for a document the default rejects, lower it to put a
+    /// fixed ceiling on an input whose size the caller does not control.
     max_input_bytes: usize = 64 * 1024 * 1024,
+    /// Largest number of nodes, counting the ones inline parsing detaches from
+    /// the tree as well as the ones it keeps; exceeding it fails with
+    /// `error.TooManyNodes`, and `0` rejects every input because even the root
+    /// node exceeds it. Raise it for inline-heavy source, where delimiter runs
+    /// outnumber blocks, lower it to bound node memory per input byte.
     max_nodes: usize = 1_000_000,
+    /// Largest total length in bytes of `CommonMarkDocument.text_bytes`;
+    /// exceeding it fails with `error.TextTooLarge`, and `0` admits no recorded
+    /// text byte at all. A configured value above `4294967295` is capped to
+    /// that, the largest offset a `TextRecord` can hold. Raise it for a document
+    /// whose semantic text exceeds the default, lower it to bound text-arena
+    /// memory.
     max_text_bytes: usize = 64 * 1024 * 1024,
+    /// Largest number of link reference definitions; exceeding it fails with
+    /// `error.TooManyReferences`, so `0` rejects a document that defines any.
+    /// Raise it for a document whose definitions exceed the default, lower it to
+    /// cap the definition table.
     max_reference_count: usize = 100_000,
+    /// Largest number of emphasis delimiter runs held at once inside one block;
+    /// the run that would exceed it fails with `error.TooManyDelimiters`, so `0`
+    /// rejects any block holding a `*` or `_` delimiter run. Raise it for a
+    /// block dense in emphasis, lower it to cap per-block inline state.
     max_delimiters: usize = 1_000_000,
+    /// Largest number of bracket frames left open inside one block; the frame
+    /// that would exceed it fails with `error.TooManyBrackets`, so `0` rejects
+    /// any block that opens a bracket frame. Raise it for a block dense in
+    /// brackets, lower it to cap per-block inline state.
     max_brackets: usize = 1_000_000,
+    /// Deepest container nesting and deepest parent chain; either exceeding it
+    /// fails with `error.NestingTooDeep`, and `0` admits only a document with no
+    /// blocks, because every block adds a parent level. Raise it for deeply
+    /// nested containers, lower it to cap nesting. A single line carrying more
+    /// than 64 container prefixes fails the same way whatever this value is.
     max_depth: usize = 4096,
+    /// Budget of charged parser steps, spent per scanned line, per scanned inline
+    /// and label byte, per emphasis closer, and per list-finalization step. The
+    /// step that would exceed it fails with `error.WorkLimit`, so `0` admits only
+    /// empty input. Raise it for source large enough to exhaust the default,
+    /// lower it to cap the work one call may do.
     max_work: u64 = 256 * 1024 * 1024,
+    /// Default `.preserve`: bytes that are not valid UTF-8 are copied through.
     invalid_utf8: InvalidUtf8Policy = .preserve,
+    /// Replaces each NUL byte in recorded text with U+FFFD. With `false` the NUL
+    /// is copied through and the document holds a text containing one. This is
+    /// independent of `invalid_utf8`, because NUL is valid UTF-8.
     replace_nul: bool = true,
 };
 
+/// How one `renderCommonMarkHtml` call treats raw HTML and link destinations.
 pub const HtmlRenderMode = enum {
+    /// The default. A `.html_block` or `.html_inline` node renders as
+    /// `<!-- raw HTML omitted -->`, and a `.link`, `.image` or `.autolink` whose
+    /// destination carries the `javascript:`, `vbscript:`, `file:` or `data:`
+    /// scheme renders with an empty `href` or `src`. The scheme test ignores
+    /// leading bytes at or below `0x20` and any `\t`, `\n` or `\r` inside the
+    /// scheme, so a control-obfuscated scheme is still filtered.
+    ///
+    /// That is the whole policy, and it is a bounded one: ordinary HTML escaping
+    /// of text and of attribute values, and URL percent encoding of
+    /// destinations, still apply in this mode exactly as they do in
+    /// `.conformance`. `.safe` is not a general-purpose sanitizer or transcoder.
     safe,
+    /// Deliberately unsafe. Raw HTML is copied through verbatim and every
+    /// destination is emitted, which is what reproduces the pinned
+    /// specification's expected output. The caller owns the trust boundary in
+    /// this mode.
     conformance,
 };
 
+/// Bounds and mode applied by one `renderCommonMarkHtml` call.
 pub const HtmlRenderOptions = struct {
+    /// Default `.safe`; see `HtmlRenderMode`.
     mode: HtmlRenderMode = .safe,
+    /// Largest output length in bytes; the write that would exceed it fails with
+    /// `error.OutputTooLarge`, so `0` admits only a document that renders no
+    /// bytes at all. Raise it for a document the default rejects, lower it to cap
+    /// the buffer one call may build.
     max_output_bytes: usize = 64 * 1024 * 1024,
 };
 
+/// Failures of `parseCommonMark`. Every one releases what the parser had built
+/// and returns no document, so the caller owns nothing after a failure.
 pub const ParseError = error{
+    /// `source` is longer than `max_input_bytes`, or longer than the `u32` source
+    /// offsets can address. Decided before parsing starts.
     InputTooLarge,
+    /// The document would hold more than `max_nodes` nodes.
     TooManyNodes,
+    /// Recorded text would exceed `max_text_bytes`.
     TextTooLarge,
+    /// The document defines more than `max_reference_count` references.
     TooManyReferences,
+    /// One block holds more than `max_delimiters` emphasis delimiter runs.
     TooManyDelimiters,
+    /// One block leaves more than `max_brackets` bracket frames open.
     TooManyBrackets,
+    /// Container nesting or a parent chain passed `max_depth`, or one line
+    /// carried more than 64 container prefixes.
     NestingTooDeep,
+    /// Charged parser work reached `max_work`.
     WorkLimit,
+    /// `invalid_utf8` is `.reject` and `source` is not valid UTF-8. Decided
+    /// before parsing starts, so no text was recorded.
     InvalidUtf8,
+    /// Not produced by `parseCommonMark`; retained in the published set.
     InvalidSourceRange,
+    /// The tree the parser built did not hold together: a link that left a node
+    /// detached, an emphasis run that closed on nothing, or a parent chain that
+    /// did not reach the root. A successful parse leaves none of these.
     InvalidDocument,
+    /// An allocation failed while the document was being built.
     OutOfMemory,
 };
 
+/// Failures of `renderCommonMarkHtml`. Every one releases the output built so
+/// far and returns no bytes.
 pub const RenderError = error{
+    /// The output passed `max_output_bytes`.
     OutputTooLarge,
+    /// The document is not walkable: the root is missing or is not a detached
+    /// `.document` node, a child or parent link is dangling or crosses parents,
+    /// or the walk did not finish within twice the node count in steps.
     InvalidDocument,
+    /// Not produced by `renderCommonMarkHtml`; retained in the published set.
     WorkLimit,
+    /// An allocation failed while the output was being built.
     OutOfMemory,
 };
 
+/// One parsed document: a node table, a text table with its bytes, and the link
+/// reference definitions, all allocated from the caller's allocator.
+///
+/// The document owns `nodes`, `texts`, `text_bytes` and `references`, stores
+/// `allocator` so `deinit` can release them into the same one, and borrows
+/// `source` without ever freeing it. One owner releases all four, once. Copying
+/// the struct duplicates the handle and not the storage: the copy frees nothing,
+/// and the hazard is a second `deinit` reached through either copy.
+///
+/// Parsing allocates each owned slice once. Accessors never resize it, so views
+/// into that storage remain valid until `deinit`. The document itself may move;
+/// those views point into its allocations, not into the struct.
+///
+/// Keep `allocator` and the owned slice handles unchanged. `deinit` needs the
+/// original allocations and their compatible allocator, whose backing state
+/// must remain alive. Replacing a handle can leak an allocation or cause invalid
+/// cleanup; assignment alone does not free the old allocation.
+///
+/// The fields are writable, not private. Writes through their slices change later
+/// reads without moving the allocation. Preserve node links, payload kinds and
+/// text ranges when modifying values; accessors do not validate the whole tree.
+///
+/// Readers may share a document only while nobody mutates or deinitializes it.
+/// Concurrent render calls also require an allocator that permits that use.
+///
+/// There is no empty or default instance: a `parseCommonMark` call always
+/// produces at least the `.document` root, even for empty input.
 pub const CommonMarkDocument = struct {
+    /// Allocator every owned slice came from. `deinit` frees into it and never
+    /// releases it; the allocator is the caller's, and its backing state must
+    /// outlive `deinit`.
     allocator: std.mem.Allocator,
+    /// The source bytes, borrowed from the `parseCommonMark` argument. No
+    /// accessor reads this field and no `Node.source` offset is checked against
+    /// it, so the borrow is recorded rather than enforced.
     source: []const u8,
+    /// Node table; index `n` holds the `NodeId` value `n`.
     nodes: []Node,
+    /// Text table; index `n` holds the `TextId` value `n`.
     texts: []TextRecord,
+    /// The bytes every `TextRecord` range indexes into.
     text_bytes: []u8,
+    /// Link reference definitions in definition order. The `.reference_definition`
+    /// nodes that carried them hold no payload; the definitions live here.
     references: []Reference,
 
+    /// Releases `references`, `text_bytes`, `texts` and `nodes` into `allocator`.
+    /// `source` is borrowed and is not freed, and the allocator is not released.
+    ///
+    /// The document, and every pointer or slice taken from it, are invalid
+    /// afterward, and the struct is overwritten with `undefined`. Exactly one
+    /// `deinit` releases that storage; a second one, on this value or through a
+    /// copy of it, frees the same bytes again.
     pub fn deinit(self: *CommonMarkDocument) void {
         self.allocator.free(self.references);
         self.allocator.free(self.text_bytes);
@@ -168,17 +444,30 @@ pub const CommonMarkDocument = struct {
         self.* = undefined;
     }
 
+    /// Returns `NodeId.root`, the document node's fixed identifier.
     pub fn root(self: *const CommonMarkDocument) NodeId {
         _ = self;
         return .root;
     }
 
+    /// The node `id` names, or `null` when `id` is out of range for `nodes`.
+    ///
+    /// The pointer aliases `nodes` and keeps a fixed address until `deinit`. A
+    /// `null` result says only that the id is out of range: an id inside the
+    /// table names a node even when the child links no longer reach it.
     pub fn node(self: *const CommonMarkDocument, id: NodeId) ?*const Node {
         const index = @intFromEnum(id);
         if (index >= self.nodes.len) return null;
         return &self.nodes[index];
     }
 
+    /// A `ChildIterator` over the children of `id`, in document order.
+    ///
+    /// The iterator borrows the document at the address `self` holds, so that
+    /// address must stay live and unmodified while the iterator is used: moving
+    /// the document value afterwards leaves the iterator on the original
+    /// storage. An `id` naming no node, and a node with no children, both yield
+    /// an iterator whose first `nextChild` returns `null`.
     pub fn nodeChildren(self: *const CommonMarkDocument, id: NodeId) ChildIterator {
         const first = if (self.node(id)) |value| value.first_child else .none;
         return .{
@@ -188,6 +477,12 @@ pub const CommonMarkDocument = struct {
         };
     }
 
+    /// The bytes of the text `id` names, or `null` when `id` is out of range for
+    /// `texts` or its record does not fit in `text_bytes`.
+    ///
+    /// The slice aliases `text_bytes` and stays valid until `deinit`; parsing has
+    /// finished, so no later call resizes the arena. These are the cooked bytes
+    /// recorded for a node, not a byte range of `source`.
     pub fn text(self: *const CommonMarkDocument, id: TextId) ?[]const u8 {
         const index = @intFromEnum(id);
         if (index >= self.texts.len) return null;
@@ -198,12 +493,31 @@ pub const CommonMarkDocument = struct {
         return self.text_bytes[start .. start + len];
     }
 
+    /// Forward walk over one node's children, driven by `nextChild`.
+    ///
+    /// The iterator borrows the document, so the address obligation on
+    /// `nodeChildren` applies to it. It is a value, so a copy is a second walk
+    /// over the same children rather than a second owner, and it is not
+    /// reentrant: the calls share one position.
     pub const ChildIterator = struct {
+        /// The document being walked, at the address held when `nodeChildren`
+        /// ran.
         document: *const CommonMarkDocument,
+        /// The node `nextChild` will yield next, or `.none` once the chain ends.
         next: NodeId,
+        /// Steps left before the walk is declared invalid. It starts at the node
+        /// count, so a chain that cannot terminate trips `isInvalid` instead of
+        /// looping.
         remaining: usize,
+        /// Set once the walk hit a dangling link or ran past the node count, and
+        /// cleared only by a fresh `nodeChildren`.
         invalid: bool = false,
 
+        /// The next child, advancing the walk, or `null` at the end of the chain.
+        ///
+        /// `null` covers both the ordinary end of the chain and a chain that hit
+        /// a dangling link or ran past the node count; `isInvalid` tells the two
+        /// apart. The iterator stays exhausted once this has returned `null`.
         pub fn nextChild(self: *ChildIterator) ?NodeId {
             if (self.next == .none) return null;
             if (self.remaining == 0) {
@@ -222,6 +536,8 @@ pub const CommonMarkDocument = struct {
             return current;
         }
 
+        /// Whether the walk hit a dangling link or ran past the node count, which
+        /// means the document's child links are malformed.
         pub fn isInvalid(self: *const ChildIterator) bool {
             return self.invalid;
         }
@@ -464,6 +780,20 @@ fn validateTreeDepth(builder: *const Builder) ParseError!void {
     }
 }
 
+/// Parses `source` as CommonMark 0.31.2 into a document that owns `nodes`,
+/// `texts`, `text_bytes` and `references` and borrows `source`.
+///
+/// `gpa` receives every owned allocation; its backing state must remain alive
+/// through `CommonMarkDocument.deinit`. Keep `source` alive and unchanged through
+/// that release as the document's recorded borrow requires. Semantic text is
+/// copied or cooked into owned storage; accessors and rendering do not read the
+/// original source. The source field supports caller-directed span lookup.
+///
+/// On any `ParseError` the parser releases what it had built and returns no
+/// document, so the caller owns nothing after a failure and the call is
+/// retryable with other options. `error.InputTooLarge`, and with `invalid_utf8`
+/// set to `.reject` also `error.InvalidUtf8`, are decided before parsing starts;
+/// the limit tags are decided partway through and leave the same residue, none.
 pub fn parseCommonMark(
     gpa: std.mem.Allocator,
     source: []const u8,
@@ -1121,7 +1451,7 @@ fn processBlockLine(
                             block.code_indent,
                         )..line.end]
                     else
-                        content;
+                        builder.source[skipIndentColumns(builder.source, start, end, block.code_indent)..end];
                     try appendBlockLine(builder, block.node, code_content, true);
                     builder.updateSpan(block.node, @intCast(line.end));
                     return;
@@ -1132,8 +1462,18 @@ fn processBlockLine(
                     builder.source[line.start..line.end]
                 else
                     content;
-                if (htmlBlockCloses(block.html_tag, html_content)) {
-                    if (html_content.len > 0) try appendBlockLine(builder, block.node, html_content, false);
+                // Types 6 and 7 end at a blank line of the CONTAINING content,
+                // so a line holding nothing but a container marker closes them
+                // as well. This is the container-relative blank the paragraph
+                // branch below already computes, not the physical blankness.
+                var is_blank_content = line.blank;
+                if (!is_blank_content) {
+                    var i: usize = 0;
+                    while (i < content.len and (content[i] == ' ' or content[i] == '\t')) : (i += 1) {}
+                    if (i == content.len) is_blank_content = true;
+                }
+                if (htmlBlockCloses(block.html_tag, html_content, is_blank_content)) {
+                    if (!is_blank_content) try appendBlockLine(builder, block.node, html_content, false);
                     builder.updateSpan(block.node, @intCast(line.end));
                     active.* = null;
                 } else {
@@ -1151,7 +1491,7 @@ fn processBlockLine(
                 const setext_start = if (container == NodeId.root)
                     skipIndentColumns(builder.source, line.start, line.end, @min(line.indent, @as(usize, 3)))
                 else
-                    content_start;
+                    skipIndentColumns(builder.source, content_start, line.end, 3);
                 const setext_content = if (setext_start <= line.end) builder.source[setext_start..line.end] else "";
                 if (!starts_reference and !is_lazy) {
                     if (isSetextUnderline(setext_content)) |level| {
@@ -1280,7 +1620,7 @@ fn processBlockLine(
             .container = container,
             .code_fence = fence.character,
             .code_fence_length = fence.length,
-            .code_indent = @intCast(@min(line.indent, @as(usize, 3))),
+            .code_indent = @intCast(if (container == NodeId.root) @min(line.indent, @as(usize, 3)) else indent_cols),
         };
         return;
     }
@@ -1295,7 +1635,9 @@ fn processBlockLine(
             trimmed_content;
         const raw = try builder.appendTextNormalized(html_content);
         const node = try builder.appendNode(.html_block, container, lineSpan(line), .{ .raw = raw });
-        if (!htmlBlockCloses(tag, html_content)) active.* = .{ .node = node, .container = container, .html_tag = tag };
+        if (!htmlBlockCloses(tag, html_content, false)) {
+            active.* = .{ .node = node, .container = container, .html_tag = tag };
+        }
         return;
     }
     const raw = try builder.appendTextNormalized(trimmed_content);
@@ -1537,16 +1879,63 @@ fn tagNameEquals(name: []const u8, expected: []const u8) bool {
 
 fn isBlockHtmlTag(name: []const u8) bool {
     const names = [_][]const u8{
-        "address",  "article", "aside",  "base",     "basefont",   "bgsound", "blockquote", "body",
-        "caption",  "center",  "col",    "colgroup", "dd",         "details", "dialog",     "dir",
-        "div",      "dl",      "dt",     "fieldset", "figcaption", "figure",  "footer",     "form",
-        "h1",       "h2",      "h3",     "h4",       "h5",         "h6",      "head",       "header",
-        "hr",       "html",    "iframe", "legend",   "li",         "link",    "main",       "menu",
-        "menuitem", "nav",     "ol",     "p",        "section",    "summary", "table",      "tbody",
-        "td",       "tfoot",   "th",     "thead",    "title",      "tr",      "track",      "ul",
+        "address",  "article",  "aside",    "base",       "basefont", "blockquote", "body",   "caption",
+        "center",   "col",      "colgroup", "dd",         "details",  "dialog",     "dir",    "div",
+        "dl",       "dt",       "fieldset", "figcaption", "figure",   "footer",     "form",   "frame",
+        "frameset", "h1",       "h2",       "h3",         "h4",       "h5",         "h6",     "head",
+        "header",   "hr",       "html",     "iframe",     "legend",   "li",         "link",   "main",
+        "menu",     "menuitem", "nav",      "noframes",   "ol",       "optgroup",   "option", "p",
+        "param",    "search",   "section",  "summary",    "table",    "tbody",      "td",     "tfoot",
+        "th",       "thead",    "title",    "tr",         "track",    "ul",
     };
     for (names) |expected| if (tagNameEquals(name, expected)) return true;
     return false;
+}
+
+/// A tag name is an ASCII letter followed by ASCII letters, digits, or
+/// hyphens. The scan also reports whether the name belongs to a closing tag and
+/// which byte follows it, because the start conditions of the type 1 and
+/// type 6 blocks depend on that delimiter.
+const TagName = struct { name: []const u8, closing: bool, delimiter: ?u8 };
+
+fn scanTagName(tag: []const u8) ?TagName {
+    var index: usize = 1;
+    var closing = false;
+    if (index < tag.len and tag[index] == '/') {
+        closing = true;
+        index += 1;
+    }
+    if (index >= tag.len or !std.ascii.isAlphabetic(tag[index])) return null;
+    const start = index;
+    while (index < tag.len and (std.ascii.isAlphanumeric(tag[index]) or tag[index] == '-')) : (index += 1) {}
+    return .{
+        .name = tag[start..index],
+        .closing = closing,
+        .delimiter = if (index < tag.len) tag[index] else null,
+    };
+}
+
+/// The delimiter the type 1 start condition accepts after the tag name: a
+/// space, a tab, `>`, or the end of the line. The type 6 condition is wider and
+/// is handled by `isBlockTagNameDelimiter`.
+fn isTagNameDelimiter(delimiter: ?u8) bool {
+    return delimiter == null or delimiter == ' ' or delimiter == '\t' or delimiter == '>';
+}
+
+/// The type 6 start condition adds the string `/>` to the type 1 delimiter set,
+/// so `<div/>` opens a type-6 block. `TagName.delimiter` holds only the single
+/// byte after the name, so the byte behind it is inspected here; both call
+/// sites hold the whole line.
+fn isBlockTagNameDelimiter(line: []const u8, scanned: TagName) bool {
+    if (isTagNameDelimiter(scanned.delimiter)) return true;
+    if (scanned.delimiter != '/') return false;
+    const name_end = 1 + @as(usize, if (scanned.closing) 1 else 0) + scanned.name.len;
+    return name_end + 1 < line.len and line[name_end + 1] == '>';
+}
+
+fn isTypeOneTagName(name: []const u8) bool {
+    return tagNameEquals(name, "pre") or tagNameEquals(name, "script") or
+        tagNameEquals(name, "style") or tagNameEquals(name, "textarea");
 }
 
 fn isHtmlBlockStart(content: []const u8) ?u8 {
@@ -1556,45 +1945,57 @@ fn isHtmlBlockStart(content: []const u8) ?u8 {
     if (std.mem.startsWith(u8, trimmed, "<!--")) return 1;
     if (std.mem.startsWith(u8, trimmed, "<?")) return 2;
     if (std.mem.startsWith(u8, trimmed, "<![CDATA[")) return 3;
-    if (std.mem.startsWith(u8, trimmed, "<!") or std.mem.startsWith(u8, trimmed, "<!doctype")) return 4;
-    var index: usize = 1;
-    const is_closing = index < trimmed.len and trimmed[index] == '/';
-    if (is_closing) index += 1;
-    const name_start = index;
-    while (index < trimmed.len and ((trimmed[index] >= 'a' and trimmed[index] <= 'z') or
-        (trimmed[index] >= 'A' and trimmed[index] <= 'Z') or
-        (trimmed[index] >= '0' and trimmed[index] <= '9'))) : (index += 1)
-    {}
-    if (index == name_start) return null;
-    const name = trimmed[name_start..index];
-    if (!is_closing) {
-        if (tagNameEquals(name, "script")) return 5;
-        if (tagNameEquals(name, "pre")) return 6;
-        if (tagNameEquals(name, "style")) return 7;
-        if (tagNameEquals(name, "textarea")) return 10;
+    if (trimmed.len > 2 and std.mem.startsWith(u8, trimmed, "<!") and
+        std.ascii.isAlphabetic(trimmed[2])) return 4;
+    const scanned = scanTagName(trimmed) orelse return null;
+    if (isBlockTagNameDelimiter(trimmed, scanned) and isBlockHtmlTag(scanned.name)) return 8;
+    if (isTagNameDelimiter(scanned.delimiter) and !scanned.closing) {
+        if (tagNameEquals(scanned.name, "script")) return 5;
+        if (tagNameEquals(scanned.name, "pre")) return 6;
+        if (tagNameEquals(scanned.name, "style")) return 7;
+        if (tagNameEquals(scanned.name, "textarea")) return 10;
     }
-    if (isBlockHtmlTag(name)) return 8;
-    if (std.mem.indexOfScalar(u8, trimmed, '\n') == null) {
-        if (findTagEnd(trimmed, 0)) |close| {
-            if (close + 1 == trimmed.len and isHtmlInlineTag(trimmed)) return 9;
-        }
-    }
-    return null;
+    return if (isHtmlBlockType7Start(trimmed)) 9 else null;
 }
 
-fn htmlBlockCloses(tag: u8, content: []const u8) bool {
+/// A type 7 block starts at a complete open tag whose name is not one of the
+/// type 1 names, or at a complete closing tag, followed by only spaces and tabs
+/// up to the end of the line.
+fn isHtmlBlockType7Start(line: []const u8) bool {
+    var tail = line;
+    while (tail.len > 0 and (tail[tail.len - 1] == ' ' or tail[tail.len - 1] == '\t')) {
+        tail = tail[0 .. tail.len - 1];
+    }
+    const close = findTagEnd(tail, 0) orelse return false;
+    if (close + 1 != tail.len or !isHtmlInlineTag(tail)) return false;
+    const scanned = scanTagName(tail) orelse return false;
+    return scanned.closing or !isTypeOneTagName(scanned.name);
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (haystack.len < needle.len) return false;
+    const last = haystack.len - needle.len;
+    var index: usize = 0;
+    while (index <= last) : (index += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[index..][0..needle.len], needle)) return true;
+    }
+    return false;
+}
+
+/// A type 1 block ends at a line holding any of the four end tags, in any case.
+/// Types 6 and 7 end at the blank line that follows the block; that line is not
+/// part of the block and the caller must not append it.
+fn htmlBlockCloses(tag: u8, content: []const u8, is_blank: bool) bool {
     return switch (tag) {
         1 => std.mem.indexOf(u8, content, "-->") != null,
         2 => std.mem.indexOf(u8, content, "?>") != null,
         3 => std.mem.indexOf(u8, content, "]]>") != null,
         4 => std.mem.indexOfScalar(u8, content, '>') != null,
-        5 => std.mem.indexOf(u8, content, "</script>") != null or std.mem.indexOf(u8, content, "</SCRIPT>") != null,
-        6 => std.mem.indexOf(u8, content, "</pre>") != null or std.mem.indexOf(u8, content, "</PRE>") != null,
-        7 => std.mem.indexOf(u8, content, "</style>") != null or std.mem.indexOf(u8, content, "</STYLE>") != null,
-        10 => std.mem.indexOf(u8, content, "</textarea>") != null or
-            std.mem.indexOf(u8, content, "</TEXTAREA>") != null,
-        8 => content.len == 0,
-        9 => content.len == 0,
+        5, 6, 7, 10 => containsIgnoreCase(content, "</script>") or
+            containsIgnoreCase(content, "</pre>") or
+            containsIgnoreCase(content, "</style>") or
+            containsIgnoreCase(content, "</textarea>"),
+        8, 9 => is_blank,
         else => true,
     };
 }
@@ -2428,6 +2829,11 @@ fn findTagEnd(raw: []const u8, start: usize) ?usize {
         if (std.mem.find(u8, rest, "?>")) |offset| return start + offset + 1;
         return null;
     }
+    // A declaration carries no quote rules and ends at the first `>`.
+    if (std.mem.startsWith(u8, rest, "<!")) {
+        if (std.mem.findScalar(u8, rest, '>')) |offset| return start + offset;
+        return null;
+    }
     var index = start + 1;
     var quote: u8 = 0;
     while (index < raw.len) : (index += 1) {
@@ -2447,12 +2853,33 @@ fn isHtmlWhitespace(byte: u8) bool {
     return byte == ' ' or byte == '\t' or byte == '\n' or byte == '\r';
 }
 
+/// Bytes permitted in an unquoted attribute value: anything but whitespace,
+/// a quote, `=`, an angle bracket, or a backtick.
+fn isHtmlAttributeValueChar(byte: u8) bool {
+    return !isHtmlWhitespace(byte) and byte != '"' and byte != '\'' and byte != '=' and
+        byte != '<' and byte != '>' and byte != '`';
+}
+
+fn isHtmlAttributeNameStart(byte: u8) bool {
+    return std.ascii.isAlphabetic(byte) or byte == '_' or byte == ':';
+}
+
+fn isHtmlAttributeNameChar(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '_' or byte == ':' or
+        byte == '.' or byte == '-';
+}
+
 fn isHtmlInlineTag(tag: []const u8) bool {
     if (tag.len < 3 or tag[0] != '<' or tag[tag.len - 1] != '>') return false;
     if (std.mem.startsWith(u8, tag, "<!--")) return std.mem.endsWith(u8, tag, "-->");
     if (std.mem.startsWith(u8, tag, "<?")) return std.mem.endsWith(u8, tag, "?>");
     if (std.mem.startsWith(u8, tag, "<![CDATA[")) return std.mem.endsWith(u8, tag, "]]>");
-    if (std.mem.startsWith(u8, tag, "<!")) return tag.len > 3;
+    // A declaration is `<!`, an ASCII letter, any characters other than `>`,
+    // and the closing `>`.
+    if (std.mem.startsWith(u8, tag, "<!")) {
+        if (tag.len < 4 or !std.ascii.isAlphabetic(tag[2])) return false;
+        return std.mem.indexOfScalar(u8, tag[3 .. tag.len - 1], '>') == null;
+    }
 
     var index: usize = 1;
     var closing = false;
@@ -2474,12 +2901,8 @@ fn isHtmlInlineTag(tag: []const u8) bool {
     while (index < tag.len - 1 and isHtmlWhitespace(tag[index])) : (index += 1) {}
     while (index < tag.len - 1) {
         if (tag[index] == '/') return index + 1 == tag.len - 1;
-        const attr_start = index;
-        while (index < tag.len - 1 and ((tag[index] >= 'A' and tag[index] <= 'Z') or
-            (tag[index] >= 'a' and tag[index] <= 'z') or (tag[index] >= '0' and tag[index] <= '9') or
-            tag[index] == '_' or tag[index] == ':' or tag[index] == '-')) : (index += 1)
-        {}
-        if (index == attr_start) return false;
+        if (index >= tag.len - 1 or !isHtmlAttributeNameStart(tag[index])) return false;
+        while (index < tag.len - 1 and isHtmlAttributeNameChar(tag[index])) : (index += 1) {}
         const after_name = index;
         while (index < tag.len - 1 and isHtmlWhitespace(tag[index])) : (index += 1) {}
         if (index < tag.len - 1 and tag[index] == '=') {
@@ -2494,7 +2917,7 @@ fn isHtmlInlineTag(tag: []const u8) bool {
                 index += 1;
             } else {
                 const value_start = index;
-                while (index < tag.len - 1 and !isHtmlWhitespace(tag[index]) and tag[index] != '>') : (index += 1) {}
+                while (index < tag.len - 1 and isHtmlAttributeValueChar(tag[index])) : (index += 1) {}
                 if (index == value_start) return false;
             }
         } else {
@@ -2519,7 +2942,9 @@ fn parseLinkAfterClose(raw: []const u8, start: usize, builder: *Builder, frame: 
         index += 1;
         while (index < raw.len and (raw[index] == ' ' or raw[index] == '\t' or raw[index] == '\n')) index += 1;
         var destination: TextId = .none;
+        var angle_destination = false;
         if (index < raw.len and raw[index] == '<') {
+            angle_destination = true;
             index += 1;
             const destination_start = index;
             while (index < raw.len) {
@@ -2552,9 +2977,14 @@ fn parseLinkAfterClose(raw: []const u8, start: usize, builder: *Builder, frame: 
             if (index >= raw.len or depth != 0) break :inline_check;
             destination = try cleanDestination(.link, builder, raw[destination_start..index]);
         }
-        while (index < raw.len and (raw[index] == ' ' or raw[index] == '\t' or raw[index] == '\n')) index += 1;
+        // A title after an angle destination needs whitespace to separate them.
+        var separator_seen = !angle_destination;
+        while (index < raw.len and (raw[index] == ' ' or raw[index] == '\t' or raw[index] == '\n')) {
+            separator_seen = true;
+            index += 1;
+        }
         var title: TextId = .none;
-        if (index < raw.len and (raw[index] == '"' or raw[index] == '\'' or raw[index] == '(')) {
+        if (separator_seen and index < raw.len and (raw[index] == '"' or raw[index] == '\'' or raw[index] == '(')) {
             const opener = raw[index];
             const closer = if (opener == '(') ')' else opener;
             index += 1;
@@ -2576,11 +3006,29 @@ fn parseLinkAfterClose(raw: []const u8, start: usize, builder: *Builder, frame: 
         return .{ .destination = destination, .title = title, .end = index + 1 };
     }
     index = start;
-    if (index < raw.len and raw[index] == '[') {
+    full_reference: {
+        if (index >= raw.len or raw[index] != '[') break :full_reference;
         index += 1;
         const label_start = index;
-        while (index < raw.len and raw[index] != ']') : (index += 1) {}
-        if (index >= raw.len) return null;
+        var is_label = true;
+        while (index < raw.len) {
+            if (raw[index] == '\\' and index + 1 < raw.len) {
+                index += 2;
+                continue;
+            }
+            if (raw[index] == '[') {
+                is_label = false;
+                break;
+            }
+            if (raw[index] == ']') break;
+            index += 1;
+        }
+        // An unescaped `[` means the bracketed text is not a label, so the
+        // shortcut reference is tried instead.
+        if (!is_label) break :full_reference;
+        // The scan reached the end of the text without a `]`, so the bracketed
+        // text is no label and the shortcut reference is tried instead.
+        if (index >= raw.len) break :full_reference;
         const label = try normalizeLabel(builder, raw[label_start..index]) orelse return null;
         if (builder.rawText(label).len != 0) {
             if (lookupReference(builder, label)) |reference| {
@@ -2746,6 +3194,20 @@ fn blocksHaveBlankBetween(builder: *Builder, previous: NodeId, next: NodeId) Par
     return false;
 }
 
+/// Renders `document` as HTML into bytes the caller owns.
+///
+/// `gpa` receives the result and every temporary, and the caller frees the
+/// result with that same allocator. The document is borrowed for the call only
+/// and must not be `deinit`'d, mutated or otherwise disposed of while it runs.
+/// The call reads the document and mutates nothing, so several calls may run
+/// against one live document, including from more than one thread; `gpa` must
+/// be an allocator the caller is using that way.
+///
+/// A missing root, a root that is not a detached `.document` node, a dangling or
+/// cross-parented child or parent link, and a walk that does not finish within
+/// twice the node count in steps all fail with `error.InvalidDocument`. On any
+/// error the partial output is released and no bytes are returned. On success
+/// the result is a fresh buffer of exactly the produced length.
 pub fn renderCommonMarkHtml(
     gpa: std.mem.Allocator,
     document: *const CommonMarkDocument,
@@ -2837,6 +3299,10 @@ fn listItemNeedsLeadingNewline(document: *const CommonMarkDocument, id: NodeId) 
     if (node.parent == .none) return false;
     const parent = document.node(node.parent) orelse return error.InvalidDocument;
     if (parent.kind != .list_item) return false;
+    // A link reference definition contributes no bytes, so it neither needs a
+    // line of its own nor hides the line the block after it opens on. An item
+    // whose only child was consumed as a definition renders `<li></li>`.
+    if (node.kind == .reference_definition) return false;
     var iterator = document.nodeChildren(node.parent);
     var previous: NodeId = .none;
     while (iterator.nextChild()) |child| {
@@ -2850,7 +3316,8 @@ fn listItemNeedsLeadingNewline(document: *const CommonMarkDocument, id: NodeId) 
             const previous_node = document.node(previous) orelse return error.InvalidDocument;
             return previous_node.kind == .paragraph and isTightParagraph(document, previous_node);
         }
-        previous = child;
+        const child_node = document.node(child) orelse return error.InvalidDocument;
+        if (child_node.kind != .reference_definition) previous = child;
     }
     return error.InvalidDocument;
 }
@@ -2903,15 +3370,21 @@ fn renderEnter(
             if (document.text(data.info)) |info| {
                 if (info.len > 0) {
                     const first = std.mem.indexOfAny(u8, info, " \t\n") orelse info.len;
-                    try appendLiteral(output, gpa, " class=\"language-");
-                    try appendEscaped(output, gpa, info[0..first], .attribute);
+                    const word = info[0..first];
+                    // The prefix names a bare language word, so an info word
+                    // that already starts with it keeps exactly one copy.
+                    try appendLiteral(output, gpa, " class=\"");
+                    if (!std.mem.startsWith(u8, word, "language-")) {
+                        try appendLiteral(output, gpa, "language-");
+                    }
+                    try appendEscaped(output, gpa, word);
                     try appendLiteral(output, gpa, "\"");
                 }
             }
             try appendLiteral(output, gpa, ">");
             if (document.text(data.raw)) |raw| {
                 if (raw.len > 0) {
-                    try appendEscaped(output, gpa, raw, .text);
+                    try appendEscaped(output, gpa, raw);
                     if (!std.mem.endsWith(u8, raw, "\n")) try appendLiteral(output, gpa, "\n");
                 }
             }
@@ -2923,12 +3396,12 @@ fn renderEnter(
             try appendLiteral(output, gpa, "\n");
         },
         .text => if (node.data == .raw) if (document.text(node.data.raw)) |text|
-            try appendEscaped(output, gpa, text, .text),
+            try appendEscaped(output, gpa, text),
         .softbreak => try appendLiteral(output, gpa, "\n"),
         .linebreak => try appendLiteral(output, gpa, "<br />\n"),
         .code_span => {
             try appendLiteral(output, gpa, "<code>");
-            if (node.data == .raw) if (document.text(node.data.raw)) |text| try appendEscaped(output, gpa, text, .text);
+            if (node.data == .raw) if (document.text(node.data.raw)) |text| try appendEscaped(output, gpa, text);
         },
         .emph => try appendLiteral(output, gpa, "<em>"),
         .strong => try appendLiteral(output, gpa, "<strong>"),
@@ -2944,7 +3417,7 @@ fn renderEnter(
             }
             if (data.title != .none) {
                 try appendLiteral(output, gpa, "\" title=\"");
-                if (document.text(data.title)) |title| try appendEscaped(output, gpa, title, .attribute);
+                if (document.text(data.title)) |title| try appendEscaped(output, gpa, title);
             }
             try appendLiteral(output, gpa, "\">");
         },
@@ -2962,7 +3435,7 @@ fn renderEnter(
             try renderPlainChildren(gpa, document, output, options, id);
             if (data.title != .none) {
                 try appendLiteral(output, gpa, "\" title=\"");
-                if (document.text(data.title)) |title| try appendEscaped(output, gpa, title, .attribute);
+                if (document.text(data.title)) |title| try appendEscaped(output, gpa, title);
             }
             try appendLiteral(output, gpa, "\" />");
         },
@@ -2980,7 +3453,7 @@ fn renderEnter(
                 try appendHref(output, gpa, text);
             }
             try appendLiteral(output, gpa, "\">");
-            try appendEscaped(output, gpa, text, .text);
+            try appendEscaped(output, gpa, text);
         },
         .html_inline => {
             if (options.mode == .conformance) {
@@ -3064,7 +3537,11 @@ fn renderPlainChildren(
         const node = document.node(current) orelse return error.InvalidDocument;
         switch (node.kind) {
             .text, .code_span => if (node.data == .raw) if (document.text(node.data.raw)) |text|
-                try appendEscaped(output, gpa, text, .attribute),
+                try appendEscaped(output, gpa, text),
+            // Raw HTML inside an image contributes its literal bytes to the
+            // alt text, escaped the way an attribute value is.
+            .html_inline, .html_block => if (node.data == .raw) if (document.text(node.data.raw)) |raw|
+                try appendEscaped(output, gpa, raw),
             .softbreak, .linebreak => try appendLiteral(output, gpa, " "),
             else => {
                 try collectRenderChildren(gpa, document, current, &children);
@@ -3077,8 +3554,6 @@ fn renderPlainChildren(
         }
     }
 }
-
-const EscapeContext = enum { text, attribute };
 
 fn appendLiteral(output: *RenderOutput, gpa: std.mem.Allocator, bytes: []const u8) RenderError!void {
     try output.appendSlice(gpa, bytes);
@@ -3097,22 +3572,17 @@ fn appendFmt(
     try output.print(format, gpa, args);
 }
 
-fn appendEscaped(
-    output: *RenderOutput,
-    gpa: std.mem.Allocator,
-    bytes: []const u8,
-    context: EscapeContext,
-) RenderError!void {
+/// Escapes the bytes an HTML text node or attribute value cannot carry. One
+/// table serves both contexts: `cmark` runs `houdini_escape_html` with
+/// `secure = 0` from every call site and `commonmark.js` `escapeXml` handles
+/// only `&`, `<`, `>` and `"`, so an apostrophe is written through as itself.
+fn appendEscaped(output: *RenderOutput, gpa: std.mem.Allocator, bytes: []const u8) RenderError!void {
     for (bytes) |byte| {
         switch (byte) {
             '&' => try appendLiteral(output, gpa, "&amp;"),
             '<' => try appendLiteral(output, gpa, "&lt;"),
             '>' => try appendLiteral(output, gpa, "&gt;"),
             '"' => try appendLiteral(output, gpa, "&quot;"),
-            '\'' => if (context == .attribute)
-                try appendLiteral(output, gpa, "&#39;")
-            else
-                try appendLiteral(output, gpa, "'"),
             else => try output.append(gpa, byte),
         }
     }
@@ -3121,8 +3591,11 @@ fn appendEscaped(
 fn appendHref(output: *RenderOutput, gpa: std.mem.Allocator, bytes: []const u8) RenderError!void {
     const hex = "0123456789ABCDEF";
     for (bytes) |byte| {
-        if (byte >= 0x80 or byte == '"' or byte == '<' or byte == '>' or
-            byte == '\\' or byte == ' ' or byte == '`' or byte == '[' or byte == ']')
+        // The set mirrors cmark's HREF_SAFE: every byte outside printable ASCII
+        // that a URL cannot carry literally, and `%` stays as written.
+        if (byte <= 0x20 or byte >= 0x80 or byte == 0x7F or byte == '"' or byte == '<' or
+            byte == '>' or byte == '\\' or byte == '`' or byte == '[' or byte == ']' or
+            byte == '^' or byte == '{' or byte == '|' or byte == '}')
         {
             try output.appendSlice(gpa, &.{ '%', hex[byte >> 4], hex[byte & 0x0F] });
         } else if (byte == '&') {

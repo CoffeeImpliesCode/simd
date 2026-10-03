@@ -1,3 +1,30 @@
+//! Opt-in `yaml-extended-e2b-1.2.2` YAML parsing: literal and folded block
+//! scalars, multiline quoted scalars, and compact sequence mappings, over the
+//! `yaml-basic-1.2.2` grammar in `yaml.zig`. `formats.yaml` stays on the basic
+//! profile; a caller selects this one by importing `formats.yaml_extended`,
+//! which publishes `buildYamlTape`, `validateYaml`, `Document`, `Value`,
+//! `ScalarInfo`, `Limits`, `default_limits`, `Error`, `Diagnostic`,
+//! `DiagnosticKind` and the four scalar enums. The parser's own helpers stay
+//! private.
+//!
+//! What stays outside the profile stays outside the parse: a directive, an
+//! anchor, an alias, a tag, a complex key, a second document, and content after
+//! `...` are `error.Unsupported` rather than a document with parts missing.
+//! There is no schema here, so `Document.value` hands back cooked or borrowed
+//! bytes and leaves the reading of them to the caller.
+//!
+//! The module does no I/O and exposes no streaming or indexer entry point:
+//! `buildYamlTape` parses one complete buffer. It returns a `Document` the
+//! caller releases exactly once through the allocator it passed in, while the
+//! buffer itself stays the caller's; `validateYaml` parses into a temporary
+//! document it releases before returning, and answers with `null` or a
+//! `Diagnostic` whose `snippet` borrows that same buffer.
+//!
+//! ```
+//! var document = try yaml_extended.buildYamlTape(gpa, input, .{});
+//! defer document.deinit(gpa);
+//! const value = try document.value(input, event_index);
+//! ```
 const std = @import("std");
 const source = @import("yaml_source.zig");
 const basic = @import("yaml.zig");
@@ -5,9 +32,14 @@ const basic = @import("yaml.zig");
 const max_u24: usize = std.math.maxInt(u24);
 const max_u32: usize = std.math.maxInt(u32);
 
+/// The profile this module implements; `formats.yaml` keeps `.basic`.
 pub const profile: basic.Profile = .extended;
+/// The label a caller or report compares, `"yaml-extended-e2b-1.2.2"`.
 pub const profile_label = basic.profileLabel(.extended);
 
+/// Source spelling of one scalar, recorded per word and returned by
+/// `Document.scalarInfo`. `plain` is unquoted source text, `literal` is a `|`
+/// block scalar and `folded` a `>` one.
 pub const ScalarStyle = enum(u8) {
     plain,
     single_quoted,
@@ -16,35 +48,91 @@ pub const ScalarStyle = enum(u8) {
     folded,
 };
 
+/// How trailing line breaks of a block scalar are treated. For a scalar with no
+/// block header this is `.clip`, the profile's default, and nothing is applied.
 pub const Chomping = enum(u8) {
+    /// Trailing breaks collapse to a single one, and to none when the block
+    /// cooked to nothing.
     clip,
+    /// Trailing breaks are removed.
     strip,
+    /// Trailing breaks are kept as written.
     keep,
 };
 
+/// Where a block scalar's content indent came from. A scalar with no block
+/// header reports `.automatic`, and neither mode is applied to it.
 pub const ScalarIndentation = enum(u8) {
+    /// Taken from the first body line that is not blank; a body of blank lines
+    /// only takes the deepest indent among them.
     automatic,
+    /// A `1` to `9` digit in the header, so `ScalarInfo.indentation_width` is
+    /// the parent indent plus that digit.
     explicit,
 };
 
+/// Which storage a `Value` reads from, and therefore how long its bytes stay
+/// valid. `Document.value` reports it and `Document.scalarInfo` repeats it for
+/// the same word.
 pub const ValueOwnership = enum(u8) {
+    /// The bytes are a span of the source buffer the caller passed to
+    /// `buildYamlTape`; they die with that buffer, and a caller that rewrites
+    /// the buffer sees the rewrite through this value.
     source_borrowed,
+    /// The bytes borrow `Document.cooked`, produced while building. The parser
+    /// does not modify them afterward; the view ends at `Document.deinit`.
     document_owned,
 };
 
+/// Resource bounds one parse respects, validated on entry to `buildYamlTape`
+/// and `validateYaml` before any input is read. A bound outside the ranges
+/// below is `error.InvalidLimits` on either entry point, before anything is
+/// allocated. Lower a bound to cap accepted work or memory; raise it within its
+/// checked range when an intended input exceeds the default. `validateYaml`
+/// reports a crossed resource bound in a `DiagnosticKind.resource` diagnostic.
 pub const Limits = struct {
+    /// Longest accepted input buffer. A longer one is `error.SourceBytesExceeded`
+    /// before parsing; the ceiling is 4294967295, the largest length a tape
+    /// offset can name.
     source_bytes_max: usize = max_u32,
+    /// Total cooked bytes one document may hold, summed over every cooked
+    /// scalar. A byte past it is `error.CookedBytesExceeded`. Ceiling
+    /// 4294967295.
     cooked_bytes_max: usize = 16 * 1024 * 1024,
+    /// Longest raw source span of one key or scalar, a block header and its body
+    /// included. A longer span is `error.ScalarSourceExceeded`. Ceiling 16777215,
+    /// the largest span a tape word can name.
     scalar_source_bytes_max: usize = max_u24,
+    /// Physical lines in the input, counting the empty line after a trailing
+    /// newline as one more. A longer input is `error.LineLimitExceeded`. Must
+    /// not be zero.
     line_count_max: usize = 1 * 1024 * 1024,
+    /// Lines one scalar may span. A quoted scalar counts its opening line, so a
+    /// value on two lines needs at least 2; a block scalar counts body lines
+    /// only, and neither its header line nor the terminal line after the input
+    /// counts. Crossing it is `error.ScalarLineLimitExceeded`. Must not be zero.
     scalar_line_count_max: usize = 1 * 1024 * 1024,
+    /// Leading spaces one line may carry, body lines of a block scalar included.
+    /// A deeper line is `error.IndentationExceeded`. Ceiling 4294967295.
     indentation_max: usize = 1024,
+    /// Nested mapping and sequence levels allowed in one document; a container
+    /// past it is `error.DepthExceeded`. A caller may lower this, but 0 and
+    /// anything above `yaml.yaml_max_depth` (1024) is `error.InvalidLimits`.
     depth_max: usize = basic.yaml_max_depth,
+    /// Tape words one document may hold. A further word is
+    /// `error.TapeWordsExceeded`. Must not be zero.
     tape_words_max: usize = 1 * 1024 * 1024,
 };
 
+/// The `Limits` a caller gets from `.{}`; each field comment states its default
+/// and the bound a caller lowers it to cross.
 pub const default_limits: Limits = .{};
 
+/// Every failure `buildYamlTape`, `validateYaml` and a `Document` accessor can
+/// return: `error.OutOfMemory`, the basic profile's parse, build and navigation
+/// tags, and the resource tags named in `Limits`. One shared set, so an
+/// exhaustive handler written against it carries an arm for tags the call it
+/// handles never returns.
 pub const Error = std.mem.Allocator.Error ||
     basic.YamlError ||
     basic.YamlBuildError ||
@@ -60,64 +148,149 @@ pub const Error = std.mem.Allocator.Error ||
         TapeWordsExceeded,
     };
 
+/// How `Diagnostic.err` is classified for a caller that reacts to the kind
+/// rather than the tag.
 pub const DiagnosticKind = enum(u8) {
+    /// Input this profile cannot read.
     syntax,
+    /// A recognizable YAML feature outside the profile.
     unsupported,
+    /// A `Limits` bound or the depth ceiling.
     resource,
+    /// A structural disagreement the basic profile's index check found.
     invalid_index,
 };
 
+/// One located failure. Every field is a value; `snippet` borrows the buffer
+/// passed to `validateYaml` and is valid only as long as that buffer is, so the
+/// diagnostic outlives nothing and allocates nothing itself.
 pub const Diagnostic = struct {
+    /// The tag the parse failed with.
     err: Error,
+    /// Its classification.
     kind: DiagnosticKind,
+    /// Byte offset into the input, clamped to its length.
     byte_offset: usize,
+    /// One-based line of `byte_offset`.
     line: u32,
+    /// One-based column of `byte_offset` within that line.
     column: u32,
+    /// Up to 16 bytes of the failing line on either side of `byte_offset`,
+    /// borrowed from the input.
     snippet: []const u8,
+    /// Offset of `snippet[0]` in that same input.
     snippet_start: usize,
 };
 
+/// Bytes of one key or scalar and the storage they borrow. Copies share that
+/// borrow and require no stable address or teardown. A `.source_borrowed` view
+/// lasts while the caller's source remains live; a `.document_owned` view lasts
+/// until `Document.deinit`. An extracted source view does not borrow the tape.
 pub const Value = struct {
+    /// The value's bytes, borrowed from the source buffer or from
+    /// `Document.cooked` as `ownership_kind` says.
     bytes_view: []const u8,
+    /// Which of those two storages `bytes_view` points into.
     ownership_kind: ValueOwnership,
 
+    /// The value's bytes. Their lifetime is the one `ValueOwnership` names.
     pub fn bytes(self: Value) []const u8 {
         return self.bytes_view;
     }
 
+    /// Which storage `bytes` reads from, and so how long they stay valid.
     pub fn ownership(self: Value) ValueOwnership {
         return self.ownership_kind;
     }
 };
 
+/// What the source said about one key or scalar: its spelling, its block
+/// header, and the storage its bytes live in. A plain record that borrows
+/// nothing and owns nothing; a copy is another independent copy.
 pub const ScalarInfo = struct {
+    /// How the value was written in the source.
     style: ScalarStyle,
+    /// Trailing-break mode from the block header, `.clip` for every other style.
     chomping: Chomping,
+    /// Whether the content indent came from a header digit or from the body.
     indentation: ScalarIndentation,
+    /// The header's indent digit, or 0 when the header carried none.
     indentation_indicator: u8,
+    /// Column the block content starts at, or 0 for a scalar with no block
+    /// header.
     indentation_width: u32,
+    /// The same ownership `Document.value` reports for this word.
     ownership: ValueOwnership,
 };
 
+/// Metadata for one tape word, indexed exactly as `Document.tape`.
+/// The declaration name is not exported, but `@TypeOf` can recover the type
+/// through `Document.scalar_metadata`; its fields remain readable and writable.
 const ScalarMeta = struct {
+    /// Offset into `Document.source` of this word's raw span.
     raw_start: u32 = 0,
+    /// Length of that span. Only a key or scalar word has a readable one,
+    /// because `Document.rawSpan` rejects every other word; on the others the
+    /// pair is the parser's own marker and means nothing to a consumer.
     raw_length: u32 = 0,
+    /// Same value `Document.scalarInfo` reports as `style`.
     style: ScalarStyle = .plain,
+    /// Same value `Document.scalarInfo` reports as `chomping`.
     chomping: Chomping = .clip,
+    /// Same value `Document.scalarInfo` reports as `indentation`.
     indentation: ScalarIndentation = .automatic,
+    /// Same value `Document.scalarInfo` reports as `indentation_indicator`.
     indentation_indicator: u8 = 0,
+    /// Same value `Document.scalarInfo` reports as `indentation_width`.
     indentation_width: u32 = 0,
+    /// Same value `Document.scalarInfo` reports as `ownership`.
     ownership: ValueOwnership = .source_borrowed,
+    /// Offset into `Document.cooked` of the cooked bytes, meaningful only
+    /// where `ownership` is `.document_owned`.
     cooked_start: u32 = 0,
+    /// Length of those cooked bytes, under the same condition.
     cooked_length: u32 = 0,
 };
 
+/// One parsed extended-profile document, and the owner of everything that
+/// parse produced.
+///
+/// `Document` owns `tape`, `scalar_metadata` and `cooked`, all allocated from
+/// the `allocator` `buildYamlTape` was given; `source` is the caller's own
+/// buffer, borrowed and never copied, and `deinit` does not free it. The
+/// caller must keep that buffer alive for as long as the document lives.
+///
+/// `Value` bytes and `rawSpan` results point into `cooked` or into the source
+/// buffer, never into the `Document` value, so the value may be moved freely.
+/// A copy, though, is a second name for the same three allocations rather than
+/// a second owner, and a second `deinit` through either copy frees them twice.
+/// Accessors only read, so readers may share a document while nobody mutates its
+/// fields, owned storage or source, or calls `deinit`. No synchronization,
+/// capability or callback is stored here. Preserve the original owned slice
+/// handles and their compatible allocator through exactly one cleanup.
 pub const Document = struct {
+    /// Tape words in parse order, each `event_index` an accessor accepts. Every
+    /// `kind` byte is one of the profile's `yaml.YamlTokenKind` tags.
     tape: []basic.YamlTapeWord,
+    /// The buffer `buildYamlTape` was given, held by the caller. The parse only
+    /// ever reads it. The accessors that take an `input` accept this exact
+    /// pointer and length and reject anything else with
+    /// `error.SourceOutOfBounds`; a caller that rewrites its contents sees the
+    /// rewrite through every `.source_borrowed` value.
     source: []const u8,
+    /// One `ScalarMeta` per tape word, in the same order, owned here. Its type
+    /// is private to the module but every field of every entry is readable
+    /// through this slice.
     scalar_metadata: []ScalarMeta,
+    /// The cooked bytes of every `.document_owned` word, concatenated in parse
+    /// order, owned here. Empty when the document holds no cooked scalar.
     cooked: []u8,
 
+    /// Releases `tape`, `scalar_metadata` and `cooked` through `allocator`,
+    /// which must be the allocator `buildYamlTape` was given. `source` is the
+    /// caller's and is left untouched; every field becomes `undefined`
+    /// afterwards, so a second call, or one reached through a copy, is a
+    /// double free. Every `Value` borrowed from `cooked` dies here.
     pub fn deinit(self: *Document, allocator: std.mem.Allocator) void {
         allocator.free(self.tape);
         allocator.free(self.scalar_metadata);
@@ -149,6 +322,17 @@ pub const Document = struct {
         return word;
     }
 
+    /// Source span of the key or scalar at `event_index`, before folding,
+    /// escape decoding and chomping. `input` must be the same buffer and the
+    /// same length the document was built from; any other slice is
+    /// `error.SourceOutOfBounds`.
+    ///
+    /// An index at or past `tape` is `error.TapeOutOfBounds`, a container or
+    /// document delimiter word is `error.TypeMismatch`, and a kind byte this
+    /// profile does not define is `error.InvalidStructure`. Those are finite
+    /// bounds against this document's own tape and metadata; they say nothing
+    /// about whether `input` is still live, which only the caller knows. The
+    /// result borrows `input`, so a rewrite of the buffer shows through it.
     pub fn rawSpan(
         self: *const Document,
         input: []const u8,
@@ -161,6 +345,19 @@ pub const Document = struct {
         return input[offset .. offset + word.sourceLength()];
     }
 
+    /// Style, block header and ownership recorded for the key or scalar at
+    /// `event_index`. It checks the recorded spans against `Document.source`
+    /// rather than against a caller-supplied buffer, so it takes no `input` and
+    /// cannot observe a mismatched one.
+    ///
+    /// An index at or past `tape` or past `scalar_metadata` is
+    /// `error.TapeOutOfBounds`, a container or document delimiter is
+    /// `error.TypeMismatch`, an undefined kind byte is
+    /// `error.InvalidTapeKind`, a span reaching past `source` is
+    /// `error.SourceOutOfBounds`, and an entry whose ownership byte is not one
+    /// of the two tags, or whose cooked span reaches past `cooked`, is
+    /// `error.InvalidStructure`. It allocates nothing, and the record it
+    /// returns borrows nothing.
     pub fn scalarInfo(self: *const Document, event_index: usize) Error!ScalarInfo {
         if (event_index >= self.tape.len or event_index >= self.scalar_metadata.len) {
             return error.TapeOutOfBounds;
@@ -199,6 +396,15 @@ pub const Document = struct {
         };
     }
 
+    /// The bytes of the key or scalar at `event_index`: cooked where the source
+    /// spelling needed it, raw source where it did not. `input` must be the
+    /// same buffer and length the document was built from, and the index, kind
+    /// and span checks are `rawSpan`'s.
+    ///
+    /// The `Value` borrows `input` for a `.source_borrowed` word and `cooked`
+    /// for a `.document_owned` one, and reports which: the first dies with the
+    /// caller's buffer, the second with `deinit`. A recorded cooked span that
+    /// reaches past `cooked` is `error.InvalidStructure`.
     pub fn value(
         self: *const Document,
         input: []const u8,
@@ -230,6 +436,23 @@ pub const Document = struct {
     }
 };
 
+/// Parses `input` under this profile and returns the owning `Document`.
+///
+/// The caller chooses the allocator the document's three allocations come
+/// from, keeps `input` alive for as long as the document lives, and releases
+/// the result exactly once through `deinit`.
+///
+/// `limits` is validated first, so a bound outside its documented range is
+/// `error.InvalidLimits` before any input is read and before anything is
+/// allocated. Every other failure transfers nothing: the parse frees
+/// everything it built before returning, so on an error the caller owns no
+/// document and there is nothing to release.
+///
+/// A buffer longer than `limits.source_bytes_max` is
+/// `error.SourceBytesExceeded`, before any parsing. An input that needs no
+/// extended construct is parsed by the basic profile, so its grammar failures
+/// arrive with that profile's tags; either route produces the same events and
+/// spans for an input both accept.
 pub fn buildYamlTape(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -246,6 +469,21 @@ pub fn buildYamlTape(
     return parseExtended(allocator, input, limits, &failure);
 }
 
+/// Parses `input` under this profile and reports the first failure without
+/// returning a document. `null` means the input parsed within `limits`; a
+/// `Diagnostic` locates the failure and its `snippet` borrows `input`, so the
+/// buffer must outlive the diagnostic.
+///
+/// The allocator receives the parse's temporary document and whatever else the
+/// checks allocate, and all of it is released before the call returns on both
+/// paths; the caller holds only the diagnostic. The two failures that carry no
+/// location are returned instead of one: `error.OutOfMemory` and
+/// `error.InvalidLimits`.
+///
+/// A failure the parse located carries its own offset, and a grammar failure
+/// the basic profile re-checked carries the offset that check reported. Every
+/// other failure, a bound crossed before parsing starts among them, is reported
+/// at offset 0, which `byte_offset`, `line` and `column` then describe.
 pub fn validateYaml(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -914,8 +1152,14 @@ const Parser = struct {
         }
         return switch (self.input[start]) {
             '\'', '"' => self.parseQuoted(start, context),
-            '[' => self.parseFlowSequence(start, end),
-            '{' => self.parseFlowMapping(start, end),
+            // A collection in a key slot is a complex key, and this profile
+            // keeps complex keys out on every route.
+            '[', '{' => if (context == .block_key or context == .flow_key)
+                self.unsupported(start)
+            else if (self.input[start] == '[')
+                self.parseFlowSequence(start, end)
+            else
+                self.parseFlowMapping(start, end),
             '|', '>' => self.unsupported(start),
             else => self.parsePlain(start, end, context),
         };
@@ -1216,6 +1460,7 @@ const Parser = struct {
             return;
         }
         var emitted_content = false;
+        var previous_more = false;
         var index = body_start;
         while (index < body_end) : (index += 1) {
             const line = self.lines.items[index];
@@ -1223,6 +1468,7 @@ const Parser = struct {
             if (content_start < line.content_end) {
                 try sink.append(self.input[content_start..line.content_end]);
                 emitted_content = true;
+                previous_more = line.indent > body_indent;
             }
             if (line.next <= line.content_end) continue;
             if (index + 1 >= body_end) {
@@ -1232,13 +1478,14 @@ const Parser = struct {
             const next_line = self.lines.items[index + 1];
             const current_blank = content_start == line.content_end;
             const next_blank = next_line.content_start >= next_line.content_end;
-            const current_more = line.indent > body_indent and !current_blank;
             const next_more = next_line.indent > body_indent and !next_blank;
             if (current_blank and !next_blank) {
-                if (!emitted_content) try sink.byte('\n');
+                // A blank line beside a more-indented line is a line break
+                // rather than a fold, so it keeps its break.
+                if (!emitted_content or previous_more or next_more) try sink.byte('\n');
                 continue;
             }
-            if (next_blank or current_more or next_more) {
+            if (next_blank or previous_more or next_more) {
                 try sink.byte('\n');
             } else {
                 try sink.byte(' ');
@@ -1310,12 +1557,10 @@ fn parseBlockHeader(input: []const u8, start: usize, end: usize) Error!BlockHead
     var saw_chomping = false;
     var indent_indicator: u8 = 0;
     var saw_indent = false;
-    while (pos < end and input[pos] != '#') {
+    // The two indicators are contiguous with the style byte and with each
+    // other, in either order. Only whitespace and then a comment may follow.
+    while (pos < end) {
         const byte = input[pos];
-        if (byte == ' ') {
-            pos += 1;
-            continue;
-        }
         if ((byte == '+' or byte == '-') and !saw_chomping) {
             chomping = if (byte == '+') .keep else .strip;
             saw_chomping = true;
@@ -1328,11 +1573,11 @@ fn parseBlockHeader(input: []const u8, start: usize, end: usize) Error!BlockHead
             pos += 1;
             continue;
         }
-        return error.Invalid;
+        break;
     }
-    if (pos < end and input[pos] == '#') {
-        if (pos > start and input[pos - 1] != ' ') return error.Invalid;
-    }
+    while (pos < end and input[pos] == ' ') pos += 1;
+    if (pos < end and input[pos] != '#') return error.Invalid;
+    if (pos < end and input[pos - 1] != ' ') return error.Invalid;
     return .{
         .style = style,
         .chomping = chomping,

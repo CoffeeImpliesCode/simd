@@ -1,11 +1,41 @@
+//! Stage 2 of the JSON-family pipeline: validate one complete document, then
+//! record it as a tape a later stage navigates.
+//!
+//! `validate` and `validateView` check an input and report the first failure as
+//! a zero-copy `Diagnostic`. `buildTape` and `buildTapeView` run the same checks
+//! and additionally return an owned `Document` whose `TapeCursor` replays the
+//! values. `TokenReader` is the token-level entry point beneath all of them,
+//! and `Dialect` selects which JSON-family grammar is accepted. Callers reach
+//! this as `stage2` from the package root.
+//!
+//! A `Document` owns its tape and nothing else. The source bytes are supplied
+//! separately to `Document.root` and borrowed there, so they are never copied
+//! into the tape and the caller keeps them. Only `buildTape` and
+//! `buildTapeView` allocate: one tape from the caller's allocator, released
+//! again by `Document.deinit`. Every other entry point allocates nothing, and
+//! none of them performs I/O or retains a capability.
+//!
+//! Grammar and tape layout live here, structural indexing lives in `stage1`,
+//! and the incremental lexical scanner that produces an index lives in
+//! `stream`.
+
 const std = @import("std");
 const simd = @import("simd.zig");
 const stage1 = @import("stage1.zig");
 
 const testing = std.testing;
 
+/// Container nesting depth past which reading fails with `error.DepthExceeded`.
+///
+/// `TokenReader` and the cursor's subtree scan are both bounded by it, and
+/// `DepthStack` holds exactly that many open containers.
 pub const max_depth: usize = 1024;
 
+/// The lexical and grammar failures a JSON-family document can produce.
+///
+/// Every tag describes the input rather than the environment, so the only
+/// remedy is different bytes. `DuplicateKey` is declared here and produced by
+/// no supported path: duplicate object members are accepted.
 pub const Error = error{
     UnexpectedToken,
     UnclosedObject,
@@ -22,17 +52,41 @@ pub const Error = error{
     InvalidStructuralIndex,
 };
 
+/// Which JSON-family grammar the readers in this module accept.
 pub const Dialect = enum {
+    /// Strict JSON: no comments, no trailing comma, no single-quoted string.
     json,
+    /// `json` plus `//` line comments and `/* */` block comments.
     jsonc,
+    /// `jsonc` plus a leading `+` on numbers, `Infinity`, `NaN`, `0x`
+    /// integers, a leading-dot fraction, trailing commas, single-quoted
+    /// strings, unquoted IdentifierName keys, and U+000B, U+000C, U+2028 and
+    /// U+2029 as whitespace or line terminators.
     json5,
 };
 
+/// Everything `buildTape` and `buildTapeView` can return.
+///
+/// `error.OutOfMemory` comes from the caller's allocator and
+/// `error.TapeTooLarge` from an offset, span or word count a tape word cannot
+/// record; the rest is `Error`. A failure releases the tape buffer before
+/// returning, so the caller owns nothing it has to free.
 pub const BuildError = std.mem.Allocator.Error || Error || error{TapeTooLarge};
+/// Everything `TokenReader.init` and `TokenReader.next` can return.
+///
+/// `error.TapeTooLarge` is raised when a token offset or the running token
+/// count exceeds what a tape word records, and the rest is `Error`.
 pub const ReaderError = Error || error{TapeTooLarge};
 const ParseError = ReaderError;
+/// The error set `validate` and `validateView` return.
+///
+/// Only `error.TapeTooLarge` and `error.InvalidStructuralIndex` leave as an
+/// error; every other `Error` describes the input and arrives as a
+/// `Diagnostic`. `error.OutOfMemory` is in the set because it is shared with
+/// `buildTape`'s, and nothing on this path allocates.
 pub const ValidationError = std.mem.Allocator.Error || Error || error{TapeTooLarge};
 
+/// The word kinds a tape records, in the order their discriminants take.
 pub const TapeKind = enum(u8) {
     object_start,
     array_start,
@@ -46,12 +100,35 @@ pub const TapeKind = enum(u8) {
     null_literal,
 };
 
-/// A validated JSON token. String offsets point at the opening quote.
+/// One validated token, packed into a single 64-bit word.
+///
+/// `payload` and `offset` mean different things per kind. `payload` is the
+/// member count for `object_start` and `array_start`, the index of the
+/// matching open word for `object_end` and `array_end`, the content length in
+/// bytes for `string` and `key`, and `0` for `number`, `true_literal`,
+/// `false_literal` and `null_literal`. `offset` is the byte offset of the token
+/// in the input it was built from: the opening quote for a string or key, or
+/// the token's first byte otherwise. Both fields must fit their stored width,
+/// which is what bounds an accepted input to `maxInt(u32)` bytes.
+///
+/// A word carries offsets, never bytes, so any span read through it needs the
+/// original input beside it. Copying a word is a plain value copy.
 pub const TapeWord = packed struct(u64) {
+    /// The raw `TapeKind` discriminant, unvalidated. Read it through
+    /// `tapeKind`, and only under the terms that method states.
     kind: u8,
+    /// The per-kind value: member count, matching open-word index, or content
+    /// length, as this type's own comment describes.
     payload: u24,
+    /// Byte offset of the token in the input the tape was built from.
     offset: u32,
 
+    /// This word's `kind` as a `TapeKind`, converted without a range check.
+    ///
+    /// A `kind` byte outside `TapeKind` is a trap in Debug and ReleaseSafe and
+    /// unchecked illegal behavior in ReleaseFast and ReleaseSmall. Use this on
+    /// a word this package produced, or on one a `TapeCursor` has already
+    /// accepted; every word a cursor method reads is checked for you.
     pub fn tapeKind(self: TapeWord) TapeKind {
         return @enumFromInt(self.kind);
     }
@@ -62,15 +139,39 @@ comptime {
     std.debug.assert(@sizeOf(TapeWord) == 8);
 }
 
-/// An owned tape. Source bytes are supplied separately to `root` and borrowed.
+/// An owned tape plus the dialect it was validated against.
+///
+/// `tape` is the only owned resource. The bytes its words point into are not
+/// copied in: they are supplied to `Document.root` and borrowed there, and the
+/// caller keeps them. `dialect` is a value copied in, so a copied `Document`
+/// still names the same tape.
+///
+/// One `Document` has one owner, who calls `deinit` exactly once with the
+/// allocator `buildTape` or `buildTapeView` was given. A value built by struct
+/// literal owns no tape allocation, and passing one to `deinit` frees memory it
+/// did not allocate.
 pub const Document = struct {
+    /// The tape words. Owned, and the only thing `deinit` releases.
     tape: []TapeWord,
+    /// The grammar the tape was validated against, copied into the document.
     dialect: Dialect,
 
-    /// Creates a cursor over the owned tape and borrowed source input.
+    /// Creates a cursor over this tape and over borrowed source input.
     ///
-    /// The document owns only its tape. The caller must keep `input` and this
-    /// document alive for as long as the returned cursor is used.
+    /// `input` must be the exact bytes this tape was built from, and must stay
+    /// alive and unmodified until the returned cursor and every cursor derived
+    /// from it are finished. The cursor borrows the tape's memory and the
+    /// input; it does not borrow the `Document` value, which need not stay at
+    /// one address and may be moved or copied while the cursor lives.
+    ///
+    /// `error.TapeOutOfBounds` when `tape` is empty, and otherwise whatever
+    /// the first word reports, `error.InvalidTapeKind` among them. Only the
+    /// root word is checked here; the rest is checked as the cursor walks it.
+    ///
+    /// Nothing compares `input` against the bytes the tape was built from. The
+    /// tape records offsets only, so a different buffer that happens to satisfy
+    /// the bounds each accessor re-checks yields spans into that buffer rather
+    /// than an error; passing the original is the caller's obligation.
     pub fn root(self: *const Document, input: []const u8) NavigationError!TapeCursor {
         if (self.tape.len == 0) return error.TapeOutOfBounds;
         const cursor: TapeCursor = .{
@@ -82,12 +183,29 @@ pub const Document = struct {
         return cursor;
     }
 
+    /// Releases `tape` with the allocator `buildTape` or `buildTapeView` was
+    /// given.
+    ///
+    /// The allocator itself is not released here. The document is `undefined`
+    /// afterward, so a second call is a double free, and every cursor obtained
+    /// from `root` then dangles.
     pub fn deinit(self: *Document, allocator: std.mem.Allocator) void {
         allocator.free(self.tape);
         self.* = undefined;
     }
 };
 
+/// The failures a cursor reports over a tape.
+///
+/// `error.InvalidTapeKind` is a `kind` byte outside `TapeKind`,
+/// `error.PositionOutOfBounds` a position past the last word, and
+/// `error.TapeOutOfBounds` an index the tape cannot hold.
+/// `error.InvalidTapeOrder` means the words are not a well-formed sequence,
+/// `error.InvalidSource` and `error.SourceOutOfBounds` that the borrowed input
+/// does not hold what a word points at, `error.TypeMismatch` that the operation
+/// does not apply to the current word's kind, and `error.DepthExceeded` that
+/// the subtree nests deeper than `max_depth`. A tape from `buildTape` or
+/// `buildTapeView` over the input it was built from triggers none of them.
 pub const NavigationError = error{
     PositionOutOfBounds,
     InvalidTapeKind,
@@ -106,26 +224,63 @@ const ContainerFrame = struct {
     expect_key: bool,
 };
 
-/// A zero-allocation cursor over an owned tape and borrowed source input.
+/// A cursor over one tape, holding no allocation of its own.
+///
+/// `tape` and `input` are borrowed and `dialect` is copied in, so the cursor
+/// owns nothing and `Document.deinit` on the owner invalidates it. Both
+/// borrows must stay alive and unmodified for as long as the cursor, and every
+/// cursor derived from it, is used. The cursor itself is a plain value: it
+/// needs no stable address, and a copy is an independent position over the
+/// same tape and input.
 pub const TapeCursor = struct {
+    /// The words to walk. Borrowed from the owning `Document`, or from any
+    /// other slice of words the caller keeps alive.
     tape: []const TapeWord,
+    /// The source bytes `TapeWord.offset` and `TapeWord.payload` refer to.
+    /// Borrowed from whoever called `Document.root`.
     input: []const u8,
+    /// The grammar the tape was validated against; selects how `rawValue`
+    /// reads a string or key.
     dialect: Dialect,
+    /// Index into `tape` of the word every other method reads. Public so a
+    /// caller can build a cursor directly; a value outside `tape` makes every
+    /// method that reads a word report `error.PositionOutOfBounds`.
     position_index: usize = 0,
 
+    /// The word at the current position, without moving.
+    ///
+    /// `error.PositionOutOfBounds` when the cursor sits past the last word, and
+    /// `error.InvalidTapeKind` when that word's `kind` is not a `TapeKind`. The
+    /// word's `payload` and `offset` are returned as stored and are not
+    /// validated; the cursor does not move, and nothing is copied out.
     pub fn peek(self: *const TapeCursor) NavigationError!TapeWord {
         return self.currentWord();
     }
 
+    /// Moves one word forward.
+    ///
+    /// The word being left is checked first, so this reports the same two
+    /// failures `peek` does and leaves `position_index` unchanged when it
+    /// fails. On success the cursor may sit one past the last word, where
+    /// `peek` reports `error.PositionOutOfBounds`; that position is a valid
+    /// stopping point and nothing checks whether the tape continues after it.
     pub fn advance(self: *TapeCursor) NavigationError!void {
         _ = try self.currentWord();
         self.position_index += 1;
     }
 
+    /// The current index into `tape`, without checking it against `tape`.
     pub fn position(self: *const TapeCursor) usize {
         return self.position_index;
     }
 
+    /// Number of direct members in the container the cursor sits on.
+    ///
+    /// The whole subtree is validated on the way, so a malformed container is
+    /// reported here rather than silently skipped. `error.TypeMismatch` unless
+    /// the current word is `object_start` or `array_start`, and otherwise any
+    /// error the subtree scan reports, `error.DepthExceeded` among them for a
+    /// document nested deeper than `max_depth`. The cursor does not move.
     pub fn containerCount(self: *const TapeCursor) NavigationError!u32 {
         const word = try self.currentWord();
         const kind = try checkedTapeKind(word);
@@ -138,6 +293,18 @@ pub const TapeCursor = struct {
         }
     }
 
+    /// A new cursor at the container word matching the closing word here.
+    ///
+    /// `error.TypeMismatch` unless the current word is `object_end` or
+    /// `array_end`. The backlink is then checked: `error.TapeOutOfBounds` when
+    /// it names no word in `tape`, `error.InvalidTapeOrder` when it names this
+    /// word or a later one, and again when the word it names is not the start
+    /// kind that pairs with this end kind. Only the backlink and that one kind
+    /// are read, so a hand-written tape can still disagree inside the
+    /// container; the subtree scan is what checks the rest.
+    ///
+    /// The receiver is not modified and nothing is allocated. The result
+    /// borrows the same tape and input, so both must outlive it.
     pub fn matchingStart(self: *const TapeCursor) NavigationError!TapeCursor {
         const word = try self.currentWord();
         const end_kind = try checkedTapeKind(word);
@@ -165,11 +332,33 @@ pub const TapeCursor = struct {
 
     /// Advances past the current scalar or complete container subtree.
     /// Container skips validate and scan each nested tape word.
+    /// On failure `position_index` is unchanged; on success it names the first
+    /// word after the value. `error.TapeOutOfBounds` for a value running off the
+    /// end of the tape, `error.InvalidTapeOrder` for a word sequence that is
+    /// not well formed, and `error.DepthExceeded` for a subtree nested deeper
+    /// than `max_depth`. The scan keeps its frames in an automatic array of
+    /// `max_depth` entries, so the call reserves that much stack and allocates
+    /// nothing.
     pub fn skipValue(self: *TapeCursor) NavigationError!void {
         self.position_index = try self.valueEnd(self.position_index);
     }
 
     /// Returns still-escaped string/key content, or the complete scalar source.
+    /// For `string` and `key`, the content between the delimiters and still
+    /// escaped as written. For `number`, `true_literal`, `false_literal` and
+    /// `null_literal`, the complete token source. Container words report
+    /// `error.TypeMismatch`, and a scalar word whose `payload` is not `0`
+    /// reports `error.InvalidTapeOrder`.
+    ///
+    /// The span is re-derived from `input` rather than trusted from the tape:
+    /// the recorded offset must be in bounds, the recorded length must equal
+    /// what the grammar finds there, and a string or key must open with the
+    /// delimiter its dialect and kind allow, with a JSON5 unquoted key
+    /// validated as an IdentifierName. Anything else is `error.InvalidSource`
+    /// or `error.SourceOutOfBounds`.
+    ///
+    /// The result borrows `input` and is invalidated when the caller writes to
+    /// or releases it. The cursor does not move.
     pub fn rawValue(self: *const TapeCursor) NavigationError![]const u8 {
         const word = try self.currentWord();
         const kind = try checkedTapeKind(word);
@@ -388,69 +577,163 @@ fn checkedTapeKind(word: TapeWord) NavigationError!TapeKind {
     };
 }
 
+/// Where one input failed, with a borrowed excerpt of the line around it.
+///
+/// `line` and `column` are one-based, so both are at least 1.
+/// `byte_offset` is a byte index into the input that was validated, clamped to
+/// its length. `snippet` holds at most 16 bytes before the offset and at most
+/// 16 from it onward, never crossing a newline, and `snippet_start` is the
+/// absolute index of `snippet[0]`. Line and column saturate at `maxInt(u32)`
+/// rather than wrapping.
+///
+/// `snippet` borrows the input the diagnostic was built from and is
+/// invalidated when the caller writes to or releases it. A copy of the value
+/// copies the slice header, not the bytes.
 pub const Diagnostic = struct {
+    /// The grammar failure, as `diagnosticAt` was called with.
     err: Error,
+    /// Byte index into the validated input, clamped to its length.
     byte_offset: usize,
+    /// One-based line of `byte_offset`.
     line: u32,
+    /// One-based column of `byte_offset` within that line.
     column: u32,
+    /// Bytes around `byte_offset`, borrowed from the input, within one line.
     snippet: []const u8,
+    /// Absolute index of `snippet[0]` in the validated input.
     snippet_start: usize,
 };
 
+/// One open container a `TokenReader` is inside.
+///
+/// The reader fills these; a caller reads them through `DepthStack` to follow
+/// nesting. The value owns nothing, and a copy is independent.
 pub const DepthEntry = struct {
+    /// Whether the container is an array; `false` means an object.
     is_array: bool,
+    /// Tape index of the word that opened this container.
     tape_index: u32,
+    /// Byte offset of the opening brace or bracket, as an index into
+    /// `TokenReader.input`.
     open_offset: u32,
+    /// Direct members completed so far. Incrementing it past `maxInt(u32)`
+    /// fails the token that overflowed, with `error.UnexpectedToken`.
     count: u32,
 };
 
+/// A fixed-size stack of open containers, allocated inside the value.
+///
+/// `.{}` is the empty stack, which is a usable state: `top` is `0` and
+/// `push` is the first operation that changes anything. Nothing here allocates;
+/// the value reserves `max_depth` entries, so keep one where that much stack
+/// is available. A `TokenReader` owns its own.
+///
+/// The value needs no stable address, but a pointer returned by `peek` or
+/// `peekConst` points into it: the next `push` or `pop`, and moving or
+/// destroying the stack, all invalidate that pointer. A copy is a separate
+/// stack, so the two do not share entries.
 pub const DepthStack = struct {
+    /// The open containers, oldest first. Written by `push` and `pop`; the
+    /// entries above `top` are whatever the last operation left there.
     entries: [max_depth]DepthEntry,
+    /// Number of live entries, and the index the next `push` writes. Written by
+    /// every method here and reset to `0` by `TokenReader.reset`.
     top: usize = 0,
 
+    /// Adds one open container on top of the stack.
+    ///
+    /// `error.DepthExceeded` when `top` already equals `max_depth`, decided
+    /// before anything is written, so the stack keeps its previous contents.
     pub fn push(self: *DepthStack, entry: DepthEntry) Error!void {
         if (self.top >= max_depth) return error.DepthExceeded;
         self.entries[self.top] = entry;
         self.top += 1;
     }
 
+    /// Removes and returns the top entry.
+    ///
+    /// Popping an empty stack is a caller precondition held by
+    /// `std.debug.assert`: Debug and ReleaseSafe diagnose it and the fast
+    /// release modes treat it as unchecked illegal behavior.
     pub fn pop(self: *DepthStack) DepthEntry {
         std.debug.assert(self.top > 0);
         self.top -= 1;
         return self.entries[self.top];
     }
 
+    /// A pointer to the top entry, for reading and for updating it in place.
+    ///
+    /// The same precondition as `pop` applies. The pointer is invalidated by
+    /// the next `push` or `pop` and by moving or destroying the stack.
     pub fn peek(self: *DepthStack) *DepthEntry {
         std.debug.assert(self.top > 0);
         return &self.entries[self.top - 1];
     }
 
+    /// A pointer to the top entry for reading only.
+    ///
+    /// The same precondition and the same invalidation as `peek`.
     pub fn peekConst(self: *const DepthStack) *const DepthEntry {
         std.debug.assert(self.top > 0);
         return &self.entries[self.top - 1];
     }
 };
 
-/// A token view emitted by `TokenReader`.
+/// One token as `TokenReader` produced it.
 ///
-/// `raw` is authoritative for borrowed spans. `word.payload` keeps the
-/// compact tape representation and is zero when a span exceeds `u24`.
+/// `word` is the tape encoding and `raw` is the borrowed span to read instead:
+/// the content between the delimiters for a string or key, still escaped as
+/// written, and the complete token source for a number, a literal, or a
+/// container word, in which case the single delimiter byte. `word.payload` is
+/// the compact encoding of that span and is `0` when the span is too long for
+/// it to record, so a caller that needs the length reads `raw`.
+///
+/// `raw` borrows the reader's input and is invalidated when the caller writes
+/// to or releases it. A copy of the value copies the slice header, not the
+/// bytes.
 pub const ParsedToken = struct {
+    /// The token as the tape would record it.
     word: TapeWord,
+    /// The token's borrowed source span, authoritative over `word.payload`.
     raw: []const u8,
 };
 
-/// A checked borrowed view over global Stage 1 offsets.
+/// A checked borrowed window over Stage 1 offsets.
 ///
-/// `global_offsets` remains owned by the caller. The view tracks the local
-/// input extent used by the reader's validation boundary.
+/// The offsets stay owned by the caller and are never copied; the view holds
+/// the slice header and rebases each offset against `base_offset`. They must
+/// stay alive and unmodified while any entry point below is reading them, and
+/// nothing revalidates them afterwards, so a mutation is not detected.
+///
+/// The view owns nothing and needs no stable address; a copy is an independent
+/// window over the same offsets. `init` checks the offsets once against the
+/// input it was given, and `TokenReader.reset` checks them again against
+/// whichever input that reader is later given. Those are consistency checks
+/// over the bytes, not a liveness or identity check: nothing here proves the
+/// offsets still describe that input.
 pub const IndexView = struct {
+    /// The one way an offset set can fail these checks.
     pub const Error = error{InvalidStructuralIndex};
 
+    /// Absolute offsets, borrowed from the caller and never copied.
     global_offsets: []const u32,
+    /// Absolute offset that local offset `0` corresponds to, so the offsets
+    /// may be a window of a larger source.
     base_offset: u32,
+    /// Length of the local window. Every local offset must be below it, and
+    /// `base_offset` plus it must fit in `u32`.
     limit: u32,
 
+    /// Checks `global_offsets` against `input` and borrows both extents.
+    ///
+    /// `error.InvalidStructuralIndex` when `input.len` exceeds `maxInt(u32)`,
+    /// when `base_offset` plus that length overflows `u32`, when an offset is
+    /// below `base_offset` or reaches the end of the window, or when two
+    /// offsets are equal or descending. The check is total over the slice, so a
+    /// view this returns reads only offsets that passed it.
+    ///
+    /// `input` is not retained: it sets `limit`, and a later reader is given
+    /// its own input and revalidates. Nothing is allocated.
     pub fn init(
         input: []const u8,
         global_offsets: []const u32,
@@ -480,6 +763,12 @@ pub const IndexView = struct {
         };
     }
 
+    /// Number of offsets in the view, without checking them again.
+    ///
+    /// A count of `0` is valid and describes an input with no indexed
+    /// structural bytes. What a reader then reports depends on those bytes:
+    /// `error.EmptyDocument` for an empty input, and otherwise whatever the
+    /// first unindexed byte classifies as.
     pub fn count(self: *const IndexView) usize {
         return self.global_offsets.len;
     }
@@ -513,7 +802,19 @@ pub const IndexView = struct {
     }
 };
 
-/// Builds an owned tape from a checked borrowed index view.
+/// Validates `input` against `view` and returns the tape it describes.
+///
+/// `input` and the view's offsets are borrowed for the call only. The returned
+/// `Document` owns its tape and copies `dialect`; it borrows nothing, so both
+/// may be released as soon as the call returns. The tape buffer is reserved
+/// once from an upper bound on the word count, and the reader refuses to pass
+/// that bound with `error.TapeTooLarge` rather than growing it.
+///
+/// On any error the reserved buffer is released before returning, so the
+/// caller owns nothing to free and keeps its allocator. The reader reads only
+/// the window `view` describes, so an index outside it is
+/// `error.InvalidStructuralIndex`. The caller owns the returned tape exactly
+/// once, through `Document.deinit`.
 pub fn buildTapeView(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -541,7 +842,16 @@ pub fn buildTapeView(
     };
 }
 
-/// Validates a document from a checked borrowed index view.
+/// Validates `input` against `view` without building a tape.
+///
+/// Returns `null` when the document is well formed, and a `Diagnostic` for the
+/// first grammar failure. `input` and the view's offsets are borrowed for the
+/// call, and the returned diagnostic borrows `input`, so it stays valid only as
+/// long as those bytes do. Nothing is allocated.
+///
+/// `error.TapeTooLarge` and `error.InvalidStructuralIndex` are the only tags
+/// that leave as errors; both describe a size or an index rather than the
+/// input's grammar. Every other `Error` arrives inside the `Diagnostic`.
 pub fn validateView(
     input: []const u8,
     view: IndexView,
@@ -632,7 +942,19 @@ fn validateStructuralIndex(
     }
 }
 
-/// Builds an owned tape after complete dialect-specific syntax validation.
+/// Builds an owned tape from `input` and its Stage 1 index.
+///
+/// The index is checked before anything is read with it:
+/// `error.InvalidStructuralIndex` when its offsets are not strictly increasing
+/// within `input`, when the three sentinels after them are not
+/// `input.len, input.len, 0`, or when they do not fit in the buffer the index
+/// reserves for them. `error.TapeTooLarge` when `input.len` exceeds
+/// `maxInt(u32)`, which is the width a tape word records an offset in.
+///
+/// Both `input` and the index are borrowed for the call only; the returned
+/// `Document` owns its tape and copies `dialect`, and the caller owns that
+/// tape exactly once through `Document.deinit`. Every remaining failure comes
+/// from `buildTapeView`, which releases its buffer before returning.
 pub fn buildTape(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -645,7 +967,13 @@ pub fn buildTape(
     return buildTapeView(allocator, input, view, dialect);
 }
 
-/// Validates an indexed document without allocating a tape.
+/// Validates an indexed document without building a tape.
+///
+/// The same index checks and errors as `buildTape` apply, and the result
+/// contract is `validateView`'s: `null` for a well-formed document, a
+/// `Diagnostic` for the first grammar failure, and only
+/// `error.TapeTooLarge` or `error.InvalidStructuralIndex` as errors. Nothing
+/// is allocated, and both `input` and the index are borrowed for the call.
 pub fn validate(
     input: []const u8,
     structural_index: *const stage1.StructuralIndex,
@@ -657,7 +985,18 @@ pub fn validate(
     return validateView(input, view, dialect);
 }
 
-/// Creates a zero-copy diagnostic view into `input`.
+/// Builds a `Diagnostic` pointing into `input` without copying it.
+///
+/// `byte_offset` is clamped to `input.len`, so an offset past the end reports
+/// the end rather than failing. Line and column are one-based and counted up
+/// to `'\n'` only; `snippet` holds at most the 16 bytes before the offset and
+/// the 16 from it onward, never crossing a line boundary, and
+/// `snippet_start` is the absolute index of its first byte. Line and column
+/// saturate at `maxInt(u32)`.
+///
+/// `err` is stored as given and is not re-derived from the bytes, so a caller
+/// that reports a failure at an offset of its own choosing may name an error
+/// the text there does not cause. The snippet borrows `input`.
 pub fn diagnosticAt(
     input: []const u8,
     err: Error,
@@ -692,13 +1031,29 @@ pub fn diagnosticAt(
     };
 }
 
+/// Which token the `TokenReader` grammar expects next, in a type this module
+/// does not publish. The name is not exported, but `TokenReader.expect` is a
+/// field of this type, so `@TypeOf` recovers the type and every tag below.
+///
+/// The value is read only while a container is open: at the root the grammar
+/// is decided by `TokenReader.root_started` and `TokenReader.root_done`
+/// instead, and this field is stale there.
 const Expect = enum(u3) {
+    /// A member value is expected, right after `[`. The default, and the value
+    /// `TokenReader.init` and `TokenReader.reset` install.
     value_after_open,
+    /// A member value is expected, after a `,` inside an array.
     value_after_comma,
+    /// An object member key is expected, right after `{`.
     key_after_open,
+    /// An object member key is expected, after a `,` inside an object.
     key_after_comma,
+    /// `:` is expected, after an object member key.
     colon,
+    /// A member value is expected, after the `:` that follows a key.
     value_after_colon,
+    /// A value has just been completed, so a `,` or the matching closing
+    /// delimiter is expected next.
     after_value,
 };
 
@@ -719,24 +1074,76 @@ const StringToken = struct {
     end_offset: usize,
 };
 
+/// A pull reader over one borrowed JSON-family input.
+///
+/// A reader owns only its `DepthStack`. `input` and the offsets inside `view`
+/// are borrowed and must stay alive and unmodified until `reset` rebinds them;
+/// `tape`, when set, is a borrowed pointer to a list the caller owns and must
+/// outlive the reader. Nothing is allocated here, and the reader needs no
+/// stable address.
+///
+/// The value reserves `max_depth` depth entries inside itself, so keep it
+/// where that much stack is available. `next` yields tokens until the whole
+/// input has been validated as one document, latches the first failure, and
+/// keeps reporting that failure; `reset` returns the reader to its start over
+/// a new input without reallocating the stack.
 pub const TokenReader = struct {
+    /// The borrowed bytes being read, already truncated to the view's window.
     input: []const u8,
+    /// Empty after `init` and `reset`, which take their offsets from `view`.
+    /// It is read only when `view` is `null`, which neither constructor here
+    /// produces; a caller who builds a reader by hand may fill both.
     indexes: []const u32,
+    /// The checked offset window this reader walks. Set by `init` and `reset`,
+    /// and `null` only in a hand-built reader.
     view: ?IndexView = null,
+    /// Which grammar to accept.
     dialect: Dialect,
+    /// Where emitted words go. `null` for a reader that only yields tokens, in
+    /// which case payloads stay compact and no word is stored; non-`null`
+    /// makes the reader append to it and backpatch container payloads. The
+    /// caller owns the list and must keep it alive and unmodified.
     tape: ?*std.ArrayList(TapeWord) = null,
+    /// How many structural offsets have been consumed. Read through the view.
     structural_position: usize = 0,
+    /// Current byte offset into `input`. The reader reads only up to
+    /// `input.len`.
     byte_position: usize = 0,
+    /// Byte offset of the most recent failure, as the grammar reports it. For
+    /// `error.UnclosedArray` and `error.UnclosedObject` it is the offset of
+    /// the opening delimiter, not where the input ran out. `0` until a
+    /// failure.
     failure_offset: usize = 0,
+    /// Words emitted so far, which is the index the next word receives.
     tape_count: usize = 0,
+    /// The containers currently open.
     depth: DepthStack,
+    /// Which token the grammar expects next, in a type this module does not
+    /// publish. Drive the reader with `next` rather than reading this.
     expect: Expect = .value_after_open,
+    /// Whether a root value has begun. It is `false` before the first token,
+    /// and a second root value then reports `error.RootNotSingular`.
     root_started: bool = false,
+    /// Whether the root value has completed. Anything after it, a closing
+    /// delimiter included, reports `error.RootNotSingular`, and an input that
+    /// ends with the root still open reports `error.UnexpectedToken`.
     root_done: bool = false,
+    /// A token produced by the current step but not yet handed back. It is
+    /// `null` between `next` calls, so a caller never observes it set.
     pending: ?ParsedToken = null,
+    /// Whether the whole input has been validated, after which `next` returns
+    /// `null` without reading again.
     finished: bool = false,
+    /// The first failure, latched so every later `next` reports the same one.
     failure: ?ReaderError = null,
 
+    /// Creates a reader over `input`, bounded by `view`, ready for `next`.
+    ///
+    /// `view` is checked against `input` first, so
+    /// `error.InvalidStructuralIndex` means the two disagree about the extent,
+    /// not that the input is malformed. Neither the bytes nor the offsets are
+    /// retained beyond the borrow this type documents. Nothing is allocated;
+    /// the depth storage lives inside the returned value.
     pub fn init(
         input: []const u8,
         view: IndexView,
@@ -753,7 +1160,18 @@ pub const TokenReader = struct {
         return reader;
     }
 
-    /// Reuses this reader with a new borrowed input and index view.
+    /// Reuses this reader over a new borrowed input and index view.
+    ///
+    /// The view is checked against `input` first, on the same terms `init`
+    /// states. `input` is then truncated to the view's window, and that window
+    /// is what bounds the reader: bytes past it are never read. Every field
+    /// returns to its start value, including `tape`, so a reader that was
+    /// filling a tape stops unless the caller attaches a new one, and
+    /// `failure` is cleared along with `finished`.
+    ///
+    /// The depth storage is reused rather than reallocated, so one reader can
+    /// scan any number of documents. No token survives the call: a token the
+    /// caller still holds borrows the previous input, which must outlive it.
     pub fn reset(
         self: *TokenReader,
         input: []const u8,
@@ -779,6 +1197,23 @@ pub const TokenReader = struct {
         self.finished = false;
     }
 
+    /// The next token, or `null` once the whole input has been read.
+    ///
+    /// `null` is only returned for an input that validated as one document;
+    /// every other outcome is a `ParsedToken` or an error. The first failure
+    /// is latched in `failure` and returned by every later call, so a caller
+    /// does not have to remember it, and `failure_offset` still names where it
+    /// happened.
+    ///
+    /// `error.InvalidStructuralIndex` means the structural index ran out before
+    /// the grammar did, which is a mismatch between the two rather than a fact
+    /// about the bytes. `error.TapeTooLarge` means a token offset or the token
+    /// count exceeded what a tape word records. Every other tag describes the
+    /// input.
+    ///
+    /// `raw` in each token borrows the reader's input; it is invalidated when
+    /// the caller writes to or releases those bytes, and when `reset` rebinds
+    /// the reader to another input.
     pub fn next(self: *TokenReader) ReaderError!?ParsedToken {
         if (self.failure) |err| return err;
         if (self.finished) return null;
@@ -1794,7 +2229,11 @@ fn json5LineTerminatorWidth(input: []const u8, byte_offset: usize) ?usize {
     return null;
 }
 
-/// Unicode ID_Start and ID_Continue ranges for JSON5 IdentifierName.
+/// Unicode 17.0.0 general categories, generated from UnicodeData.txt.
+/// IdentifierStart is the set ECMA-262 5.1 7.6 calls UnicodeLetter, meaning
+/// category Lu, Ll, Lt, Lm, Lo or Nl. $ and _ are named directly by 7.6 and
+/// checked beside these ranges.
+/// Data license: https://www.unicode.org/license.txt
 const json5_identifier_start_ranges = [_]u21{
     0x41,    0x5A,    0x61,    0x7A,    0xAA,    0xAA,    0xB5,    0xB5,    0xBA,    0xBA,    0xC0,    0xD6,
     0xD8,    0xF6,    0xF8,    0x2C1,   0x2C6,   0x2D1,   0x2E0,   0x2E4,   0x2EC,   0x2EC,   0x2EE,   0x2EE,
@@ -1830,156 +2269,162 @@ const json5_identifier_start_ranges = [_]u21{
     0x1312,  0x1315,  0x1318,  0x135A,  0x1380,  0x138F,  0x13A0,  0x13F5,  0x13F8,  0x13FD,  0x1401,  0x166C,
     0x166F,  0x167F,  0x1681,  0x169A,  0x16A0,  0x16EA,  0x16EE,  0x16F8,  0x1700,  0x1711,  0x171F,  0x1731,
     0x1740,  0x1751,  0x1760,  0x176C,  0x176E,  0x1770,  0x1780,  0x17B3,  0x17D7,  0x17D7,  0x17DC,  0x17DC,
-    0x1820,  0x1878,  0x1880,  0x18A8,  0x18AA,  0x18AA,  0x18B0,  0x18F5,  0x1900,  0x191E,  0x1950,  0x196D,
-    0x1970,  0x1974,  0x1980,  0x19AB,  0x19B0,  0x19C9,  0x1A00,  0x1A16,  0x1A20,  0x1A54,  0x1AA7,  0x1AA7,
-    0x1B05,  0x1B33,  0x1B45,  0x1B4C,  0x1B83,  0x1BA0,  0x1BAE,  0x1BAF,  0x1BBA,  0x1BE5,  0x1C00,  0x1C23,
-    0x1C4D,  0x1C4F,  0x1C5A,  0x1C7D,  0x1C80,  0x1C8A,  0x1C90,  0x1CBA,  0x1CBD,  0x1CBF,  0x1CE9,  0x1CEC,
-    0x1CEE,  0x1CF3,  0x1CF5,  0x1CF6,  0x1CFA,  0x1CFA,  0x1D00,  0x1DBF,  0x1E00,  0x1F15,  0x1F18,  0x1F1D,
-    0x1F20,  0x1F45,  0x1F48,  0x1F4D,  0x1F50,  0x1F57,  0x1F59,  0x1F59,  0x1F5B,  0x1F5B,  0x1F5D,  0x1F5D,
-    0x1F5F,  0x1F7D,  0x1F80,  0x1FB4,  0x1FB6,  0x1FBC,  0x1FBE,  0x1FBE,  0x1FC2,  0x1FC4,  0x1FC6,  0x1FCC,
-    0x1FD0,  0x1FD3,  0x1FD6,  0x1FDB,  0x1FE0,  0x1FEC,  0x1FF2,  0x1FF4,  0x1FF6,  0x1FFC,  0x2071,  0x2071,
-    0x207F,  0x207F,  0x2090,  0x209C,  0x2102,  0x2102,  0x2107,  0x2107,  0x210A,  0x2113,  0x2115,  0x2115,
-    0x2118,  0x211D,  0x2124,  0x2124,  0x2126,  0x2126,  0x2128,  0x2128,  0x212A,  0x2139,  0x213C,  0x213F,
-    0x2145,  0x2149,  0x214E,  0x214E,  0x2160,  0x2188,  0x2C00,  0x2CE4,  0x2CEB,  0x2CEE,  0x2CF2,  0x2CF3,
-    0x2D00,  0x2D25,  0x2D27,  0x2D27,  0x2D2D,  0x2D2D,  0x2D30,  0x2D67,  0x2D6F,  0x2D6F,  0x2D80,  0x2D96,
-    0x2DA0,  0x2DA6,  0x2DA8,  0x2DAE,  0x2DB0,  0x2DB6,  0x2DB8,  0x2DBE,  0x2DC0,  0x2DC6,  0x2DC8,  0x2DCE,
-    0x2DD0,  0x2DD6,  0x2DD8,  0x2DDE,  0x3005,  0x3007,  0x3021,  0x3029,  0x3031,  0x3035,  0x3038,  0x303C,
-    0x3041,  0x3096,  0x309B,  0x309F,  0x30A1,  0x30FA,  0x30FC,  0x30FF,  0x3105,  0x312F,  0x3131,  0x318E,
-    0x31A0,  0x31BF,  0x31F0,  0x31FF,  0x3400,  0x4DBF,  0x4E00,  0xA48C,  0xA4D0,  0xA4FD,  0xA500,  0xA60C,
-    0xA610,  0xA61F,  0xA62A,  0xA62B,  0xA640,  0xA66E,  0xA67F,  0xA69D,  0xA6A0,  0xA6EF,  0xA717,  0xA71F,
-    0xA722,  0xA788,  0xA78B,  0xA7DC,  0xA7F1,  0xA801,  0xA803,  0xA805,  0xA807,  0xA80A,  0xA80C,  0xA822,
-    0xA840,  0xA873,  0xA882,  0xA8B3,  0xA8F2,  0xA8F7,  0xA8FB,  0xA8FB,  0xA8FD,  0xA8FE,  0xA90A,  0xA925,
-    0xA930,  0xA946,  0xA960,  0xA97C,  0xA984,  0xA9B2,  0xA9CF,  0xA9CF,  0xA9E0,  0xA9E4,  0xA9E6,  0xA9EF,
-    0xA9FA,  0xA9FE,  0xAA00,  0xAA28,  0xAA40,  0xAA42,  0xAA44,  0xAA4B,  0xAA60,  0xAA76,  0xAA7A,  0xAA7A,
-    0xAA7E,  0xAAAF,  0xAAB1,  0xAAB1,  0xAAB5,  0xAAB6,  0xAAB9,  0xAABD,  0xAAC0,  0xAAC0,  0xAAC2,  0xAAC2,
-    0xAADB,  0xAADD,  0xAAE0,  0xAAEA,  0xAAF2,  0xAAF4,  0xAB01,  0xAB06,  0xAB09,  0xAB0E,  0xAB11,  0xAB16,
-    0xAB20,  0xAB26,  0xAB28,  0xAB2E,  0xAB30,  0xAB5A,  0xAB5C,  0xAB69,  0xAB70,  0xABE2,  0xAC00,  0xD7A3,
-    0xD7B0,  0xD7C6,  0xD7CB,  0xD7FB,  0xF900,  0xFA6D,  0xFA70,  0xFAD9,  0xFB00,  0xFB06,  0xFB13,  0xFB17,
-    0xFB1D,  0xFB1D,  0xFB1F,  0xFB28,  0xFB2A,  0xFB36,  0xFB38,  0xFB3C,  0xFB3E,  0xFB3E,  0xFB40,  0xFB41,
-    0xFB43,  0xFB44,  0xFB46,  0xFBB1,  0xFBD3,  0xFD3D,  0xFD50,  0xFD8F,  0xFD92,  0xFDC7,  0xFDF0,  0xFDFB,
-    0xFE70,  0xFE74,  0xFE76,  0xFEFC,  0xFF21,  0xFF3A,  0xFF41,  0xFF5A,  0xFF66,  0xFFBE,  0xFFC2,  0xFFC7,
-    0xFFCA,  0xFFCF,  0xFFD2,  0xFFD7,  0xFFDA,  0xFFDC,  0x10000, 0x1000B, 0x1000D, 0x10026, 0x10028, 0x1003A,
-    0x1003C, 0x1003D, 0x1003F, 0x1004D, 0x10050, 0x1005D, 0x10080, 0x100FA, 0x10140, 0x10174, 0x10280, 0x1029C,
-    0x102A0, 0x102D0, 0x10300, 0x1031F, 0x1032D, 0x1034A, 0x10350, 0x10375, 0x10380, 0x1039D, 0x103A0, 0x103C3,
-    0x103C8, 0x103CF, 0x103D1, 0x103D5, 0x10400, 0x1049D, 0x104B0, 0x104D3, 0x104D8, 0x104FB, 0x10500, 0x10527,
-    0x10530, 0x10563, 0x10570, 0x1057A, 0x1057C, 0x1058A, 0x1058C, 0x10592, 0x10594, 0x10595, 0x10597, 0x105A1,
-    0x105A3, 0x105B1, 0x105B3, 0x105B9, 0x105BB, 0x105BC, 0x105C0, 0x105F3, 0x10600, 0x10736, 0x10740, 0x10755,
-    0x10760, 0x10767, 0x10780, 0x10785, 0x10787, 0x107B0, 0x107B2, 0x107BA, 0x10800, 0x10805, 0x10808, 0x10808,
-    0x1080A, 0x10835, 0x10837, 0x10838, 0x1083C, 0x1083C, 0x1083F, 0x10855, 0x10860, 0x10876, 0x10880, 0x1089E,
-    0x108E0, 0x108F2, 0x108F4, 0x108F5, 0x10900, 0x10915, 0x10920, 0x10939, 0x10940, 0x10959, 0x10980, 0x109B7,
-    0x109BE, 0x109BF, 0x10A00, 0x10A00, 0x10A10, 0x10A13, 0x10A15, 0x10A17, 0x10A19, 0x10A35, 0x10A60, 0x10A7C,
-    0x10A80, 0x10A9C, 0x10AC0, 0x10AC7, 0x10AC9, 0x10AE4, 0x10B00, 0x10B35, 0x10B40, 0x10B55, 0x10B60, 0x10B72,
-    0x10B80, 0x10B91, 0x10C00, 0x10C48, 0x10C80, 0x10CB2, 0x10CC0, 0x10CF2, 0x10D00, 0x10D23, 0x10D4A, 0x10D65,
-    0x10D6F, 0x10D85, 0x10E80, 0x10EA9, 0x10EB0, 0x10EB1, 0x10EC2, 0x10EC7, 0x10F00, 0x10F1C, 0x10F27, 0x10F27,
-    0x10F30, 0x10F45, 0x10F70, 0x10F81, 0x10FB0, 0x10FC4, 0x10FE0, 0x10FF6, 0x11003, 0x11037, 0x11071, 0x11072,
-    0x11075, 0x11075, 0x11083, 0x110AF, 0x110D0, 0x110E8, 0x11103, 0x11126, 0x11144, 0x11144, 0x11147, 0x11147,
-    0x11150, 0x11172, 0x11176, 0x11176, 0x11183, 0x111B2, 0x111C1, 0x111C4, 0x111DA, 0x111DA, 0x111DC, 0x111DC,
-    0x11200, 0x11211, 0x11213, 0x1122B, 0x1123F, 0x11240, 0x11280, 0x11286, 0x11288, 0x11288, 0x1128A, 0x1128D,
-    0x1128F, 0x1129D, 0x1129F, 0x112A8, 0x112B0, 0x112DE, 0x11305, 0x1130C, 0x1130F, 0x11310, 0x11313, 0x11328,
-    0x1132A, 0x11330, 0x11332, 0x11333, 0x11335, 0x11339, 0x1133D, 0x1133D, 0x11350, 0x11350, 0x1135D, 0x11361,
-    0x11380, 0x11389, 0x1138B, 0x1138B, 0x1138E, 0x1138E, 0x11390, 0x113B5, 0x113B7, 0x113B7, 0x113D1, 0x113D1,
-    0x113D3, 0x113D3, 0x11400, 0x11434, 0x11447, 0x1144A, 0x1145F, 0x11461, 0x11480, 0x114AF, 0x114C4, 0x114C5,
-    0x114C7, 0x114C7, 0x11580, 0x115AE, 0x115D8, 0x115DB, 0x11600, 0x1162F, 0x11644, 0x11644, 0x11680, 0x116AA,
-    0x116B8, 0x116B8, 0x11700, 0x1171A, 0x11740, 0x11746, 0x11800, 0x1182B, 0x118A0, 0x118DF, 0x118FF, 0x11906,
-    0x11909, 0x11909, 0x1190C, 0x11913, 0x11915, 0x11916, 0x11918, 0x1192F, 0x1193F, 0x1193F, 0x11941, 0x11941,
-    0x119A0, 0x119A7, 0x119AA, 0x119D0, 0x119E1, 0x119E1, 0x119E3, 0x119E3, 0x11A00, 0x11A00, 0x11A0B, 0x11A32,
-    0x11A3A, 0x11A3A, 0x11A50, 0x11A50, 0x11A5C, 0x11A89, 0x11A9D, 0x11A9D, 0x11AB0, 0x11AF8, 0x11BC0, 0x11BE0,
-    0x11C00, 0x11C08, 0x11C0A, 0x11C2E, 0x11C40, 0x11C40, 0x11C72, 0x11C8F, 0x11D00, 0x11D06, 0x11D08, 0x11D09,
-    0x11D0B, 0x11D30, 0x11D46, 0x11D46, 0x11D60, 0x11D65, 0x11D67, 0x11D68, 0x11D6A, 0x11D89, 0x11D98, 0x11D98,
-    0x11DB0, 0x11DDB, 0x11EE0, 0x11EF2, 0x11F02, 0x11F02, 0x11F04, 0x11F10, 0x11F12, 0x11F33, 0x11FB0, 0x11FB0,
-    0x12000, 0x12399, 0x12400, 0x1246E, 0x12480, 0x12543, 0x12F90, 0x12FF0, 0x13000, 0x1342F, 0x13441, 0x13446,
-    0x13460, 0x143FA, 0x14400, 0x14646, 0x16100, 0x1611D, 0x16800, 0x16A38, 0x16A40, 0x16A5E, 0x16A70, 0x16ABE,
-    0x16AD0, 0x16AED, 0x16B00, 0x16B2F, 0x16B40, 0x16B43, 0x16B63, 0x16B77, 0x16B7D, 0x16B8F, 0x16D40, 0x16D6C,
-    0x16E40, 0x16E7F, 0x16EA0, 0x16EB8, 0x16EBB, 0x16ED3, 0x16F00, 0x16F4A, 0x16F50, 0x16F50, 0x16F93, 0x16F9F,
-    0x16FE0, 0x16FE1, 0x16FE3, 0x16FE3, 0x16FF2, 0x16FF6, 0x17000, 0x18CD5, 0x18CFF, 0x18D1E, 0x18D80, 0x18DF2,
-    0x1AFF0, 0x1AFF3, 0x1AFF5, 0x1AFFB, 0x1AFFD, 0x1AFFE, 0x1B000, 0x1B122, 0x1B132, 0x1B132, 0x1B150, 0x1B152,
-    0x1B155, 0x1B155, 0x1B164, 0x1B167, 0x1B170, 0x1B2FB, 0x1BC00, 0x1BC6A, 0x1BC70, 0x1BC7C, 0x1BC80, 0x1BC88,
-    0x1BC90, 0x1BC99, 0x1D400, 0x1D454, 0x1D456, 0x1D49C, 0x1D49E, 0x1D49F, 0x1D4A2, 0x1D4A2, 0x1D4A5, 0x1D4A6,
-    0x1D4A9, 0x1D4AC, 0x1D4AE, 0x1D4B9, 0x1D4BB, 0x1D4BB, 0x1D4BD, 0x1D4C3, 0x1D4C5, 0x1D505, 0x1D507, 0x1D50A,
-    0x1D50D, 0x1D514, 0x1D516, 0x1D51C, 0x1D51E, 0x1D539, 0x1D53B, 0x1D53E, 0x1D540, 0x1D544, 0x1D546, 0x1D546,
-    0x1D54A, 0x1D550, 0x1D552, 0x1D6A5, 0x1D6A8, 0x1D6C0, 0x1D6C2, 0x1D6DA, 0x1D6DC, 0x1D6FA, 0x1D6FC, 0x1D714,
-    0x1D716, 0x1D734, 0x1D736, 0x1D74E, 0x1D750, 0x1D76E, 0x1D770, 0x1D788, 0x1D78A, 0x1D7A8, 0x1D7AA, 0x1D7C2,
-    0x1D7C4, 0x1D7CB, 0x1DF00, 0x1DF1E, 0x1DF25, 0x1DF2A, 0x1E030, 0x1E06D, 0x1E100, 0x1E12C, 0x1E137, 0x1E13D,
-    0x1E14E, 0x1E14E, 0x1E290, 0x1E2AD, 0x1E2C0, 0x1E2EB, 0x1E4D0, 0x1E4EB, 0x1E5D0, 0x1E5ED, 0x1E5F0, 0x1E5F0,
-    0x1E6C0, 0x1E6DE, 0x1E6E0, 0x1E6E2, 0x1E6E4, 0x1E6E5, 0x1E6E7, 0x1E6ED, 0x1E6F0, 0x1E6F4, 0x1E6FE, 0x1E6FF,
-    0x1E7E0, 0x1E7E6, 0x1E7E8, 0x1E7EB, 0x1E7ED, 0x1E7EE, 0x1E7F0, 0x1E7FE, 0x1E800, 0x1E8C4, 0x1E900, 0x1E943,
-    0x1E94B, 0x1E94B, 0x1EE00, 0x1EE03, 0x1EE05, 0x1EE1F, 0x1EE21, 0x1EE22, 0x1EE24, 0x1EE24, 0x1EE27, 0x1EE27,
-    0x1EE29, 0x1EE32, 0x1EE34, 0x1EE37, 0x1EE39, 0x1EE39, 0x1EE3B, 0x1EE3B, 0x1EE42, 0x1EE42, 0x1EE47, 0x1EE47,
-    0x1EE49, 0x1EE49, 0x1EE4B, 0x1EE4B, 0x1EE4D, 0x1EE4F, 0x1EE51, 0x1EE52, 0x1EE54, 0x1EE54, 0x1EE57, 0x1EE57,
-    0x1EE59, 0x1EE59, 0x1EE5B, 0x1EE5B, 0x1EE5D, 0x1EE5D, 0x1EE5F, 0x1EE5F, 0x1EE61, 0x1EE62, 0x1EE64, 0x1EE64,
-    0x1EE67, 0x1EE6A, 0x1EE6C, 0x1EE72, 0x1EE74, 0x1EE77, 0x1EE79, 0x1EE7C, 0x1EE7E, 0x1EE7E, 0x1EE80, 0x1EE89,
-    0x1EE8B, 0x1EE9B, 0x1EEA1, 0x1EEA3, 0x1EEA5, 0x1EEA9, 0x1EEAB, 0x1EEBB, 0x20000, 0x2A6DF, 0x2A700, 0x2B81D,
-    0x2B820, 0x2CEAD, 0x2CEB0, 0x2EBE0, 0x2EBF0, 0x2EE5D, 0x2F800, 0x2FA1D, 0x30000, 0x3134A, 0x31350, 0x33479,
+    0x1820,  0x1878,  0x1880,  0x1884,  0x1887,  0x18A8,  0x18AA,  0x18AA,  0x18B0,  0x18F5,  0x1900,  0x191E,
+    0x1950,  0x196D,  0x1970,  0x1974,  0x1980,  0x19AB,  0x19B0,  0x19C9,  0x1A00,  0x1A16,  0x1A20,  0x1A54,
+    0x1AA7,  0x1AA7,  0x1B05,  0x1B33,  0x1B45,  0x1B4C,  0x1B83,  0x1BA0,  0x1BAE,  0x1BAF,  0x1BBA,  0x1BE5,
+    0x1C00,  0x1C23,  0x1C4D,  0x1C4F,  0x1C5A,  0x1C7D,  0x1C80,  0x1C8A,  0x1C90,  0x1CBA,  0x1CBD,  0x1CBF,
+    0x1CE9,  0x1CEC,  0x1CEE,  0x1CF3,  0x1CF5,  0x1CF6,  0x1CFA,  0x1CFA,  0x1D00,  0x1DBF,  0x1E00,  0x1F15,
+    0x1F18,  0x1F1D,  0x1F20,  0x1F45,  0x1F48,  0x1F4D,  0x1F50,  0x1F57,  0x1F59,  0x1F59,  0x1F5B,  0x1F5B,
+    0x1F5D,  0x1F5D,  0x1F5F,  0x1F7D,  0x1F80,  0x1FB4,  0x1FB6,  0x1FBC,  0x1FBE,  0x1FBE,  0x1FC2,  0x1FC4,
+    0x1FC6,  0x1FCC,  0x1FD0,  0x1FD3,  0x1FD6,  0x1FDB,  0x1FE0,  0x1FEC,  0x1FF2,  0x1FF4,  0x1FF6,  0x1FFC,
+    0x2071,  0x2071,  0x207F,  0x207F,  0x2090,  0x209C,  0x2102,  0x2102,  0x2107,  0x2107,  0x210A,  0x2113,
+    0x2115,  0x2115,  0x2119,  0x211D,  0x2124,  0x2124,  0x2126,  0x2126,  0x2128,  0x2128,  0x212A,  0x212D,
+    0x212F,  0x2139,  0x213C,  0x213F,  0x2145,  0x2149,  0x214E,  0x214E,  0x2160,  0x2188,  0x2C00,  0x2CE4,
+    0x2CEB,  0x2CEE,  0x2CF2,  0x2CF3,  0x2D00,  0x2D25,  0x2D27,  0x2D27,  0x2D2D,  0x2D2D,  0x2D30,  0x2D67,
+    0x2D6F,  0x2D6F,  0x2D80,  0x2D96,  0x2DA0,  0x2DA6,  0x2DA8,  0x2DAE,  0x2DB0,  0x2DB6,  0x2DB8,  0x2DBE,
+    0x2DC0,  0x2DC6,  0x2DC8,  0x2DCE,  0x2DD0,  0x2DD6,  0x2DD8,  0x2DDE,  0x2E2F,  0x2E2F,  0x3005,  0x3007,
+    0x3021,  0x3029,  0x3031,  0x3035,  0x3038,  0x303C,  0x3041,  0x3096,  0x309D,  0x309F,  0x30A1,  0x30FA,
+    0x30FC,  0x30FF,  0x3105,  0x312F,  0x3131,  0x318E,  0x31A0,  0x31BF,  0x31F0,  0x31FF,  0x3400,  0x4DBF,
+    0x4E00,  0xA48C,  0xA4D0,  0xA4FD,  0xA500,  0xA60C,  0xA610,  0xA61F,  0xA62A,  0xA62B,  0xA640,  0xA66E,
+    0xA67F,  0xA69D,  0xA6A0,  0xA6EF,  0xA717,  0xA71F,  0xA722,  0xA788,  0xA78B,  0xA7DC,  0xA7F1,  0xA801,
+    0xA803,  0xA805,  0xA807,  0xA80A,  0xA80C,  0xA822,  0xA840,  0xA873,  0xA882,  0xA8B3,  0xA8F2,  0xA8F7,
+    0xA8FB,  0xA8FB,  0xA8FD,  0xA8FE,  0xA90A,  0xA925,  0xA930,  0xA946,  0xA960,  0xA97C,  0xA984,  0xA9B2,
+    0xA9CF,  0xA9CF,  0xA9E0,  0xA9E4,  0xA9E6,  0xA9EF,  0xA9FA,  0xA9FE,  0xAA00,  0xAA28,  0xAA40,  0xAA42,
+    0xAA44,  0xAA4B,  0xAA60,  0xAA76,  0xAA7A,  0xAA7A,  0xAA7E,  0xAAAF,  0xAAB1,  0xAAB1,  0xAAB5,  0xAAB6,
+    0xAAB9,  0xAABD,  0xAAC0,  0xAAC0,  0xAAC2,  0xAAC2,  0xAADB,  0xAADD,  0xAAE0,  0xAAEA,  0xAAF2,  0xAAF4,
+    0xAB01,  0xAB06,  0xAB09,  0xAB0E,  0xAB11,  0xAB16,  0xAB20,  0xAB26,  0xAB28,  0xAB2E,  0xAB30,  0xAB5A,
+    0xAB5C,  0xAB69,  0xAB70,  0xABE2,  0xAC00,  0xD7A3,  0xD7B0,  0xD7C6,  0xD7CB,  0xD7FB,  0xF900,  0xFA6D,
+    0xFA70,  0xFAD9,  0xFB00,  0xFB06,  0xFB13,  0xFB17,  0xFB1D,  0xFB1D,  0xFB1F,  0xFB28,  0xFB2A,  0xFB36,
+    0xFB38,  0xFB3C,  0xFB3E,  0xFB3E,  0xFB40,  0xFB41,  0xFB43,  0xFB44,  0xFB46,  0xFBB1,  0xFBD3,  0xFD3D,
+    0xFD50,  0xFD8F,  0xFD92,  0xFDC7,  0xFDF0,  0xFDFB,  0xFE70,  0xFE74,  0xFE76,  0xFEFC,  0xFF21,  0xFF3A,
+    0xFF41,  0xFF5A,  0xFF66,  0xFFBE,  0xFFC2,  0xFFC7,  0xFFCA,  0xFFCF,  0xFFD2,  0xFFD7,  0xFFDA,  0xFFDC,
+    0x10000, 0x1000B, 0x1000D, 0x10026, 0x10028, 0x1003A, 0x1003C, 0x1003D, 0x1003F, 0x1004D, 0x10050, 0x1005D,
+    0x10080, 0x100FA, 0x10140, 0x10174, 0x10280, 0x1029C, 0x102A0, 0x102D0, 0x10300, 0x1031F, 0x1032D, 0x1034A,
+    0x10350, 0x10375, 0x10380, 0x1039D, 0x103A0, 0x103C3, 0x103C8, 0x103CF, 0x103D1, 0x103D5, 0x10400, 0x1049D,
+    0x104B0, 0x104D3, 0x104D8, 0x104FB, 0x10500, 0x10527, 0x10530, 0x10563, 0x10570, 0x1057A, 0x1057C, 0x1058A,
+    0x1058C, 0x10592, 0x10594, 0x10595, 0x10597, 0x105A1, 0x105A3, 0x105B1, 0x105B3, 0x105B9, 0x105BB, 0x105BC,
+    0x105C0, 0x105F3, 0x10600, 0x10736, 0x10740, 0x10755, 0x10760, 0x10767, 0x10780, 0x10785, 0x10787, 0x107B0,
+    0x107B2, 0x107BA, 0x10800, 0x10805, 0x10808, 0x10808, 0x1080A, 0x10835, 0x10837, 0x10838, 0x1083C, 0x1083C,
+    0x1083F, 0x10855, 0x10860, 0x10876, 0x10880, 0x1089E, 0x108E0, 0x108F2, 0x108F4, 0x108F5, 0x10900, 0x10915,
+    0x10920, 0x10939, 0x10940, 0x10959, 0x10980, 0x109B7, 0x109BE, 0x109BF, 0x10A00, 0x10A00, 0x10A10, 0x10A13,
+    0x10A15, 0x10A17, 0x10A19, 0x10A35, 0x10A60, 0x10A7C, 0x10A80, 0x10A9C, 0x10AC0, 0x10AC7, 0x10AC9, 0x10AE4,
+    0x10B00, 0x10B35, 0x10B40, 0x10B55, 0x10B60, 0x10B72, 0x10B80, 0x10B91, 0x10C00, 0x10C48, 0x10C80, 0x10CB2,
+    0x10CC0, 0x10CF2, 0x10D00, 0x10D23, 0x10D4A, 0x10D65, 0x10D6F, 0x10D85, 0x10E80, 0x10EA9, 0x10EB0, 0x10EB1,
+    0x10EC2, 0x10EC7, 0x10F00, 0x10F1C, 0x10F27, 0x10F27, 0x10F30, 0x10F45, 0x10F70, 0x10F81, 0x10FB0, 0x10FC4,
+    0x10FE0, 0x10FF6, 0x11003, 0x11037, 0x11071, 0x11072, 0x11075, 0x11075, 0x11083, 0x110AF, 0x110D0, 0x110E8,
+    0x11103, 0x11126, 0x11144, 0x11144, 0x11147, 0x11147, 0x11150, 0x11172, 0x11176, 0x11176, 0x11183, 0x111B2,
+    0x111C1, 0x111C4, 0x111DA, 0x111DA, 0x111DC, 0x111DC, 0x11200, 0x11211, 0x11213, 0x1122B, 0x1123F, 0x11240,
+    0x11280, 0x11286, 0x11288, 0x11288, 0x1128A, 0x1128D, 0x1128F, 0x1129D, 0x1129F, 0x112A8, 0x112B0, 0x112DE,
+    0x11305, 0x1130C, 0x1130F, 0x11310, 0x11313, 0x11328, 0x1132A, 0x11330, 0x11332, 0x11333, 0x11335, 0x11339,
+    0x1133D, 0x1133D, 0x11350, 0x11350, 0x1135D, 0x11361, 0x11380, 0x11389, 0x1138B, 0x1138B, 0x1138E, 0x1138E,
+    0x11390, 0x113B5, 0x113B7, 0x113B7, 0x113D1, 0x113D1, 0x113D3, 0x113D3, 0x11400, 0x11434, 0x11447, 0x1144A,
+    0x1145F, 0x11461, 0x11480, 0x114AF, 0x114C4, 0x114C5, 0x114C7, 0x114C7, 0x11580, 0x115AE, 0x115D8, 0x115DB,
+    0x11600, 0x1162F, 0x11644, 0x11644, 0x11680, 0x116AA, 0x116B8, 0x116B8, 0x11700, 0x1171A, 0x11740, 0x11746,
+    0x11800, 0x1182B, 0x118A0, 0x118DF, 0x118FF, 0x11906, 0x11909, 0x11909, 0x1190C, 0x11913, 0x11915, 0x11916,
+    0x11918, 0x1192F, 0x1193F, 0x1193F, 0x11941, 0x11941, 0x119A0, 0x119A7, 0x119AA, 0x119D0, 0x119E1, 0x119E1,
+    0x119E3, 0x119E3, 0x11A00, 0x11A00, 0x11A0B, 0x11A32, 0x11A3A, 0x11A3A, 0x11A50, 0x11A50, 0x11A5C, 0x11A89,
+    0x11A9D, 0x11A9D, 0x11AB0, 0x11AF8, 0x11BC0, 0x11BE0, 0x11C00, 0x11C08, 0x11C0A, 0x11C2E, 0x11C40, 0x11C40,
+    0x11C72, 0x11C8F, 0x11D00, 0x11D06, 0x11D08, 0x11D09, 0x11D0B, 0x11D30, 0x11D46, 0x11D46, 0x11D60, 0x11D65,
+    0x11D67, 0x11D68, 0x11D6A, 0x11D89, 0x11D98, 0x11D98, 0x11DB0, 0x11DDB, 0x11EE0, 0x11EF2, 0x11F02, 0x11F02,
+    0x11F04, 0x11F10, 0x11F12, 0x11F33, 0x11FB0, 0x11FB0, 0x12000, 0x12399, 0x12400, 0x1246E, 0x12480, 0x12543,
+    0x12F90, 0x12FF0, 0x13000, 0x1342F, 0x13441, 0x13446, 0x13460, 0x143FA, 0x14400, 0x14646, 0x16100, 0x1611D,
+    0x16800, 0x16A38, 0x16A40, 0x16A5E, 0x16A70, 0x16ABE, 0x16AD0, 0x16AED, 0x16B00, 0x16B2F, 0x16B40, 0x16B43,
+    0x16B63, 0x16B77, 0x16B7D, 0x16B8F, 0x16D40, 0x16D6C, 0x16E40, 0x16E7F, 0x16EA0, 0x16EB8, 0x16EBB, 0x16ED3,
+    0x16F00, 0x16F4A, 0x16F50, 0x16F50, 0x16F93, 0x16F9F, 0x16FE0, 0x16FE1, 0x16FE3, 0x16FE3, 0x16FF2, 0x16FF6,
+    0x17000, 0x18CD5, 0x18CFF, 0x18D1E, 0x18D80, 0x18DF2, 0x1AFF0, 0x1AFF3, 0x1AFF5, 0x1AFFB, 0x1AFFD, 0x1AFFE,
+    0x1B000, 0x1B122, 0x1B132, 0x1B132, 0x1B150, 0x1B152, 0x1B155, 0x1B155, 0x1B164, 0x1B167, 0x1B170, 0x1B2FB,
+    0x1BC00, 0x1BC6A, 0x1BC70, 0x1BC7C, 0x1BC80, 0x1BC88, 0x1BC90, 0x1BC99, 0x1D400, 0x1D454, 0x1D456, 0x1D49C,
+    0x1D49E, 0x1D49F, 0x1D4A2, 0x1D4A2, 0x1D4A5, 0x1D4A6, 0x1D4A9, 0x1D4AC, 0x1D4AE, 0x1D4B9, 0x1D4BB, 0x1D4BB,
+    0x1D4BD, 0x1D4C3, 0x1D4C5, 0x1D505, 0x1D507, 0x1D50A, 0x1D50D, 0x1D514, 0x1D516, 0x1D51C, 0x1D51E, 0x1D539,
+    0x1D53B, 0x1D53E, 0x1D540, 0x1D544, 0x1D546, 0x1D546, 0x1D54A, 0x1D550, 0x1D552, 0x1D6A5, 0x1D6A8, 0x1D6C0,
+    0x1D6C2, 0x1D6DA, 0x1D6DC, 0x1D6FA, 0x1D6FC, 0x1D714, 0x1D716, 0x1D734, 0x1D736, 0x1D74E, 0x1D750, 0x1D76E,
+    0x1D770, 0x1D788, 0x1D78A, 0x1D7A8, 0x1D7AA, 0x1D7C2, 0x1D7C4, 0x1D7CB, 0x1DF00, 0x1DF1E, 0x1DF25, 0x1DF2A,
+    0x1E030, 0x1E06D, 0x1E100, 0x1E12C, 0x1E137, 0x1E13D, 0x1E14E, 0x1E14E, 0x1E290, 0x1E2AD, 0x1E2C0, 0x1E2EB,
+    0x1E4D0, 0x1E4EB, 0x1E5D0, 0x1E5ED, 0x1E5F0, 0x1E5F0, 0x1E6C0, 0x1E6DE, 0x1E6E0, 0x1E6E2, 0x1E6E4, 0x1E6E5,
+    0x1E6E7, 0x1E6ED, 0x1E6F0, 0x1E6F4, 0x1E6FE, 0x1E6FF, 0x1E7E0, 0x1E7E6, 0x1E7E8, 0x1E7EB, 0x1E7ED, 0x1E7EE,
+    0x1E7F0, 0x1E7FE, 0x1E800, 0x1E8C4, 0x1E900, 0x1E943, 0x1E94B, 0x1E94B, 0x1EE00, 0x1EE03, 0x1EE05, 0x1EE1F,
+    0x1EE21, 0x1EE22, 0x1EE24, 0x1EE24, 0x1EE27, 0x1EE27, 0x1EE29, 0x1EE32, 0x1EE34, 0x1EE37, 0x1EE39, 0x1EE39,
+    0x1EE3B, 0x1EE3B, 0x1EE42, 0x1EE42, 0x1EE47, 0x1EE47, 0x1EE49, 0x1EE49, 0x1EE4B, 0x1EE4B, 0x1EE4D, 0x1EE4F,
+    0x1EE51, 0x1EE52, 0x1EE54, 0x1EE54, 0x1EE57, 0x1EE57, 0x1EE59, 0x1EE59, 0x1EE5B, 0x1EE5B, 0x1EE5D, 0x1EE5D,
+    0x1EE5F, 0x1EE5F, 0x1EE61, 0x1EE62, 0x1EE64, 0x1EE64, 0x1EE67, 0x1EE6A, 0x1EE6C, 0x1EE72, 0x1EE74, 0x1EE77,
+    0x1EE79, 0x1EE7C, 0x1EE7E, 0x1EE7E, 0x1EE80, 0x1EE89, 0x1EE8B, 0x1EE9B, 0x1EEA1, 0x1EEA3, 0x1EEA5, 0x1EEA9,
+    0x1EEAB, 0x1EEBB, 0x20000, 0x2A6DF, 0x2A700, 0x2B81D, 0x2B820, 0x2CEAD, 0x2CEB0, 0x2EBE0, 0x2EBF0, 0x2EE5D,
+    0x2F800, 0x2FA1D, 0x30000, 0x3134A, 0x31350, 0x33479,
 };
 
+/// Unicode 17.0.0 general categories, generated from UnicodeData.txt.
+/// IdentifierPart keeps everything IdentifierStart admits and adds the Mn,
+/// Mc, Nd and Pc categories, plus U+200C ZWNJ and U+200D ZWJ, which 7.6 names
+/// directly. Only the additions IdentifierStart does not already carry are
+/// listed here.
+/// Data license: https://www.unicode.org/license.txt
 const json5_identifier_part_extra_ranges = [_]u21{
-    0x30,    0x39,    0x5F,    0x5F,    0xB7,    0xB7,    0x300,   0x36F,   0x387,   0x387,   0x483,   0x487,
-    0x591,   0x5BD,   0x5BF,   0x5BF,   0x5C1,   0x5C2,   0x5C4,   0x5C5,   0x5C7,   0x5C7,   0x610,   0x61A,
-    0x64B,   0x669,   0x670,   0x670,   0x6D6,   0x6DC,   0x6DF,   0x6E4,   0x6E7,   0x6E8,   0x6EA,   0x6ED,
-    0x6F0,   0x6F9,   0x711,   0x711,   0x730,   0x74A,   0x7A6,   0x7B0,   0x7C0,   0x7C9,   0x7EB,   0x7F3,
-    0x7FD,   0x7FD,   0x816,   0x819,   0x81B,   0x823,   0x825,   0x827,   0x829,   0x82D,   0x859,   0x85B,
-    0x897,   0x89F,   0x8CA,   0x8E1,   0x8E3,   0x903,   0x93A,   0x93C,   0x93E,   0x94F,   0x951,   0x957,
-    0x962,   0x963,   0x966,   0x96F,   0x981,   0x983,   0x9BC,   0x9BC,   0x9BE,   0x9C4,   0x9C7,   0x9C8,
-    0x9CB,   0x9CD,   0x9D7,   0x9D7,   0x9E2,   0x9E3,   0x9E6,   0x9EF,   0x9FE,   0x9FE,   0xA01,   0xA03,
-    0xA3C,   0xA3C,   0xA3E,   0xA42,   0xA47,   0xA48,   0xA4B,   0xA4D,   0xA51,   0xA51,   0xA66,   0xA71,
-    0xA75,   0xA75,   0xA81,   0xA83,   0xABC,   0xABC,   0xABE,   0xAC5,   0xAC7,   0xAC9,   0xACB,   0xACD,
-    0xAE2,   0xAE3,   0xAE6,   0xAEF,   0xAFA,   0xAFF,   0xB01,   0xB03,   0xB3C,   0xB3C,   0xB3E,   0xB44,
-    0xB47,   0xB48,   0xB4B,   0xB4D,   0xB55,   0xB57,   0xB62,   0xB63,   0xB66,   0xB6F,   0xB82,   0xB82,
-    0xBBE,   0xBC2,   0xBC6,   0xBC8,   0xBCA,   0xBCD,   0xBD7,   0xBD7,   0xBE6,   0xBEF,   0xC00,   0xC04,
-    0xC3C,   0xC3C,   0xC3E,   0xC44,   0xC46,   0xC48,   0xC4A,   0xC4D,   0xC55,   0xC56,   0xC62,   0xC63,
-    0xC66,   0xC6F,   0xC81,   0xC83,   0xCBC,   0xCBC,   0xCBE,   0xCC4,   0xCC6,   0xCC8,   0xCCA,   0xCCD,
-    0xCD5,   0xCD6,   0xCE2,   0xCE3,   0xCE6,   0xCEF,   0xCF3,   0xCF3,   0xD00,   0xD03,   0xD3B,   0xD3C,
-    0xD3E,   0xD44,   0xD46,   0xD48,   0xD4A,   0xD4D,   0xD57,   0xD57,   0xD62,   0xD63,   0xD66,   0xD6F,
-    0xD81,   0xD83,   0xDCA,   0xDCA,   0xDCF,   0xDD4,   0xDD6,   0xDD6,   0xDD8,   0xDDF,   0xDE6,   0xDEF,
-    0xDF2,   0xDF3,   0xE31,   0xE31,   0xE34,   0xE3A,   0xE47,   0xE4E,   0xE50,   0xE59,   0xEB1,   0xEB1,
-    0xEB4,   0xEBC,   0xEC8,   0xECE,   0xED0,   0xED9,   0xF18,   0xF19,   0xF20,   0xF29,   0xF35,   0xF35,
-    0xF37,   0xF37,   0xF39,   0xF39,   0xF3E,   0xF3F,   0xF71,   0xF84,   0xF86,   0xF87,   0xF8D,   0xF97,
-    0xF99,   0xFBC,   0xFC6,   0xFC6,   0x102B,  0x103E,  0x1040,  0x1049,  0x1056,  0x1059,  0x105E,  0x1060,
-    0x1062,  0x1064,  0x1067,  0x106D,  0x1071,  0x1074,  0x1082,  0x108D,  0x108F,  0x109D,  0x135D,  0x135F,
-    0x1369,  0x1371,  0x1712,  0x1715,  0x1732,  0x1734,  0x1752,  0x1753,  0x1772,  0x1773,  0x17B4,  0x17D3,
-    0x17DD,  0x17DD,  0x17E0,  0x17E9,  0x180B,  0x180D,  0x180F,  0x1819,  0x18A9,  0x18A9,  0x1920,  0x192B,
-    0x1930,  0x193B,  0x1946,  0x194F,  0x19D0,  0x19DA,  0x1A17,  0x1A1B,  0x1A55,  0x1A5E,  0x1A60,  0x1A7C,
-    0x1A7F,  0x1A89,  0x1A90,  0x1A99,  0x1AB0,  0x1ABD,  0x1ABF,  0x1ADD,  0x1AE0,  0x1AEB,  0x1B00,  0x1B04,
-    0x1B34,  0x1B44,  0x1B50,  0x1B59,  0x1B6B,  0x1B73,  0x1B80,  0x1B82,  0x1BA1,  0x1BAD,  0x1BB0,  0x1BB9,
-    0x1BE6,  0x1BF3,  0x1C24,  0x1C37,  0x1C40,  0x1C49,  0x1C50,  0x1C59,  0x1CD0,  0x1CD2,  0x1CD4,  0x1CE8,
-    0x1CED,  0x1CED,  0x1CF4,  0x1CF4,  0x1CF7,  0x1CF9,  0x1DC0,  0x1DFF,  0x200C,  0x200D,  0x203F,  0x2040,
-    0x2054,  0x2054,  0x20D0,  0x20DC,  0x20E1,  0x20E1,  0x20E5,  0x20F0,  0x2CEF,  0x2CF1,  0x2D7F,  0x2D7F,
-    0x2DE0,  0x2DFF,  0x302A,  0x302F,  0x3099,  0x309A,  0x30FB,  0x30FB,  0xA620,  0xA629,  0xA66F,  0xA66F,
-    0xA674,  0xA67D,  0xA69E,  0xA69F,  0xA6F0,  0xA6F1,  0xA802,  0xA802,  0xA806,  0xA806,  0xA80B,  0xA80B,
-    0xA823,  0xA827,  0xA82C,  0xA82C,  0xA880,  0xA881,  0xA8B4,  0xA8C5,  0xA8D0,  0xA8D9,  0xA8E0,  0xA8F1,
-    0xA8FF,  0xA909,  0xA926,  0xA92D,  0xA947,  0xA953,  0xA980,  0xA983,  0xA9B3,  0xA9C0,  0xA9D0,  0xA9D9,
-    0xA9E5,  0xA9E5,  0xA9F0,  0xA9F9,  0xAA29,  0xAA36,  0xAA43,  0xAA43,  0xAA4C,  0xAA4D,  0xAA50,  0xAA59,
-    0xAA7B,  0xAA7D,  0xAAB0,  0xAAB0,  0xAAB2,  0xAAB4,  0xAAB7,  0xAAB8,  0xAABE,  0xAABF,  0xAAC1,  0xAAC1,
-    0xAAEB,  0xAAEF,  0xAAF5,  0xAAF6,  0xABE3,  0xABEA,  0xABEC,  0xABED,  0xABF0,  0xABF9,  0xFB1E,  0xFB1E,
-    0xFE00,  0xFE0F,  0xFE20,  0xFE2F,  0xFE33,  0xFE34,  0xFE4D,  0xFE4F,  0xFF10,  0xFF19,  0xFF3F,  0xFF3F,
-    0xFF65,  0xFF65,  0x101FD, 0x101FD, 0x102E0, 0x102E0, 0x10376, 0x1037A, 0x104A0, 0x104A9, 0x10A01, 0x10A03,
-    0x10A05, 0x10A06, 0x10A0C, 0x10A0F, 0x10A38, 0x10A3A, 0x10A3F, 0x10A3F, 0x10AE5, 0x10AE6, 0x10D24, 0x10D27,
-    0x10D30, 0x10D39, 0x10D40, 0x10D49, 0x10D69, 0x10D6D, 0x10EAB, 0x10EAC, 0x10EFA, 0x10EFF, 0x10F46, 0x10F50,
-    0x10F82, 0x10F85, 0x11000, 0x11002, 0x11038, 0x11046, 0x11066, 0x11070, 0x11073, 0x11074, 0x1107F, 0x11082,
-    0x110B0, 0x110BA, 0x110C2, 0x110C2, 0x110F0, 0x110F9, 0x11100, 0x11102, 0x11127, 0x11134, 0x11136, 0x1113F,
-    0x11145, 0x11146, 0x11173, 0x11173, 0x11180, 0x11182, 0x111B3, 0x111C0, 0x111C9, 0x111CC, 0x111CE, 0x111D9,
-    0x1122C, 0x11237, 0x1123E, 0x1123E, 0x11241, 0x11241, 0x112DF, 0x112EA, 0x112F0, 0x112F9, 0x11300, 0x11303,
-    0x1133B, 0x1133C, 0x1133E, 0x11344, 0x11347, 0x11348, 0x1134B, 0x1134D, 0x11357, 0x11357, 0x11362, 0x11363,
-    0x11366, 0x1136C, 0x11370, 0x11374, 0x113B8, 0x113C0, 0x113C2, 0x113C2, 0x113C5, 0x113C5, 0x113C7, 0x113CA,
-    0x113CC, 0x113D0, 0x113D2, 0x113D2, 0x113E1, 0x113E2, 0x11435, 0x11446, 0x11450, 0x11459, 0x1145E, 0x1145E,
-    0x114B0, 0x114C3, 0x114D0, 0x114D9, 0x115AF, 0x115B5, 0x115B8, 0x115C0, 0x115DC, 0x115DD, 0x11630, 0x11640,
-    0x11650, 0x11659, 0x116AB, 0x116B7, 0x116C0, 0x116C9, 0x116D0, 0x116E3, 0x1171D, 0x1172B, 0x11730, 0x11739,
-    0x1182C, 0x1183A, 0x118E0, 0x118E9, 0x11930, 0x11935, 0x11937, 0x11938, 0x1193B, 0x1193E, 0x11940, 0x11940,
-    0x11942, 0x11943, 0x11950, 0x11959, 0x119D1, 0x119D7, 0x119DA, 0x119E0, 0x119E4, 0x119E4, 0x11A01, 0x11A0A,
-    0x11A33, 0x11A39, 0x11A3B, 0x11A3E, 0x11A47, 0x11A47, 0x11A51, 0x11A5B, 0x11A8A, 0x11A99, 0x11B60, 0x11B67,
-    0x11BF0, 0x11BF9, 0x11C2F, 0x11C36, 0x11C38, 0x11C3F, 0x11C50, 0x11C59, 0x11C92, 0x11CA7, 0x11CA9, 0x11CB6,
-    0x11D31, 0x11D36, 0x11D3A, 0x11D3A, 0x11D3C, 0x11D3D, 0x11D3F, 0x11D45, 0x11D47, 0x11D47, 0x11D50, 0x11D59,
-    0x11D8A, 0x11D8E, 0x11D90, 0x11D91, 0x11D93, 0x11D97, 0x11DA0, 0x11DA9, 0x11DE0, 0x11DE9, 0x11EF3, 0x11EF6,
-    0x11F00, 0x11F01, 0x11F03, 0x11F03, 0x11F34, 0x11F3A, 0x11F3E, 0x11F42, 0x11F50, 0x11F5A, 0x13440, 0x13440,
-    0x13447, 0x13455, 0x1611E, 0x16139, 0x16A60, 0x16A69, 0x16AC0, 0x16AC9, 0x16AF0, 0x16AF4, 0x16B30, 0x16B36,
-    0x16B50, 0x16B59, 0x16D70, 0x16D79, 0x16F4F, 0x16F4F, 0x16F51, 0x16F87, 0x16F8F, 0x16F92, 0x16FE4, 0x16FE4,
-    0x16FF0, 0x16FF1, 0x1BC9D, 0x1BC9E, 0x1CCF0, 0x1CCF9, 0x1CF00, 0x1CF2D, 0x1CF30, 0x1CF46, 0x1D165, 0x1D169,
-    0x1D16D, 0x1D172, 0x1D17B, 0x1D182, 0x1D185, 0x1D18B, 0x1D1AA, 0x1D1AD, 0x1D242, 0x1D244, 0x1D7CE, 0x1D7FF,
-    0x1DA00, 0x1DA36, 0x1DA3B, 0x1DA6C, 0x1DA75, 0x1DA75, 0x1DA84, 0x1DA84, 0x1DA9B, 0x1DA9F, 0x1DAA1, 0x1DAAF,
-    0x1E000, 0x1E006, 0x1E008, 0x1E018, 0x1E01B, 0x1E021, 0x1E023, 0x1E024, 0x1E026, 0x1E02A, 0x1E08F, 0x1E08F,
-    0x1E130, 0x1E136, 0x1E140, 0x1E149, 0x1E2AE, 0x1E2AE, 0x1E2EC, 0x1E2F9, 0x1E4EC, 0x1E4F9, 0x1E5EE, 0x1E5EF,
-    0x1E5F1, 0x1E5FA, 0x1E6E3, 0x1E6E3, 0x1E6E6, 0x1E6E6, 0x1E6EE, 0x1E6EF, 0x1E6F5, 0x1E6F5, 0x1E8D0, 0x1E8D6,
-    0x1E944, 0x1E94A, 0x1E950, 0x1E959, 0x1FBF0, 0x1FBF9, 0xE0100, 0xE01EF,
+    0x30,    0x39,    0x5F,    0x5F,    0x300,   0x36F,   0x483,   0x487,   0x591,   0x5BD,   0x5BF,   0x5BF,
+    0x5C1,   0x5C2,   0x5C4,   0x5C5,   0x5C7,   0x5C7,   0x610,   0x61A,   0x64B,   0x669,   0x670,   0x670,
+    0x6D6,   0x6DC,   0x6DF,   0x6E4,   0x6E7,   0x6E8,   0x6EA,   0x6ED,   0x6F0,   0x6F9,   0x711,   0x711,
+    0x730,   0x74A,   0x7A6,   0x7B0,   0x7C0,   0x7C9,   0x7EB,   0x7F3,   0x7FD,   0x7FD,   0x816,   0x819,
+    0x81B,   0x823,   0x825,   0x827,   0x829,   0x82D,   0x859,   0x85B,   0x897,   0x89F,   0x8CA,   0x8E1,
+    0x8E3,   0x903,   0x93A,   0x93C,   0x93E,   0x94F,   0x951,   0x957,   0x962,   0x963,   0x966,   0x96F,
+    0x981,   0x983,   0x9BC,   0x9BC,   0x9BE,   0x9C4,   0x9C7,   0x9C8,   0x9CB,   0x9CD,   0x9D7,   0x9D7,
+    0x9E2,   0x9E3,   0x9E6,   0x9EF,   0x9FE,   0x9FE,   0xA01,   0xA03,   0xA3C,   0xA3C,   0xA3E,   0xA42,
+    0xA47,   0xA48,   0xA4B,   0xA4D,   0xA51,   0xA51,   0xA66,   0xA71,   0xA75,   0xA75,   0xA81,   0xA83,
+    0xABC,   0xABC,   0xABE,   0xAC5,   0xAC7,   0xAC9,   0xACB,   0xACD,   0xAE2,   0xAE3,   0xAE6,   0xAEF,
+    0xAFA,   0xAFF,   0xB01,   0xB03,   0xB3C,   0xB3C,   0xB3E,   0xB44,   0xB47,   0xB48,   0xB4B,   0xB4D,
+    0xB55,   0xB57,   0xB62,   0xB63,   0xB66,   0xB6F,   0xB82,   0xB82,   0xBBE,   0xBC2,   0xBC6,   0xBC8,
+    0xBCA,   0xBCD,   0xBD7,   0xBD7,   0xBE6,   0xBEF,   0xC00,   0xC04,   0xC3C,   0xC3C,   0xC3E,   0xC44,
+    0xC46,   0xC48,   0xC4A,   0xC4D,   0xC55,   0xC56,   0xC62,   0xC63,   0xC66,   0xC6F,   0xC81,   0xC83,
+    0xCBC,   0xCBC,   0xCBE,   0xCC4,   0xCC6,   0xCC8,   0xCCA,   0xCCD,   0xCD5,   0xCD6,   0xCE2,   0xCE3,
+    0xCE6,   0xCEF,   0xCF3,   0xCF3,   0xD00,   0xD03,   0xD3B,   0xD3C,   0xD3E,   0xD44,   0xD46,   0xD48,
+    0xD4A,   0xD4D,   0xD57,   0xD57,   0xD62,   0xD63,   0xD66,   0xD6F,   0xD81,   0xD83,   0xDCA,   0xDCA,
+    0xDCF,   0xDD4,   0xDD6,   0xDD6,   0xDD8,   0xDDF,   0xDE6,   0xDEF,   0xDF2,   0xDF3,   0xE31,   0xE31,
+    0xE34,   0xE3A,   0xE47,   0xE4E,   0xE50,   0xE59,   0xEB1,   0xEB1,   0xEB4,   0xEBC,   0xEC8,   0xECE,
+    0xED0,   0xED9,   0xF18,   0xF19,   0xF20,   0xF29,   0xF35,   0xF35,   0xF37,   0xF37,   0xF39,   0xF39,
+    0xF3E,   0xF3F,   0xF71,   0xF84,   0xF86,   0xF87,   0xF8D,   0xF97,   0xF99,   0xFBC,   0xFC6,   0xFC6,
+    0x102B,  0x103E,  0x1040,  0x1049,  0x1056,  0x1059,  0x105E,  0x1060,  0x1062,  0x1064,  0x1067,  0x106D,
+    0x1071,  0x1074,  0x1082,  0x108D,  0x108F,  0x109D,  0x135D,  0x135F,  0x1712,  0x1715,  0x1732,  0x1734,
+    0x1752,  0x1753,  0x1772,  0x1773,  0x17B4,  0x17D3,  0x17DD,  0x17DD,  0x17E0,  0x17E9,  0x180B,  0x180D,
+    0x180F,  0x1819,  0x1885,  0x1886,  0x18A9,  0x18A9,  0x1920,  0x192B,  0x1930,  0x193B,  0x1946,  0x194F,
+    0x19D0,  0x19D9,  0x1A17,  0x1A1B,  0x1A55,  0x1A5E,  0x1A60,  0x1A7C,  0x1A7F,  0x1A89,  0x1A90,  0x1A99,
+    0x1AB0,  0x1ABD,  0x1ABF,  0x1ADD,  0x1AE0,  0x1AEB,  0x1B00,  0x1B04,  0x1B34,  0x1B44,  0x1B50,  0x1B59,
+    0x1B6B,  0x1B73,  0x1B80,  0x1B82,  0x1BA1,  0x1BAD,  0x1BB0,  0x1BB9,  0x1BE6,  0x1BF3,  0x1C24,  0x1C37,
+    0x1C40,  0x1C49,  0x1C50,  0x1C59,  0x1CD0,  0x1CD2,  0x1CD4,  0x1CE8,  0x1CED,  0x1CED,  0x1CF4,  0x1CF4,
+    0x1CF7,  0x1CF9,  0x1DC0,  0x1DFF,  0x200C,  0x200D,  0x203F,  0x2040,  0x2054,  0x2054,  0x20D0,  0x20DC,
+    0x20E1,  0x20E1,  0x20E5,  0x20F0,  0x2CEF,  0x2CF1,  0x2D7F,  0x2D7F,  0x2DE0,  0x2DFF,  0x302A,  0x302F,
+    0x3099,  0x309A,  0xA620,  0xA629,  0xA66F,  0xA66F,  0xA674,  0xA67D,  0xA69E,  0xA69F,  0xA6F0,  0xA6F1,
+    0xA802,  0xA802,  0xA806,  0xA806,  0xA80B,  0xA80B,  0xA823,  0xA827,  0xA82C,  0xA82C,  0xA880,  0xA881,
+    0xA8B4,  0xA8C5,  0xA8D0,  0xA8D9,  0xA8E0,  0xA8F1,  0xA8FF,  0xA909,  0xA926,  0xA92D,  0xA947,  0xA953,
+    0xA980,  0xA983,  0xA9B3,  0xA9C0,  0xA9D0,  0xA9D9,  0xA9E5,  0xA9E5,  0xA9F0,  0xA9F9,  0xAA29,  0xAA36,
+    0xAA43,  0xAA43,  0xAA4C,  0xAA4D,  0xAA50,  0xAA59,  0xAA7B,  0xAA7D,  0xAAB0,  0xAAB0,  0xAAB2,  0xAAB4,
+    0xAAB7,  0xAAB8,  0xAABE,  0xAABF,  0xAAC1,  0xAAC1,  0xAAEB,  0xAAEF,  0xAAF5,  0xAAF6,  0xABE3,  0xABEA,
+    0xABEC,  0xABED,  0xABF0,  0xABF9,  0xFB1E,  0xFB1E,  0xFE00,  0xFE0F,  0xFE20,  0xFE2F,  0xFE33,  0xFE34,
+    0xFE4D,  0xFE4F,  0xFF10,  0xFF19,  0xFF3F,  0xFF3F,  0x101FD, 0x101FD, 0x102E0, 0x102E0, 0x10376, 0x1037A,
+    0x104A0, 0x104A9, 0x10A01, 0x10A03, 0x10A05, 0x10A06, 0x10A0C, 0x10A0F, 0x10A38, 0x10A3A, 0x10A3F, 0x10A3F,
+    0x10AE5, 0x10AE6, 0x10D24, 0x10D27, 0x10D30, 0x10D39, 0x10D40, 0x10D49, 0x10D69, 0x10D6D, 0x10EAB, 0x10EAC,
+    0x10EFA, 0x10EFF, 0x10F46, 0x10F50, 0x10F82, 0x10F85, 0x11000, 0x11002, 0x11038, 0x11046, 0x11066, 0x11070,
+    0x11073, 0x11074, 0x1107F, 0x11082, 0x110B0, 0x110BA, 0x110C2, 0x110C2, 0x110F0, 0x110F9, 0x11100, 0x11102,
+    0x11127, 0x11134, 0x11136, 0x1113F, 0x11145, 0x11146, 0x11173, 0x11173, 0x11180, 0x11182, 0x111B3, 0x111C0,
+    0x111C9, 0x111CC, 0x111CE, 0x111D9, 0x1122C, 0x11237, 0x1123E, 0x1123E, 0x11241, 0x11241, 0x112DF, 0x112EA,
+    0x112F0, 0x112F9, 0x11300, 0x11303, 0x1133B, 0x1133C, 0x1133E, 0x11344, 0x11347, 0x11348, 0x1134B, 0x1134D,
+    0x11357, 0x11357, 0x11362, 0x11363, 0x11366, 0x1136C, 0x11370, 0x11374, 0x113B8, 0x113C0, 0x113C2, 0x113C2,
+    0x113C5, 0x113C5, 0x113C7, 0x113CA, 0x113CC, 0x113D0, 0x113D2, 0x113D2, 0x113E1, 0x113E2, 0x11435, 0x11446,
+    0x11450, 0x11459, 0x1145E, 0x1145E, 0x114B0, 0x114C3, 0x114D0, 0x114D9, 0x115AF, 0x115B5, 0x115B8, 0x115C0,
+    0x115DC, 0x115DD, 0x11630, 0x11640, 0x11650, 0x11659, 0x116AB, 0x116B7, 0x116C0, 0x116C9, 0x116D0, 0x116E3,
+    0x1171D, 0x1172B, 0x11730, 0x11739, 0x1182C, 0x1183A, 0x118E0, 0x118E9, 0x11930, 0x11935, 0x11937, 0x11938,
+    0x1193B, 0x1193E, 0x11940, 0x11940, 0x11942, 0x11943, 0x11950, 0x11959, 0x119D1, 0x119D7, 0x119DA, 0x119E0,
+    0x119E4, 0x119E4, 0x11A01, 0x11A0A, 0x11A33, 0x11A39, 0x11A3B, 0x11A3E, 0x11A47, 0x11A47, 0x11A51, 0x11A5B,
+    0x11A8A, 0x11A99, 0x11B60, 0x11B67, 0x11BF0, 0x11BF9, 0x11C2F, 0x11C36, 0x11C38, 0x11C3F, 0x11C50, 0x11C59,
+    0x11C92, 0x11CA7, 0x11CA9, 0x11CB6, 0x11D31, 0x11D36, 0x11D3A, 0x11D3A, 0x11D3C, 0x11D3D, 0x11D3F, 0x11D45,
+    0x11D47, 0x11D47, 0x11D50, 0x11D59, 0x11D8A, 0x11D8E, 0x11D90, 0x11D91, 0x11D93, 0x11D97, 0x11DA0, 0x11DA9,
+    0x11DE0, 0x11DE9, 0x11EF3, 0x11EF6, 0x11F00, 0x11F01, 0x11F03, 0x11F03, 0x11F34, 0x11F3A, 0x11F3E, 0x11F42,
+    0x11F50, 0x11F5A, 0x13440, 0x13440, 0x13447, 0x13455, 0x1611E, 0x16139, 0x16A60, 0x16A69, 0x16AC0, 0x16AC9,
+    0x16AF0, 0x16AF4, 0x16B30, 0x16B36, 0x16B50, 0x16B59, 0x16D70, 0x16D79, 0x16F4F, 0x16F4F, 0x16F51, 0x16F87,
+    0x16F8F, 0x16F92, 0x16FE4, 0x16FE4, 0x16FF0, 0x16FF1, 0x1BC9D, 0x1BC9E, 0x1CCF0, 0x1CCF9, 0x1CF00, 0x1CF2D,
+    0x1CF30, 0x1CF46, 0x1D165, 0x1D169, 0x1D16D, 0x1D172, 0x1D17B, 0x1D182, 0x1D185, 0x1D18B, 0x1D1AA, 0x1D1AD,
+    0x1D242, 0x1D244, 0x1D7CE, 0x1D7FF, 0x1DA00, 0x1DA36, 0x1DA3B, 0x1DA6C, 0x1DA75, 0x1DA75, 0x1DA84, 0x1DA84,
+    0x1DA9B, 0x1DA9F, 0x1DAA1, 0x1DAAF, 0x1E000, 0x1E006, 0x1E008, 0x1E018, 0x1E01B, 0x1E021, 0x1E023, 0x1E024,
+    0x1E026, 0x1E02A, 0x1E08F, 0x1E08F, 0x1E130, 0x1E136, 0x1E140, 0x1E149, 0x1E2AE, 0x1E2AE, 0x1E2EC, 0x1E2F9,
+    0x1E4EC, 0x1E4F9, 0x1E5EE, 0x1E5EF, 0x1E5F1, 0x1E5FA, 0x1E6E3, 0x1E6E3, 0x1E6E6, 0x1E6E6, 0x1E6EE, 0x1E6EF,
+    0x1E6F5, 0x1E6F5, 0x1E8D0, 0x1E8D6, 0x1E944, 0x1E94A, 0x1E950, 0x1E959, 0x1FBF0, 0x1FBF9, 0xE0100, 0xE01EF,
 };
 
 const Json5IdentifierCodepoint = struct {
@@ -2464,6 +2909,194 @@ test "JSON5 ASCII identifiers preserve continuation and fallback boundaries" {
         .json5,
     );
     try testing.expectEqual(@as(usize, 2), diagnostic.byte_offset);
+}
+
+// ECMA-262 5.1 7.6 defines IdentifierStart as UnicodeLetter, meaning Lu, Ll,
+// Lt, Lm, Lo or Nl, plus $ and _. Other_ID_Start, which ID_Start carries on top
+// of those categories, contains no letter at all, so 7.6 admits none of it and
+// rejects every member. Membership in Other_ID_Start therefore decides this
+// grammar, and the tables carry the categories rather than ID_Start.
+test "parser audit: JSON5 IdentifierName rejects non-letter identifier starts" {
+    const illegal_starts = [_][]const u8{
+        // Other_ID_Start: Mn, Mn, Sm, So, Sk, Sk.
+        "{\u{1885}:0}", "{\\u1885:0}",
+        "{\u{1886}:0}", "{\\u1886:0}",
+        "{\u{2118}:0}", "{\\u2118:0}",
+        "{\u{212E}:0}", "{\\u212E:0}",
+        "{\u{309B}:0}", "{\\u309B:0}",
+        "{\u{309C}:0}", "{\\u309C:0}",
+        // Other_Number, which is not the Nl category 7.6 admits.
+        "{\u{00B2}:0}", "{\\u00B2:0}",
+        "{\u{2070}:0}", "{\\u2070:0}",
+        "{\u{2150}:0}", "{\\u2150:0}",
+        "{\u{2460}:0}", "{\\u2460:0}",
+    };
+    for (illegal_starts) |input| {
+        var structural_index = try indexJson5ForTest(testing.allocator, input);
+        defer structural_index.deinit(testing.allocator);
+        const diagnostic = try expectDialectStage2Diagnostic(
+            error.UnexpectedToken,
+            input,
+            &structural_index,
+            .json5,
+        );
+        try testing.expectEqual(@as(usize, 1), diagnostic.byte_offset);
+    }
+}
+
+test "parser audit: JSON5 IdentifierName rejects non-letter identifier continuations" {
+    // IdentifierPart adds Mn, Mc, Nd and Pc to IdentifierStart and names ZWNJ
+    // and ZWJ directly. Modern ID_Continue adds the Unicode 16.0.0
+    // Other_ID_Continue set, whose members are Po and No code points that none
+    // of those categories covers.
+    const illegal_continuations = [_][]const u8{
+        "{a\u{00B7}b:0}", "{a\\u00B7b:0}",
+        "{a\u{0387}b:0}", "{a\\u0387b:0}",
+        "{a\u{30FB}b:0}", "{a\\u30FBb:0}",
+        "{a\u{FF65}b:0}", "{a\\uFF65b:0}",
+        "{a\u{1369}b:0}", "{a\\u1369b:0}",
+        "{a\u{19DA}b:0}", "{a\\u19DAb:0}",
+        "{a\u{00B2}b:0}", "{a\\u00B2b:0}",
+        "{a\u{2070}b:0}", "{a\\u2070b:0}",
+        "{a\u{2150}b:0}", "{a\\u2150b:0}",
+        "{a\u{2460}b:0}", "{a\\u2460b:0}",
+    };
+    for (illegal_continuations) |input| {
+        var structural_index = try indexJson5ForTest(testing.allocator, input);
+        defer structural_index.deinit(testing.allocator);
+        const diagnostic = try expectDialectStage2Diagnostic(
+            error.UnexpectedToken,
+            input,
+            &structural_index,
+            .json5,
+        );
+        try testing.expectEqual(@as(usize, 2), diagnostic.byte_offset);
+    }
+}
+
+test "parser audit: JSON5 IdentifierName accepts ECMA-262 5.1 letter categories" {
+    // IdentifierStart, in order: U+0041 Lu, U+0061 Ll, U+01C5 Lt, U+02B0 Lm,
+    // U+3005 Lm, U+05D0 Lo, U+1100 Lo, U+2160 Nl, then the two characters 7.6
+    // names directly, $ and _.
+    //
+    // IdentifierPart, in order: U+0030 Nd, U+0300 Mn, U+0903 Mc, U+0660 Nd,
+    // U+FF10 Nd, U+203F Pc, then the two join controls 7.6 names directly.
+    //
+    // The remaining entries reach those same categories through a \uHHHH
+    // escape at either position, which 7.6 requires to decide exactly as the
+    // code point it names would.
+    const keys = .{
+        "A",
+        "a",
+        "\u{01C5}",
+        "\u{02B0}",
+        "\u{3005}",
+        "\u{05D0}",
+        "\u{1100}",
+        "\u{2160}",
+        "$",
+        "_",
+        "a0",
+        "a\u{0300}",
+        "a\u{0903}",
+        "a\u{0660}",
+        "a\u{FF10}",
+        "a\u{203F}",
+        "a\u{200C}",
+        "a\u{200D}",
+        "\\u0041",
+        "\\u01C5",
+        "\\u02B0",
+        "\\u05D0",
+        "\\u1100",
+        "\\u2160",
+        "\\u0024",
+        "\\u005F",
+        "a\\u0300",
+        "a\\u0903",
+        "a\\u0660",
+        "a\\u203F",
+        "a\\u200C",
+        "a\\u200D",
+    };
+
+    inline for (keys) |key| {
+        const input: []const u8 = "{" ++ key ++ ":0}";
+        var structural_index = try indexJson5ForTest(testing.allocator, input);
+        defer structural_index.deinit(testing.allocator);
+        var document = try buildTape(testing.allocator, input, &structural_index, .json5);
+        defer document.deinit(testing.allocator);
+
+        var cursor = try document.root(input);
+        try cursor.advance();
+        try testing.expectEqualStrings(key, try cursor.rawValue());
+        try cursor.advance();
+        try testing.expectEqualStrings("0", try cursor.rawValue());
+        try cursor.advance();
+        try testing.expectEqual(TapeKind.object_end, (try cursor.peek()).tapeKind());
+    }
+}
+
+test "parser audit: JSON5 IdentifierName separates Lm letters from Other_ID_Mn marks" {
+    // U+2E2F VERTICAL TILDE is Lm, so 7.6 admits it at every position, even
+    // though Pattern_Syntax is what keeps modern ID_Start from carrying it.
+    inline for (.{ "\u{2E2F}", "\\u2E2F", "a\u{2E2F}", "a\\u2E2F" }) |key| {
+        const input: []const u8 = "{" ++ key ++ ":0}";
+        var structural_index = try indexJson5ForTest(testing.allocator, input);
+        defer structural_index.deinit(testing.allocator);
+        var document = try buildTape(testing.allocator, input, &structural_index, .json5);
+        defer document.deinit(testing.allocator);
+
+        var cursor = try document.root(input);
+        try cursor.advance();
+        try testing.expectEqualStrings(key, try cursor.rawValue());
+        try cursor.advance();
+        try testing.expectEqualStrings("0", try cursor.rawValue());
+        try cursor.advance();
+        try testing.expectEqual(TapeKind.object_end, (try cursor.peek()).tapeKind());
+    }
+
+    // U+1885 and U+1886 are Mn in Unicode 16.0.0. Other_ID_Start lists them,
+    // but IdentifierPart already covers Mn, so neither may open a name.
+    for ([_][]const u8{
+        "{\u{1885}:0}",
+        "{\\u1885:0}",
+        "{\u{1886}:0}",
+        "{\\u1886:0}",
+    }) |input| {
+        try expectJson5Stage2Error(error.UnexpectedToken, input);
+    }
+
+    inline for (.{ "a\u{1885}", "a\u{1886}", "a\\u1885", "a\\u1886" }) |key| {
+        const input: []const u8 = "{" ++ key ++ ":0}";
+        var structural_index = try indexJson5ForTest(testing.allocator, input);
+        defer structural_index.deinit(testing.allocator);
+        var document = try buildTape(testing.allocator, input, &structural_index, .json5);
+        defer document.deinit(testing.allocator);
+
+        var cursor = try document.root(input);
+        try cursor.advance();
+        try testing.expectEqualStrings(key, try cursor.rawValue());
+        try cursor.advance();
+        try testing.expectEqualStrings("0", try cursor.rawValue());
+        try cursor.advance();
+        try testing.expectEqual(TapeKind.object_end, (try cursor.peek()).tapeKind());
+    }
+}
+
+test "parser audit: JSON5 IdentifierName view validation follows the same categories" {
+    const input = "{a\u{00B7}b:1}";
+    const offsets = [_]u32{ 0, 1 };
+    const view = try IndexView.init(input, &offsets, 0);
+
+    const diagnostic = (try validateView(input, view, .json5)) orelse
+        return error.ExpectedDiagnostic;
+    try testing.expectEqual(error.UnexpectedToken, diagnostic.err);
+    try testing.expectEqual(@as(usize, 2), diagnostic.byte_offset);
+    try testing.expectError(
+        error.UnexpectedToken,
+        buildTapeView(testing.allocator, input, view, .json5),
+    );
 }
 
 fn expectStage2Error(expected: Error, input: []const u8) !void {

@@ -22,6 +22,28 @@ own performance baseline is the local record/verify/reproduce contract recorded
 under **Local performance baseline** below; it is a new baseline, not a
 recovery of the external packet.
 
+## Implemented native publication
+
+This is a checkout-only implementation record. The packaged consumer contract is
+the shipped README and attached source declarations; it does not depend on this file.
+
+The registered module is `dependency.module("simd")`. Its build options travel
+with the module. The installed static artifact is `simd-static`; the `simd`
+artifact remains the fixed-sample visualizer, not a parser CLI or a C binding.
+The package ships [README.md](../README.md) and the runnable
+[consumer example](../examples/consumer.zig). Attached source comments carry
+the ownership, source, address-stability, error and default contracts.
+
+These additions preserve the current borrowing and allocator regimes. They do
+not implement the recorded-borrow proposal in the historical design records.
+Stream JSONL mode accepts only the strict JSON dialect. Combining `.mode = .jsonl`
+with `.dialect = .jsonc` or `.json5` returns `error.InvalidOptions` before allocation.
+`zig build example` exercises cleanup, resident leases, index transfer and semantic
+values. `zig build check` includes that example without dropping an existing gate.
+
+---
+
+
 Grounded in: `papers/1902.08318_parsing_gigabytes_of_json_per_second.pdf`,
 `papers/2312.17149_on_demand_json.pdf`, simdjson's upstream On-Demand design
 note and its `json_scanner.h` / `json_structural_indexer.h` / tape design, RFC
@@ -968,8 +990,8 @@ this suite. The YAML extension regressions run through `zig build test`.
 
 `zig build check` is the width gate and the single acceptance command. It runs
 `zig fmt --check` over the Zig sources this repository owns (`build.zig`,
-`build.zig.zon`, `src`, `test`, `scripts`, `library_test.zig`, `bench.zig`,
-`kernel_bench.zig`, `semantic_bench.zig`, `string_bench.zig`), the full test roots at the native
+`build.zig.zon`, `src`, `test`, `scripts`, `examples`, `library_test.zig`,
+`bench.zig`, `kernel_bench.zig`, `semantic_bench.zig`, `string_bench.zig`), the full test roots at the native
 width, the offline corpus and CommonMark suites, the `scripts/benchmark.zig`
 behavior tests once on the host, and a visualizer smoke run, then repeats the
 test roots at the explicit widths `[4, 5, 7, 12, 16, 24, 32, 64]`.
@@ -1031,6 +1053,91 @@ enforces for its own scratch and caches, the `.zig-cache` symlink, the
 the two limits that travel with it are recorded once, in `AGENTS.md` under
 **Scratch storage**. That section is the single record of the storage contract;
 nothing here restates or overrides it.
+
+## Conformance audit repairs
+
+An audit compared each parser with the reference it implements and found rules
+the code held on one path and not on another. Every bullet below names the file
+that owns the rule. These are contracts, not a record of one run.
+
+- `src/formats/commonmark.zig` reads the delimiter after an HTML block tag name
+  from the specification for that type, and the two differ. A type 1 name is
+  followed by a space, a tab, `>` or the end of the line; a type 6 name is also
+  followed by `/>`. So `<pre-x>` opens no `pre` block and `<div/>` does open a
+  `div` block.
+- `src/formats/commonmark.zig` holds the type 6 tag list as the specification
+  writes it, including `frame`, `frameset`, `noframes`, `optgroup`, `option`,
+  `param` and `search`.
+- `src/formats/commonmark.zig` ends a type 1 block at a case-insensitive
+  `</script>`, `</pre>`, `</style>` or `</textarea>`.
+- `src/formats/commonmark.zig` ends types 6 and 7 at a blank line of the
+  containing content, so a container marker alone is a blank line inside a block
+  quote, and that blank line is not part of the block. A blank line is a line of
+  only spaces and tabs.
+- `src/formats/commonmark.zig` starts a type 7 block at a complete tag followed
+  by only spaces and tabs, and refuses a start whose name is one of the four
+  type 1 names.
+- `src/formats/commonmark.zig` requires an ASCII letter after `<!` and ends a
+  declaration at the first `>`.
+- `src/formats/commonmark.zig` reads an inline attribute name with the XML
+  attribute grammar, and an unquoted attribute value excludes `"`, `'`, `=`,
+  `<`, `>` and a backtick.
+- `src/formats/commonmark.zig` honors backslash escapes in a link label,
+  refuses an unescaped `[`, and falls back to the shortcut reference when the
+  label refuses.
+- `src/formats/commonmark.zig` needs whitespace between an angle destination
+  and an inline link title.
+- `src/formats/commonmark.zig` measures a setext underline and a fence indent
+  from the container content start, not from the start of the line.
+- `src/formats/commonmark.zig` percent-encodes a rendered link destination,
+  image source and autolink against the full unsafe set, including `^`, `{`,
+  `|`, `}` and every control byte, and leaves `%` alone so an already encoded
+  destination survives.
+- `src/formats/commonmark.zig` keeps the escaped bytes of raw inline HTML in
+  the alt text of an image.
+- `src/formats/commonmark.zig` adds the `language-` class prefix to a fence info
+  word only when that word does not already start with it.
+- `src/formats/commonmark.zig` escapes `&`, `<`, `>` and `"` in the text and the
+  attribute context alike, and writes an apostrophe through as itself, which is
+  what both pinned references emit.
+- `src/formats/commonmark.zig` renders a list item whose only child was consumed
+  as a link reference definition as `<li></li>`, without the leading newline the
+  other first children need.
+- `src/formats/yaml.zig` decides a reserved indicator with one rule, and every
+  slot that can hold a plain scalar reaches it, a flow key included.
+- `src/formats/yaml.zig` spends one depth budget on open block frames and open
+  flow frames together, so the scalar oracle and the indexed path agree on
+  every document. `yaml_max_depth` stays 1024.
+- `src/formats/yaml_source.zig` permits a literal U+FEFF inside a quoted scalar
+  and an initial UTF-8 BOM. It rejects U+FEFF in plain content, comments and
+  block scalar bodies. Whole-input, resident and streaming source checks share
+  bounded lexical state, so indentation, flow punctuation and line boundaries
+  do not turn plain content into a quoted node. Streaming `reset` clears that
+  state, and source-invalid content overrides an earlier `Unsupported` verdict.
+- `src/formats/yaml_extended.zig` preserves blank breaks beside more-indented
+  folded content. Block header indicators must be contiguous. Complex keys
+  remain outside the profile, including when another node selects the extended
+  parser rather than the basic delegate.
+- `src/formats/markdown.zig` breaks a diagnostic line at CR, at LF and at a
+  CRLF pair. A pair is one two-byte ending whose bytes both belong to the line
+  it terminates, the column of a byte in the pair stays on that line, a snippet
+  holds line content only, and a `byte_offset` past the input clamps to the
+  input length.
+- `MarkdownDocument.word` checks only its tape index, not the stored kind.
+  `MarkdownTapeWord.tapeKind` is an unchecked conversion. An untrusted kind
+  needs `std.enums.fromInt(MarkdownTokenKind, kind)` and a check for `null`;
+  checked navigation rejects unknown tags.
+- `src/core/stage2.zig` validates a JSON5 key as the ECMA-262 5.1
+  `IdentifierName`, not by the modern `ID_Start` and `ID_Continue` properties.
+  A start is `Lu`, `Ll`, `Lt`, `Lm`, `Lo` or `Nl`, `$` or `_`; a continuation
+  adds `Mn`, `Mc`, `Nd`, `Pc`, U+200C and U+200D.
+- `src/core/stage2.zig` carries Unicode 17.0.0 general categories, so `U+2E2F`
+  is a letter and the `Other_ID_Start` and `Other_ID_Continue` code points are
+  not identifiers. One classifier answers for the literal and the escaped form
+  and for all three entry points.
+- `src/core/simd.zig` states the `trailingRunOdd` contract: when every valid
+  lane has its bit set the block adds no clear lane, and the carried-in parity
+  combines with the parity of `valid_count`.
 
 ## Local performance baseline: record, verify, reproduce
 

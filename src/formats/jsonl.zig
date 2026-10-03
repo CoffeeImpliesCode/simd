@@ -1,3 +1,37 @@
+//! JSON Lines: one strict RFC 8259 JSON value per LF-terminated record.
+//!
+//! Reachable as `simd.formats.jsonl`. Records are split on LF bytes that fall
+//! outside a quoted string, a record made only of spaces, tabs, and CR is
+//! skipped, and a CR before the LF stays in the record source. Nothing here
+//! rewrites bytes or decodes values: every span handed back points into the
+//! caller's input, and value-level reading belongs to `simd.json_value`. Line
+//! and block comments are not JSONL; those are `simd.formats.jsonc`.
+//!
+//! Zig has no private fields, so every struct field below is readable and
+//! writable by a consumer; the comments name what a write would break.
+//!
+//! Nothing here synchronizes concurrent access, so a caller that shares one
+//! parser, document, or reader across threads serializes it itself.
+//!
+//! Four routes reach records, and they differ in what stays resident.
+//!
+//! Eager: `buildJsonlTape` owns every record tape at once in a
+//! `JsonlDocument`, and `validateJsonl` reports the first defect in global
+//! coordinates without building a tape. Both allocate one structural index and
+//! release it before returning, and both keep `input` alive for whatever they
+//! hand back.
+//!
+//! Reused lazy: `Parser` owns one index buffer, `initOnDemandDocument` leases
+//! it for a whole document, and `eventReader` or `tokenCursor` walks that
+//! document one event at a time. Release the reader's owning document with
+//! `deinit()`, then the parser with `deinit()`.
+//!
+//! Reused per record: `TapeRecordParser` keeps one structural index and one
+//! high-water record tape, `iterate` borrows a source under a document lease,
+//! and `TapeRecordIterator.next` validates one record at a time.
+//!
+//! Streaming: `initStreamIndexer` produces one global index in `.jsonl` mode,
+//! where a record-separator LF outside a string is itself a structural offset.
 const std = @import("std");
 const simd = @import("../core/simd.zig");
 const json_lexical = @import("../core/json_lexical.zig");
@@ -6,7 +40,22 @@ const stream = @import("../core/stream.zig");
 const resident = @import("../core/resident.zig");
 const stage2 = @import("../core/stage2.zig");
 
-/// Initializes a chunk-fed JSONL Stage 1 indexer with LF framing enabled.
+/// Chunk-fed Stage 1 indexer pinned to the JSONL dialect in `.jsonl` mode.
+///
+/// `.jsonl` mode is what makes an LF outside a quoted string a structural
+/// offset, so the finished index carries record boundaries as well as JSON
+/// structure; the dialect stays `.json` because every record is validated as
+/// strict RFC 8259.
+///
+/// The wrapper fixes the mode and dialect; the caller supplies the allocator,
+/// whose interface this indexer stores. That backing state must outlive both
+/// `indexer.deinit()` and the `index.deinit(allocator)` that releases an index
+/// moved out by `take`, because both free into it. Chunk bytes are borrowed
+/// only for the duration of each `feed` call.
+///
+/// The error set is `stream.StreamIndexer.InitError`, which
+/// `stream.StreamIndexer.init` defines; it includes `error.InvalidOptions` for
+/// a mode and dialect pair this wrapper never forms.
 pub fn initStreamIndexer(
     allocator: std.mem.Allocator,
     chunk_len: usize,
@@ -18,22 +67,44 @@ pub fn initStreamIndexer(
     );
 }
 
-/// One validated JSONL record. The source is a caller-backed view and the tape
-/// is owned by the record document, so a cursor cannot cross record boundaries.
+/// One validated JSONL record, owned tape plus caller-backed source.
+///
+/// `document` owns one tape; `deinit` releases it exactly once with the
+/// allocator `buildJsonlTape` was given, and a copy names that same tape
+/// rather than becoming a second owner. `source` borrows the input
+/// `JsonlDocument` also borrows, so that input must outlive the record, its
+/// cursors, and every raw slice they return. A cursor made here cannot cross
+/// a record boundary: the tape it walks holds this record's words only.
 pub const JsonlRecord = struct {
+    /// Borrows `JsonlDocument.input`; released with the caller's input, not
+    /// here.
     source: []const u8,
+    /// Half-open start of this record in `JsonlDocument.input`.
     source_start: usize,
+    /// Half-open end in that input, excluding the terminating LF and covering
+    /// the CR that precedes it.
     source_end: usize,
+    /// Owned tape for this record alone, released by `deinit`.
     document: stage2.Document,
 
+    /// Creates a cursor over this record's tape and its borrowed source.
+    ///
+    /// This record and the input behind `source` must both outlive the cursor.
+    /// Errors are `stage2.NavigationError`.
     pub fn root(self: *const JsonlRecord) stage2.NavigationError!stage2.TapeCursor {
         return self.document.root(self.source);
     }
 
+    /// Equivalent to `root`.
     pub fn cursor(self: *const JsonlRecord) stage2.NavigationError!stage2.TapeCursor {
         return self.root();
     }
 
+    /// Releases this record's tape and nothing else.
+    ///
+    /// The allocator given to `buildJsonlTape` must be the one passed here, and
+    /// the borrowed `source` is untouched. The record is unusable afterwards
+    /// and a second call is a double free.
     pub fn deinit(self: *JsonlRecord, allocator: std.mem.Allocator) void {
         self.document.deinit(allocator);
         self.* = undefined;
@@ -42,17 +113,32 @@ pub const JsonlRecord = struct {
 
 /// An owned collection of independently validated JSONL records.
 ///
-/// The input and each record source are borrowed from the caller. The record
-/// tapes and metadata are owned by this document.
+/// `input` is borrowed and `records` is owned: the document owns one tape per
+/// record plus the record array, and `deinit` releases all of them exactly
+/// once with the allocator `buildJsonlTape` was given. `input` must outlive
+/// the document, every record, and every cursor and raw slice reached through
+/// them. Blank records are absent from `records`, so its length is the number
+/// of accepted records and a record ordinal indexes it directly.
 pub const JsonlDocument = struct {
+    /// Whole input, borrowed from the caller; must outlive this document.
     input: []const u8,
+    /// Record array in input order; each entry owns its own tape.
     records: []JsonlRecord,
 
+    /// The record at `index`, or `null` when `index` is out of range.
+    ///
+    /// The pointer aliases `records`, so it is invalidated by `deinit` and
+    /// must not outlive it.
     pub fn record(self: *const JsonlDocument, index: usize) ?*const JsonlRecord {
         if (index >= self.records.len) return null;
         return &self.records[index];
     }
 
+    /// A cursor over the record at `index`, or `error.PositionOutOfBounds`
+    /// when `index` is out of range.
+    ///
+    /// The cursor borrows this document's `input` and that record's tape, so
+    /// both must outlive it; further errors are `stage2.NavigationError`.
     pub fn cursor(
         self: *const JsonlDocument,
         index: usize,
@@ -61,6 +147,11 @@ pub const JsonlDocument = struct {
         return record_value.root();
     }
 
+    /// Releases every record tape and the record array.
+    ///
+    /// The allocator given to `buildJsonlTape` must be the one passed here, and
+    /// the borrowed `input` is untouched. The document is unusable afterwards
+    /// and a second call is a double free.
     pub fn deinit(self: *JsonlDocument, allocator: std.mem.Allocator) void {
         for (self.records) |*record_value| {
             record_value.deinit(allocator);
@@ -70,20 +161,36 @@ pub const JsonlDocument = struct {
     }
 };
 
-/// A first-error diagnostic with both record and global source coordinates.
+/// The first JSONL defect, in both record-local and global coordinates.
+///
+/// Every field is a plain value except `snippet`, which borrows the input the
+/// diagnostic was produced from, so the whole struct costs nothing to keep.
 pub const JsonlDiagnostic = struct {
+    /// Ordinal of the failing record among the nonblank records, matching what
+    /// `TapeRecordIterator.recordCount` reports when that record is reached.
     record_index: usize,
+    /// Half-open start of the failing record in the input.
     source_start: usize,
+    /// Half-open end in the input, excluding the record's terminating LF.
     source_end: usize,
     err: stage2.Error,
+    /// Offset of the defect in the whole input, never within the record.
     byte_offset: usize,
+    /// 1-based line number in the whole input.
     line: u32,
+    /// 1-based column number within that line.
     column: u32,
+    /// Borrowed slice of the input around `byte_offset`.
     snippet: []const u8,
+    /// Offset of `snippet` within the input.
     snippet_start: usize,
 };
 
-/// A lazy JSONL event with a source-backed raw span and global offset.
+/// What one JSONL event reports.
+///
+/// `record_start` and `record_end` are framing events this module synthesizes;
+/// the remaining tags are the tape kinds `stage2.TokenReader` produces, with
+/// `.key` naming an object key rather than a `.string` value.
 pub const EventKind = enum {
     record_start,
     record_end,
@@ -99,26 +206,65 @@ pub const EventKind = enum {
     null_literal,
 };
 
+/// One JSONL event: its kind, its global position, and a borrowed source span.
+///
+/// `raw` is never copied, so it stays valid exactly as long as the input it
+/// points into. `EventReader` and `TokenCursor` report end of input with
+/// `null` rather than an event.
 pub const Event = struct {
+    /// Which event this is.
     kind: EventKind,
+    /// Ordinal of the record this event belongs to.
     record_index: u32,
+    /// Offset of the event in the whole input. For `.key` and `.string` it
+    /// names the opening quote, for `.record_start` the first byte of the
+    /// record, and for `.record_end` the byte after it.
     offset: u32,
+    /// Borrowed source span, as `stage2.ParsedToken` defines it: the whole
+    /// record for `.record_start`, empty at `offset` for `.record_end`, and
+    /// the still-escaped content between the quotes for `.key` and `.string`.
     raw: []const u8,
 };
 
+/// A reusable structural index for one JSONL source at a time.
+///
+/// The parser owns its index buffer and borrows nothing: `input` reaches it
+/// only through `initOnDemandDocument`, which leases the buffer and the single
+/// active-document slot. Because the slot is held for a live document, the
+/// buffer cannot be resized under it, so a document's offsets keep their
+/// address. One document is active at a time and `initOnDemandDocument`
+/// reports `error.DocumentActive` while another is live.
 pub const Parser = struct {
+    /// Failures of `init`: `error.OutOfMemory`,
+    /// `error.CapacityOverflow`, and `error.InputTooLarge` when
+    /// `max_capacity` exceeds the `u32` offset boundary.
     pub const InitError = std.mem.Allocator.Error || error{
         CapacityOverflow,
         InputTooLarge,
     };
 
+    /// The caller's allocator, borrowed and never released by this type.
     allocator: std.mem.Allocator,
+    /// Owns the reserved index buffer; the two fields below are views into it.
     storage: resident.IndexBuffer(void, false),
+    /// The whole reserved buffer, sentinels included. It is assigned from
+    /// `storage` whenever a document is prepared and never read back inside
+    /// this module, so a consumer holding it across the next
+    /// `initOnDemandDocument` holds a stale slice.
     indexes: []u32,
+    /// Index slots currently reserved, excluding the three sentinels.
     capacity: usize,
+    /// Capacity `init` reserved up front; `0` means grow on demand.
     max_capacity: usize,
+    /// Lease state for the one active document.
     state: resident.State = .{},
 
+    /// Reserves one index buffer for `max_capacity` structural offsets.
+    ///
+    /// A `max_capacity` of `0` reserves nothing and lets each document grow
+    /// the buffer on demand up to the `u32` offset boundary; any non-zero
+    /// value becomes a fixed ceiling that `initOnDemandDocument` enforces with
+    /// `error.CapacityExceeded`.
     pub fn init(allocator: std.mem.Allocator, max_capacity: usize) InitError!Parser {
         if (max_capacity > std.math.maxInt(u32)) return error.InputTooLarge;
 
@@ -139,6 +285,13 @@ pub const Parser = struct {
         return parser;
     }
 
+    /// Releases the index buffer; the allocator passed to `init` is not
+    /// released.
+    ///
+    /// Every document built from this parser must be released first. That is a
+    /// `std.debug.assert`: Debug and ReleaseSafe diagnose a still-active
+    /// document, while ReleaseFast and ReleaseSmall treat it as unchecked
+    /// illegal behavior. A second call is a double free.
     pub fn deinit(self: *Parser) void {
         std.debug.assert(!self.state.active);
         self.state.deinit();
@@ -164,6 +317,20 @@ pub const Parser = struct {
     }
 };
 
+/// Builds a lazily readable document over `parser`'s reusable index buffer.
+///
+/// The document borrows `input` and the parser's buffer, so `input` and
+/// `parser` must outlive it, every event and cursor it produces, and every raw
+/// span those hand back. `OnDemandDocument.deinit` ends the lease and must run
+/// before the next document and before `parser.deinit`. Storage is reserved
+/// before the scan, so an error return leaves the parser holding the capacity
+/// it grew to and takes no lease.
+///
+/// Fails with `error.DocumentActive` while another document is live,
+/// `error.CapacityExceeded` when `input` exceeds a non-zero `max_capacity`,
+/// `error.InputTooLarge` past the `u32` offset boundary, and
+/// `error.OutOfMemory` or `error.CapacityOverflow` when the buffer cannot be
+/// reserved.
 pub fn initOnDemandDocument(
     parser: *Parser,
     input: []const u8,
@@ -178,34 +345,86 @@ pub fn initOnDemandDocument(
     };
 }
 
+/// A JSONL document leased over a `Parser`'s index buffer.
+///
+/// The document owns no allocation: it holds a pointer to the parser, borrows
+/// the source, and borrows the parser's index storage, so `deinit` releases the
+/// lease and nothing else and `parser` and `input` must outlive the document and
+/// everything reached through it. The lease check compares a finite `u64`
+/// generation counter that wraps back to `1`, which detects a released or
+/// superseded document but proves nothing about storage liveness; keeping
+/// `parser` and `input` alive is the caller's obligation, and the same holds
+/// for every guard a reader takes from it.
+///
+/// Copies name the same lease and parser state. Releasing one ends the lease
+/// for all copies; release through another unpoisoned copy is harmless. Do not
+/// reuse the value `deinit` overwrites. Keep `parser` alive and unmoved, and keep
+/// this document unmoved while a reader or cursor holds a pointer to it.
+///
+/// One reader at a time: `eventReader` and `tokenCursor` claim the document's
+/// single focus, neither has a `deinit`, and the claim is held until this
+/// document's `deinit` runs.
 pub const OnDemandDocument = struct {
+    /// The parser that owns the index buffer backing `indexes`.
     parser: *Parser,
+    /// Whole input, borrowed from the caller; must outlive this document.
     input: []const u8,
+    /// Structural offsets of `input`, borrowed from `parser.storage`.
     indexes: []const u32,
+    /// The active-document lease, released by `deinit`.
     lease: resident.Lease,
 
+    /// Releases the lease; no allocation is freed and `input` is untouched.
+    ///
+    /// A second call is invalid, and any reader taken from this document
+    /// reports `error.DocumentReleased` afterwards.
     pub fn deinit(self: *OnDemandDocument) void {
         self.lease.release();
         self.* = undefined;
     }
 
+    /// A lazy `EventReader` walking this document one event at a time.
+    ///
+    /// Claims the single focus: `error.FocusAlreadyClaimed` when a reader or
+    /// cursor already holds it. A retained, unpoisoned copy whose lease was
+    /// released returns `error.DocumentReleased`; the deinitialized value itself
+    /// is invalid. The reader has no teardown; its claim ends with the lease.
     pub fn eventReader(self: *OnDemandDocument) !EventReader {
         const guard = try self.lease.claim();
         return EventReader.init(self, guard);
     }
 
+    /// A lazy `TokenCursor` walking this document one token at a time.
+    ///
+    /// Claims the single focus: `error.FocusAlreadyClaimed` when a reader or
+    /// cursor already holds it. A retained, unpoisoned copy whose lease was
+    /// released returns `error.DocumentReleased`; the deinitialized value itself
+    /// is invalid. The cursor has no teardown; its claim ends with the lease.
     pub fn tokenCursor(self: *OnDemandDocument) !TokenCursor {
         const guard = try self.lease.claim();
         return TokenCursor.init(self, guard);
     }
 };
 
+/// Failures of `TapeRecordParser.init`: `error.OutOfMemory`,
+/// `error.CapacityOverflow`, `error.InputTooLarge` when `input_capacity_max`
+/// exceeds the `u32` offset boundary, and `error.TapeTooLarge` when
+/// `tape_capacity_max` does.
 pub const TapeRecordInitError = std.mem.Allocator.Error || error{
     CapacityOverflow,
     InputTooLarge,
     TapeTooLarge,
 };
 
+/// Failures shared by the reusable record path.
+///
+/// `error.CapacityExceeded` is a configured ceiling, `error.OutOfMemory` a real
+/// allocation failure, `error.CapacityOverflow`, `error.InputTooLarge`, and
+/// `error.TapeTooLarge` report an input or tape the shared storage cannot
+/// represent, `error.InvalidStructuralIndex` reports offsets that no longer
+/// describe their input, the `resident.Error` tags come from the lease and
+/// focus checks, and the `stage2.NavigationError` tags come from tape
+/// navigation.
 pub const TapeRecordError = std.mem.Allocator.Error || resident.Error ||
     stage2.NavigationError || error{
     CapacityExceeded,
@@ -215,17 +434,32 @@ pub const TapeRecordError = std.mem.Allocator.Error || resident.Error ||
     InvalidStructuralIndex,
 };
 
+/// One `TapeRecordIterator.next` outcome.
+///
+/// `.record` borrows the parser's shared tape and stays valid until the next
+/// call; `.diagnostic` is a self-contained value and ends the iteration. The
+/// two are mutually exclusive, so a caller never has to inspect both.
 pub const TapeRecordResult = union(enum) {
+    /// A validated record borrowed from the parser's tape.
     record: TapeRecord,
+    /// The first defect, in global coordinates.
     diagnostic: JsonlDiagnostic,
 };
 
 /// Configuration for the reusable strict-LF JSONL record parser.
 ///
 /// A zero limit means that the corresponding resource may grow to the checked
-/// u32 boundary. Tape capacity is measured in `stage2.TapeWord` values.
+/// u32 boundary. Tape capacity is measured in `stage2.TapeWord` values. The
+/// two limits are checked at different times: the input limit when `iterate`
+/// is called and the tape limit while `next` builds a record.
 pub const TapeRecordOptions = struct {
+    /// Largest accepted input, in bytes. `0` leaves the `u32` offset boundary
+    /// as the only limit. A longer input fails `iterate` with
+    /// `error.CapacityExceeded`.
     input_capacity_max: usize = 0,
+    /// Largest record tape, in `stage2.TapeWord` values. `0` leaves the `u32`
+    /// offset boundary as the only limit. A record needing more fails `next`
+    /// with `error.CapacityExceeded` and leaves the high-water tape unchanged.
     tape_capacity_max: usize = 0,
 };
 
@@ -234,20 +468,53 @@ pub const TapeRecordOptions = struct {
 /// The parser owns the global structural index and one high-water tape. Source
 /// bytes are borrowed from the caller. A record and every cursor made from it
 /// become invalid when the iterator advances, is deinitialized, or the parser
-/// resets.
+/// resets; stale use reports an error instead of returning a wrong tape.
+///
+/// `deinit` is the single owner release and a second call is a double free; a
+/// copy names the same allocations and is not a second owner. While an
+/// iterator, record, or cursor exists the parser must stay alive and at its
+/// address, because each of those stores a pointer to it and `deinit` poisons
+/// what they point at.
+///
+/// The staleness check is a finite `u64` record generation that wraps back to
+/// `1`, paired with the finite `resident.Lease` generation. Together they
+/// detect a record, cursor, or iterator from a superseded document; neither
+/// proves that the parser or its storage is still alive, so keeping the parser
+/// alive and unmoved remains the caller's obligation.
+///
+/// One lease at a time: `iterate` reports `error.DocumentActive` while one is
+/// live.
 pub const TapeRecordParser = struct {
+    /// The caller's allocator, borrowed and never released by this type.
     allocator: std.mem.Allocator,
+    /// The limits `init` was given.
     options: TapeRecordOptions,
+    /// Owns the global structural index buffer.
     storage: resident.IndexBuffer(void, false),
+    /// Owns the high-water record tape, reallocated only when a larger record
+    /// needs it.
     tape_storage: []stage2.TapeWord,
+    /// Tape words belonging to the record currently handed out.
     tape_len: usize = 0,
+    /// Reusable record validator; `null` until a defect needs one.
     reader: ?stage2.TokenReader = null,
+    /// Lease state for the one active iterator.
     state: resident.State = .{},
+    /// Bumped by `reset` and by every iterator advance, so records from an
+    /// earlier one are rejected.
     record_generation: u64 = 0,
+    /// Whole input borrowed from the active `iterate`; `&.{}` when idle.
     input: []const u8 = &.{},
 
+    /// Failures of `init`.
     pub const InitError = TapeRecordInitError;
 
+    /// Records both limits and reserves the structural index up front when
+    /// `input_capacity_max` is non-zero.
+    ///
+    /// A zero `input_capacity_max` reserves nothing and lets each `iterate`
+    /// grow the buffer to its input. The limits themselves are checked here,
+    /// before any allocation.
     pub fn init(
         allocator: std.mem.Allocator,
         options: TapeRecordOptions,
@@ -274,6 +541,12 @@ pub const TapeRecordParser = struct {
         return parser;
     }
 
+    /// Releases the index buffer and the high-water tape; the allocator
+    /// passed to `init` is not released.
+    ///
+    /// Any active iterator, record, and cursor is invalidated first and the
+    /// lease is dropped without error, so deinitializing under a live iterator
+    /// is allowed. The parser is unusable afterwards.
     pub fn deinit(self: *TapeRecordParser) void {
         self.releaseLease();
         self.state.deinit();
@@ -285,6 +558,11 @@ pub const TapeRecordParser = struct {
     }
 
     /// Invalidates all borrowed records and releases the active iterator.
+    ///
+    /// The reserved capacities are kept and the next `iterate` starts a fresh
+    /// document. A record or cursor from before the reset then reports
+    /// `error.DocumentReleased`, while a copied iterator that only fell behind
+    /// reports `error.OutOfOrderIteration`.
     pub fn reset(self: *TapeRecordParser) void {
         self.releaseLease();
         self.storage.count = 0;
@@ -294,14 +572,41 @@ pub const TapeRecordParser = struct {
         self.nextRecordGeneration();
     }
 
+    /// The high-water tape capacity, in `stage2.TapeWord` values.
+    ///
+    /// It starts at `0` and only grows, so it tracks the largest record seen
+    /// across every document. A record refused by `tape_capacity_max` leaves
+    /// it unchanged.
     pub fn tapeCapacity(self: *const TapeRecordParser) usize {
         return self.tape_storage.len;
     }
 
+    /// Structural index slots currently reserved, excluding the three
+    /// sentinels.
+    ///
+    /// This is storage bookkeeping, not a byte budget: it is the larger of any
+    /// up-front `input_capacity_max` reservation and every input length
+    /// `iterate` has reserved for.
     pub fn inputCapacity(self: *const TapeRecordParser) usize {
         return self.storage.capacity;
     }
 
+    /// Indexes `input` and returns an iterator over its records under a new
+    /// document lease.
+    ///
+    /// The input is borrowed: it must outlive the iterator, every record it
+    /// returns, every cursor made from those, and every raw span they hand
+    /// back. On success the previous document's records and cursors are
+    /// invalidated, because their generation no longer matches.
+    ///
+    /// Structural storage is reserved before indexing, so a call that then
+    /// fails still leaves the parser resized and takes no lease.
+    ///
+    /// Fails with `error.DocumentActive` while a lease is live,
+    /// `error.CapacityExceeded` when `input` exceeds a non-zero
+    /// `input_capacity_max`, `error.InputTooLarge` past the `u32` offset
+    /// boundary, and `error.OutOfMemory` or `error.CapacityOverflow` when the
+    /// buffer cannot be reserved.
     pub fn iterate(
         self: *TapeRecordParser,
         input: []const u8,
@@ -508,18 +813,44 @@ const TapeReuseAllocator = struct {
     }
 };
 
-/// A borrowed reusable JSONL record.
+/// A borrowed reusable JSONL record: a window into the shared high-water tape
+/// plus the record's source span.
+///
+/// The record owns nothing. `source` borrows the input given to `iterate`, and
+/// `tape_start`..`tape_end` index the parser's shared tape, which the next
+/// `next` call invalidates and which a larger record reallocates. Copies are
+/// not independent: every accessor re-checks the lease, the record generation,
+/// the source identity, and the current tape bounds, and reports an error
+/// rather than reading a stale tape.
 pub const TapeRecord = struct {
+    /// The parser owning the shared tape and the lease state.
     parser: *TapeRecordParser,
+    /// The document lease this record was produced under.
     lease: resident.Lease,
+    /// Record generation at production; see `TapeRecordParser`.
     generation: u64,
+    /// Ordinal of this record among the accepted records.
     record_index: usize,
+    /// Borrowed record bytes from the input given to `iterate`.
     source: []const u8,
+    /// Half-open start of this record in that input.
     source_start: usize,
+    /// Half-open end in that input, excluding the terminating LF.
     source_end: usize,
+    /// Half-open range in `parser.tape_storage`; always starts at `0`,
+    /// because the high-water tape is reused from its beginning.
     tape_start: usize,
+    /// One past this record's last tape word.
     tape_end: usize,
 
+    /// A checked cursor over this record's tape and source.
+    ///
+    /// The cursor borrows the shared tape, so it is invalidated exactly like
+    /// the record. Before any navigation it re-checks the lease and
+    /// generation, then the source identity and tape bounds, and reports
+    /// `error.DocumentReleased`, `error.OutOfOrderIteration`,
+    /// `error.SourceOutOfBounds`, or `error.TapeOutOfBounds`; only then does it
+    /// raise the `stage2.NavigationError` tags `stage2.Document.root` defines.
     pub fn root(self: *const TapeRecord) TapeRecordError!TapeRecordCursor {
         try self.check();
         const words = self.parser.tape_storage[self.tape_start..self.tape_end];
@@ -533,10 +864,17 @@ pub const TapeRecord = struct {
         };
     }
 
+    /// Equivalent to `root`.
     pub fn cursor(self: *const TapeRecord) TapeRecordError!TapeRecordCursor {
         return self.root();
     }
 
+    /// This record's tape words, checked against the lease, the generation, the
+    /// source identity, and the current tape bounds.
+    ///
+    /// The slice aliases the parser's high-water tape, so the next `next` call
+    /// and any later record that grows that tape both invalidate it. The
+    /// failure tags are the four named on `root`.
     pub fn tapeWords(self: *const TapeRecord) TapeRecordError![]const stage2.TapeWord {
         try self.check();
         return self.parser.tape_storage[self.tape_start..self.tape_end];
@@ -567,37 +905,63 @@ pub const TapeRecord = struct {
 };
 
 /// A checked cursor over a borrowed reusable record tape.
+///
+/// Every method re-checks the lease and record generation before reading, so a
+/// cursor kept across an iterator advance reports
+/// `error.OutOfOrderIteration` and one kept past a reset, an iterator
+/// `deinit`, or a parser `deinit` reports `error.DocumentReleased`. Positions,
+/// skipping, and raw slices are the ones `stage2.TapeCursor` documents; the
+/// raw slices borrow the record source and stay valid as long as that input
+/// does.
+///
+/// A cursor is an independent position over the shared tape rather than a view
+/// of a separate one: copies do not interfere, each keeps the position it was
+/// copied at, no stable address is required, and every copy is still checked
+/// against the same lease and generation.
 pub const TapeRecordCursor = struct {
+    /// The parser owning the shared tape.
     parser: *TapeRecordParser,
+    /// The lease the originating record was produced under.
     lease: resident.Lease,
+    /// Record generation the originating record was produced at.
     generation: u64,
+    /// The cursor over this record's tape words.
     cursor: stage2.TapeCursor,
 
+    /// The tape word at this position; see `stage2.TapeCursor.peek`.
     pub fn peek(self: *const TapeRecordCursor) TapeRecordError!stage2.TapeWord {
         try self.check();
         return self.cursor.peek();
     }
 
+    /// Moves to the next tape word; see `stage2.TapeCursor.advance`.
     pub fn advance(self: *TapeRecordCursor) TapeRecordError!void {
         try self.check();
         try self.cursor.advance();
     }
 
+    /// Skips the scalar or container subtree at this position; see
+    /// `stage2.TapeCursor.skipValue`.
     pub fn skipValue(self: *TapeRecordCursor) TapeRecordError!void {
         try self.check();
         try self.cursor.skipValue();
     }
 
+    /// The tape index at this position, or a check failure first.
     pub fn position(self: *const TapeRecordCursor) TapeRecordError!usize {
         try self.check();
         return self.cursor.position();
     }
 
+    /// The element count of the container at this position; see
+    /// `stage2.TapeCursor.containerCount`.
     pub fn containerCount(self: *const TapeRecordCursor) TapeRecordError!u32 {
         try self.check();
         return self.cursor.containerCount();
     }
 
+    /// A second checked cursor at the container's opening word; see
+    /// `stage2.TapeCursor.matchingStart`.
     pub fn matchingStart(self: *const TapeRecordCursor) TapeRecordError!TapeRecordCursor {
         try self.check();
         return .{
@@ -608,6 +972,8 @@ pub const TapeRecordCursor = struct {
         };
     }
 
+    /// The still-escaped string or key content, or the complete scalar source,
+    /// borrowed from the record; see `stage2.TapeCursor.rawValue`.
     pub fn rawValue(self: *const TapeRecordCursor) TapeRecordError![]const u8 {
         try self.check();
         return self.cursor.rawValue();
@@ -618,14 +984,37 @@ pub const TapeRecordCursor = struct {
     }
 };
 
+/// A checked iterator over one JSONL document's records.
+///
+/// The iterator holds the document lease and the single focus, and `deinit`
+/// releases both. At most one record is current: `next` invalidates the
+/// previous record and every cursor made from it before it builds the next.
 pub const TapeRecordIterator = struct {
+    /// The parser owning the shared tape and the structural index.
     parser: *TapeRecordParser,
+    /// The document lease taken by `iterate`.
     lease: resident.Lease,
+    /// The single-focus, ordered-access guard over that lease.
     guard: resident.Guard,
+    /// Walks the global structural offsets, skipping blank records.
     record_iterator: RecordIterator,
+    /// Accepted records returned so far; a `.diagnostic` does not count.
     record_index: usize = 0,
+    /// Set once `next` has returned `null` or failed; no row is left to read.
     finished: bool = false,
 
+    /// The next record, the first defect, or `null` at end of input.
+    ///
+    /// The lease and generation are checked before anything else, so a copy of
+    /// this iterator that fell behind reports `error.OutOfOrderIteration`
+    /// instead of silently skipping a record.
+    ///
+    /// A `.record` result borrows the shared tape and is valid until the next
+    /// call, so keep only one record and its cursors at a time. A
+    /// `.diagnostic` result is a self-contained value and ends the iteration:
+    /// this and every later call return `null`. An error return ends it the
+    /// same way, and the tag is not repeated — only the lease and generation
+    /// checks still report on a stale copy.
     pub fn next(self: *TapeRecordIterator) TapeRecordError!?TapeRecordResult {
         try self.guard.check();
         if (self.finished) return null;
@@ -669,10 +1058,21 @@ pub const TapeRecordIterator = struct {
         return result;
     }
 
+    /// Accepted records returned so far.
+    ///
+    /// On a `.diagnostic` result this is the failing record's ordinal, which
+    /// matches `JsonlDiagnostic.record_index`.
     pub fn recordCount(self: *const TapeRecordIterator) usize {
         return self.record_index;
     }
 
+    /// Invalidates the current record, releases the lease, and drops the focus.
+    ///
+    /// A stale iterator's `deinit` is ignored rather than releasing a newer
+    /// lease, so this is safe on every path while the parser is still alive.
+    /// After `TapeRecordParser.deinit` the lease it holds points at released
+    /// storage, so no method here may be called at all. The iterator is
+    /// unusable once this returns and a second call is invalid.
     pub fn deinit(self: *TapeRecordIterator) void {
         if (self.guard.check()) |_| {
             self.parser.invalidateRecord();
@@ -704,24 +1104,66 @@ fn globalRecordDiagnostic(
     };
 }
 
+/// The record a JSONL reader is currently inside, reached through `active`.
+///
+/// Owns nothing. `source` borrows the caller's original document bytes; `view`
+/// borrows offsets from the parser's index storage. Clearing `active` does not
+/// free either buffer. Keep the source alive and unchanged, and do not use the
+/// view after parser reuse, storage replacement or deinitialization.
+/// Copies retain those same borrows and independent value fields. Neither
+/// copying nor modifying a snapshot moves the reader that produced it.
 const ActiveRecord = struct {
+    /// The record's byte and index bounds.
     range: RecordRange,
+    /// The record's bytes, borrowed from the reader's document input.
     source: []const u8,
+    /// The record's structural offsets, borrowed from the parser's storage.
     view: stage2.IndexView,
 };
 
+/// A lazy event walk over one `OnDemandDocument`.
+///
+/// The reader stores a pointer to the document and reaches the source and the
+/// parser's index storage only through it, so `document` must stay alive and
+/// unmoved for as long as the reader is used. The reader itself holds the
+/// document's single focus and an ordered-access guard: a copy left behind
+/// reports `error.OutOfOrderIteration` while the copy that advanced keeps
+/// going, and use after the document's `deinit` reports
+/// `error.DocumentReleased`. Nothing stores a pointer to the reader, so its own
+/// address need not be stable.
+///
+/// There is no `deinit`: the focus is released when the `OnDemandDocument` is
+/// released.
+///
+/// The first failure is latched, so every later call returns the same tag
+/// without reading more input. Events borrow the document's `input` and stay
+/// valid as long as it does.
 pub const EventReader = struct {
+    /// The leased document being walked. It borrows the source and the parser's
+    /// index storage; the reader owns no part of either.
     document: *OnDemandDocument,
+    /// The single-focus, ordered-access guard over the document's lease.
     guard: resident.Guard,
+    /// Walks the global structural offsets, skipping blank records.
     record_iterator: RecordIterator,
+    /// The record currently being read, or `null` between records.
     active: ?ActiveRecord = null,
+    /// Reusable token reader for the active record.
     reader: ?stage2.TokenReader = null,
+    /// Ordinal of the record being read.
     record_index: usize = 0,
+    /// Event buffered by `peek` and returned by the next `next`.
     cache: ?Event = null,
+    /// Set once the document has been read to its end.
     cache_eof: bool = false,
+    /// The first failure, latched for every later call.
     failure: ?stage2.ReaderError = null,
+    /// Global offset reached by the most recent token read, or by the latched
+    /// failure.
     failure_offset: usize = 0,
+    /// Global byte position reached by the most recent token read.
     byte_position: usize = 0,
+    /// Position in the structural index reached by the most recent token read.
     structural_position: usize = 0,
 
     fn init(document: *OnDemandDocument, guard: resident.Guard) EventReader {
@@ -732,6 +1174,10 @@ pub const EventReader = struct {
         };
     }
 
+    /// The next event, or `null` at end of input.
+    ///
+    /// Each event returned consumes the focus position, so a caller must read
+    /// in order; an event buffered by `peek` is returned first.
     pub fn next(self: *EventReader) !?Event {
         try self.guard.check();
         if (self.failure) |err| return err;
@@ -754,6 +1200,10 @@ pub const EventReader = struct {
         return null;
     }
 
+    /// The next event without consuming it, or `null` at end of input.
+    ///
+    /// The event is buffered and returned by the next `next`, so repeated
+    /// `peek` calls report the same event.
     pub fn peek(self: *EventReader) !?Event {
         try self.guard.check();
         if (self.failure) |err| return err;
@@ -772,6 +1222,10 @@ pub const EventReader = struct {
         return null;
     }
 
+    /// Consumes the next event, or the whole subtree or record it opens.
+    ///
+    /// Returns `error.UnexpectedEnd` when the input ends inside a container or
+    /// a record.
     pub fn skip(self: *EventReader) !void {
         const first = try self.next() orelse return;
         switch (first.kind) {
@@ -851,18 +1305,43 @@ pub const EventReader = struct {
     }
 };
 
+/// A lazy token walk over one `OnDemandDocument`.
+///
+/// The cursor stores a pointer to the document and reaches the source and the
+/// parser's index storage only through it, so `document` must stay alive and
+/// unmoved for as long as the cursor is used. It holds the document's single
+/// focus and an ordered-access guard with the same copy, release, and
+/// latched-failure rules `EventReader` documents, and nothing stores a pointer
+/// to the cursor, so its own address need not be stable.
+///
+/// It has no `deinit`: the focus is released when the `OnDemandDocument` is
+/// released.
 pub const TokenCursor = struct {
+    /// The leased document being walked. It borrows the source and the parser's
+    /// index storage; the cursor owns no part of either.
     document: *OnDemandDocument,
+    /// The single-focus, ordered-access guard over the document's lease.
     guard: resident.Guard,
+    /// Walks the global structural offsets, skipping blank records.
     record_iterator: RecordIterator,
+    /// The record currently being read, or `null` between records.
     active: ?ActiveRecord = null,
+    /// Reusable token reader for the active record.
     reader: ?stage2.TokenReader = null,
+    /// Ordinal of the record being read.
     record_index: usize = 0,
+    /// Event buffered by `peek` and returned by the next `advance`.
     cache: ?Event = null,
+    /// Set once the document has been read to its end.
     cache_eof: bool = false,
+    /// The first failure, latched for every later call.
     failure: ?stage2.ReaderError = null,
+    /// Global offset reached by the most recent token read, or by the latched
+    /// failure.
     failure_offset: usize = 0,
+    /// Global byte position reached by the most recent token read.
     byte_position: usize = 0,
+    /// Position in the structural index reached by the most recent token read.
     structural_position: usize = 0,
 
     fn init(document: *OnDemandDocument, guard: resident.Guard) TokenCursor {
@@ -873,6 +1352,10 @@ pub const TokenCursor = struct {
         };
     }
 
+    /// The next event without consuming it, or `null` at end of input.
+    ///
+    /// The event is buffered and returned by the next `advance`, so repeated
+    /// `peek` calls report the same event.
     pub fn peek(self: *TokenCursor) !?Event {
         try self.guard.check();
         if (self.failure) |err| return err;
@@ -891,6 +1374,10 @@ pub const TokenCursor = struct {
         return null;
     }
 
+    /// The next event and consumes it, or `null` at end of input.
+    ///
+    /// An event buffered by `peek` is returned first, and the focus advances
+    /// exactly once either way.
     pub fn advance(self: *TokenCursor) !?Event {
         try self.guard.check();
         if (self.failure) |err| return err;
@@ -913,6 +1400,11 @@ pub const TokenCursor = struct {
         return null;
     }
 
+    /// Consumes the next event, or the whole subtree or record it opens.
+    ///
+    /// A `.record_end` event is consumed and returns. Returns
+    /// `error.UnexpectedEnd` when the input ends inside a container or a
+    /// record.
     pub fn skipChild(self: *TokenCursor) !void {
         const first = try self.advance() orelse return;
         switch (first.kind) {
@@ -1025,6 +1517,14 @@ fn parsedTokenEvent(
 }
 
 /// Builds an owned validated tape for every nonblank JSONL record.
+///
+/// The returned `JsonlDocument` owns the record array and one tape per record
+/// and stores no allocator, so the caller releases all of them once with
+/// `document.deinit(allocator)` while that backing is still alive. `input` is
+/// only borrowed and must outlive the document, its records, and their cursors
+/// and raw slices. No error path leaves the caller owning anything. Stage 1
+/// failures other than `error.OutOfMemory` arrive as `error.TapeTooLarge`, as
+/// in the other JSON-family builders.
 pub fn buildJsonlTape(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -1071,6 +1571,13 @@ pub fn buildJsonlTape(
 }
 
 /// Validates nonblank JSONL records and returns the first global diagnostic.
+///
+/// Allocates one structural index and releases it before returning, so a
+/// successful call leaves nothing to release and builds no tape. `null` means
+/// every record is valid strict RFC 8259 JSON; a returned `JsonlDiagnostic`
+/// borrows `input` for its `snippet` and reports global byte, line, and column
+/// positions plus the failing record's ordinal and span. Stage 1 failures
+/// arrive as `error.TapeTooLarge`, as in `buildJsonlTape`.
 pub fn validateJsonl(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -1114,19 +1621,51 @@ pub fn validateJsonl(
     return null;
 }
 
+/// Bounds of one JSONL record, reached through `active.range`.
+///
+/// Every field is a count: `source_start` and `source_end` are byte offsets
+/// into the document input and `index_start` and `index_end` are slot positions
+/// in the global structural index, both ranges half-open. The type owns nothing
+/// and points at nothing; a value read out of `active` is a snapshot, and the
+/// ranges the walk produces later are unrelated to it. Copies are independent
+/// values with no stable address required, and writing one changes nothing for
+/// the reader that produced it.
 const RecordRange = struct {
+    /// Byte offset of the record's first byte in the document input.
     source_start: usize,
+    /// Byte offset one past the record's last byte, excluding its LF.
     source_end: usize,
+    /// Slot index of the record's first structural offset.
     index_start: usize,
+    /// Slot index one past the record's last structural offset.
     index_end: usize,
 };
 
+/// The positional walk over one document's structural offsets, reached through
+/// `record_iterator`.
+///
+/// The type owns nothing: `input` is the borrowed source and `offsets` are
+/// borrowed from the parser's index storage, both handed over by the reader
+/// that holds the walk. Records are cut at the LF bytes `offsets` contains and
+/// at any trailing remainder that has no LF; a run made only of spaces, tabs,
+/// and CR is skipped rather than yielded, and `finished` marks that no record
+/// is left.
+///
+/// Position fields count bytes or index slots and default to `0`. Copies walk
+/// independently from the copied position over the same borrowed data; neither
+/// advances the other. No stable address is required.
 const RecordIterator = struct {
+    /// Whole borrowed source the offsets index into.
     input: []const u8,
+    /// Structural offsets, borrowed from the parser's index storage.
     offsets: []const u32,
+    /// Byte offset where the next record would start.
     source_start: usize = 0,
+    /// Slot index where the next record's offsets would start.
     index_start: usize = 0,
+    /// Offset slot already consumed by the walk.
     offset_position: usize = 0,
+    /// Set once the walk has yielded its last record or run out of input.
     finished: bool = false,
 
     fn init(input: []const u8, offsets: []const u32) RecordIterator {
@@ -1189,6 +1728,15 @@ fn isBlankRecord(source: []const u8) bool {
 const testing = std.testing;
 const sentinel_count: usize = 3;
 
+/// Owns the absolute `u32` offsets of every JSONL structural byte, atom start,
+/// and record-separator LF in `input`, plus the three trailing sentinel slots.
+///
+/// The result owns its allocation and is released once with
+/// `index.deinit(allocator)`; it holds no bytes of `input`, which may be
+/// released as soon as this returns. A copy names the same allocation and is
+/// not a second owner. Fails with `error.OutOfMemory`,
+/// `error.CapacityOverflow`, or `error.InputTooLarge` when `input` exceeds the
+/// `u32` offset boundary.
 pub fn indexJsonl(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -1200,6 +1748,11 @@ pub fn indexJsonl(
 ///
 /// The returned count excludes sentinels. `out` is unchanged beyond that
 /// prefix. Record-separator LF bytes are emitted only outside quoted strings.
+/// The checked sink reports `error.CapacityExceeded` the moment `out` is full,
+/// so on that error `out` holds an unknown-length prefix of the offsets and
+/// no count is returned; discard or recompute it rather than read a partial
+/// result. `error.InputTooLarge` when `input` exceeds the `u32` offset
+/// boundary. `vlen` is the SIMD width and must be at least 4.
 pub fn indexJsonlInto(
     comptime vlen: usize,
     out: []u32,
@@ -1221,6 +1774,11 @@ pub fn indexJsonlInto(
     return sink.count;
 }
 
+/// `indexJsonl` at an explicit SIMD width.
+///
+/// `vlen` is the bytes-per-vector width the scanner and the bit-index
+/// extractor are instantiated at, and must be at least 4. Ownership, the
+/// sentinel slots, and the errors are `indexJsonl`'s.
 pub fn indexJsonlImpl(
     comptime vlen: usize,
     allocator: std.mem.Allocator,

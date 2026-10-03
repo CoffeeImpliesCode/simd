@@ -459,3 +459,398 @@ test "CommonMark renderer rejects malformed root ancestry before sibling travers
     document.nodes[@intFromEnum(paragraph)].next_sibling = paragraph;
     try testing.expectError(error.InvalidDocument, commonmark.renderCommonMarkHtml(testing.allocator, &document, .{}));
 }
+
+/// Parser-audit regressions. Every case is a consumer-visible defect confirmed
+/// against the published CommonMark 0.31.2 productions, so the expected bytes
+/// come from the specification rather than from this parser's current output.
+const AuditCase = struct {
+    source: []const u8,
+    expected: []const u8,
+};
+
+fn checkAuditCases(cases: []const AuditCase, mode: commonmark.HtmlRenderMode) !void {
+    for (cases) |case| {
+        var document = try commonmark.parseCommonMark(testing.allocator, case.source, .{});
+        defer document.deinit();
+        const rendered = try commonmark.renderCommonMarkHtml(
+            testing.allocator,
+            &document,
+            .{ .mode = mode },
+        );
+        defer testing.allocator.free(rendered);
+        testing.expectEqualStrings(case.expected, rendered) catch |err| {
+            std.debug.print(
+                "\nsource:   {s}\nexpected: {s}\nactual:   {s}\n",
+                .{ case.source, case.expected, rendered },
+            );
+            return err;
+        };
+    }
+}
+
+test "parser audit: type-1 HTML blocks close on mixed case and alternate end tags" {
+    const cases = [_]AuditCase{
+        .{
+            .source = "<script>\nx\n</ScRiPt>\n\nhello\n",
+            .expected = "<script>\nx\n</ScRiPt>\n<p>hello</p>\n",
+        },
+        .{
+            .source = "<pre>\nx\n</PrE>\n\nhello\n",
+            .expected = "<pre>\nx\n</PrE>\n<p>hello</p>\n",
+        },
+        .{
+            .source = "<style>\nx\n</StYlE>\n\nhello\n",
+            .expected = "<style>\nx\n</StYlE>\n<p>hello</p>\n",
+        },
+        .{
+            .source = "<textarea>\nx\n</TeXtArEa>\n\nhello\n",
+            .expected = "<textarea>\nx\n</TeXtArEa>\n<p>hello</p>\n",
+        },
+        .{
+            .source = "<script>\nx\n</style>\n\nhello\n",
+            .expected = "<script>\nx\n</style>\n<p>hello</p>\n",
+        },
+    };
+    try checkAuditCases(&cases, .conformance);
+}
+
+test "parser audit: HTML blocks end on a whitespace-only blank line" {
+    const cases = [_]AuditCase{
+        .{
+            .source = "<div>\n  \nhello\n",
+            .expected = "<div>\n<p>hello</p>\n",
+        },
+        .{
+            .source = "<a href=\"x\">\n\t\nhello\n",
+            .expected = "<a href=\"x\">\n<p>hello</p>\n",
+        },
+    };
+    try checkAuditCases(&cases, .conformance);
+}
+
+test "parser audit: safe rendering keeps paragraphs after a raw HTML block" {
+    const cases = [_]AuditCase{
+        .{
+            .source = "<script>\nx\n</ScRiPt>\n\nhello\n",
+            .expected = "<!-- raw HTML omitted -->\n<p>hello</p>\n",
+        },
+        .{
+            .source = "<div>\n  \nhello\n",
+            .expected = "<!-- raw HTML omitted -->\n<p>hello</p>\n",
+        },
+        .{
+            .source = "<a href=\"x\">\n\t\nhello\n",
+            .expected = "<!-- raw HTML omitted -->\n<p>hello</p>\n",
+        },
+    };
+    try checkAuditCases(&cases, .safe);
+}
+
+test "parser audit: HTML block start names require the specification delimiter" {
+    const cases = [_]AuditCase{
+        // `script-x` and `pre-x` are custom tag names, so the type-1 start
+        // condition does not apply and the line opens a type-7 block instead.
+        .{ .source = "<script-x>\n\nhello\n", .expected = "<script-x>\n<p>hello</p>\n" },
+        .{ .source = "<pre-x>\n</pre>\ntext\n", .expected = "<pre-x>\n</pre>\ntext\n" },
+        // A custom name is not a block tag and type 7 cannot interrupt a
+        // paragraph, so the tag stays inline.
+        .{ .source = "foo\n<div-x>\n", .expected = "<p>foo\n<div-x></p>\n" },
+        // `/` is not a type-1 delimiter and type 7 excludes `script`, so no
+        // HTML block starts here.
+        .{ .source = "<script/>\n\nhello\n", .expected = "<p><script/></p>\n<p>hello</p>\n" },
+        .{ .source = "<textarea/>\n\nhello\n", .expected = "<p><textarea/></p>\n<p>hello</p>\n" },
+        // A space after the special name is a legal type-1 delimiter, and with
+        // no end tag the block runs to the end of the document.
+        .{ .source = "<script >\nx\n\nhello\n", .expected = "<script >\nx\n\nhello\n" },
+    };
+    try checkAuditCases(&cases, .conformance);
+}
+
+test "parser audit: type-6 block tag list matches the specification" {
+    const cases = [_]AuditCase{
+        .{ .source = "foo\n<frame>\n", .expected = "<p>foo</p>\n<frame>\n" },
+        .{ .source = "foo\n<frameset>\n", .expected = "<p>foo</p>\n<frameset>\n" },
+        .{ .source = "foo\n<noframes>\n", .expected = "<p>foo</p>\n<noframes>\n" },
+        .{ .source = "foo\n<optgroup>\n", .expected = "<p>foo</p>\n<optgroup>\n" },
+        .{ .source = "foo\n<option>\n", .expected = "<p>foo</p>\n<option>\n" },
+        .{ .source = "foo\n<param>\n", .expected = "<p>foo</p>\n<param>\n" },
+        .{ .source = "foo\n<search>\n", .expected = "<p>foo</p>\n<search>\n" },
+        // `bgsound` is not a block tag, so it does not interrupt the paragraph.
+        .{ .source = "foo\n<bgsound>\n", .expected = "<p>foo\n<bgsound></p>\n" },
+    };
+    try checkAuditCases(&cases, .conformance);
+}
+
+test "parser audit: type-7 HTML blocks accept trailing spaces and tabs" {
+    const cases = [_]AuditCase{
+        .{
+            .source = "<a href=\"x\">   \nfoo\n\nbar\n",
+            .expected = "<a href=\"x\">   \nfoo\n<p>bar</p>\n",
+        },
+        .{
+            .source = "<a href=\"x\">\t\t\nfoo\n\nbar\n",
+            .expected = "<a href=\"x\">\t\t\nfoo\n<p>bar</p>\n",
+        },
+    };
+    try checkAuditCases(&cases, .conformance);
+}
+
+test "parser audit: HTML declarations need an ASCII letter and end at the first >" {
+    const cases = [_]AuditCase{
+        .{ .source = "<!1>\n", .expected = "<p>&lt;!1&gt;</p>\n" },
+        .{ .source = "a <!1> b\n", .expected = "<p>a &lt;!1&gt; b</p>\n" },
+        // A declaration runs to the first `>` and carries no quote rules, so
+        // the `"` inside it does not hide the closing angle bracket.
+        .{ .source = "a <!A \" > b\n", .expected = "<p>a <!A \" > b</p>\n" },
+    };
+    try checkAuditCases(&cases, .conformance);
+}
+
+test "parser audit: inline HTML attribute names use the XML attribute grammar" {
+    const cases = [_]AuditCase{
+        .{ .source = "a <x 1a=b> z\n", .expected = "<p>a &lt;x 1a=b&gt; z</p>\n" },
+        .{ .source = "a <x a.b=c> z\n", .expected = "<p>a <x a.b=c> z</p>\n" },
+        .{ .source = "a <x _a:c-d.e=b> z\n", .expected = "<p>a <x _a:c-d.e=b> z</p>\n" },
+    };
+    try checkAuditCases(&cases, .conformance);
+}
+
+test "parser audit: unquoted HTML attribute values reject prohibited characters" {
+    const cases = [_]AuditCase{
+        .{ .source = "a <a href=x=y> z\n", .expected = "<p>a &lt;a href=x=y&gt; z</p>\n" },
+        .{ .source = "a <a href=x`y> z\n", .expected = "<p>a &lt;a href=x`y&gt; z</p>\n" },
+        .{ .source = "a <x q=b'c'> z\n", .expected = "<p>a &lt;x q=b'c'&gt; z</p>\n" },
+    };
+    try checkAuditCases(&cases, .conformance);
+}
+
+test "parser audit: reference labels honour escapes and bracket rules" {
+    const cases = [_]AuditCase{
+        // `bar[baz` holds an unescaped `[`, so it is not a label; `[foo]`
+        // falls back to the shortcut reference.
+        .{
+            .source = "[foo]: /url\n\n[foo][bar[baz]\n",
+            .expected = "<p><a href=\"/url\">foo</a>[bar[baz]</p>\n",
+        },
+        // The escaped `]` does not close the label, so the full reference wins.
+        .{
+            .source = "[foo]: /url\n[bar\\]baz]: /url2\n\n[foo][bar\\]baz]\n",
+            .expected = "<p><a href=\"/url2\">foo</a></p>\n",
+        },
+    };
+    try checkAuditCases(&cases, .conformance);
+}
+
+test "parser audit: inline link titles need whitespace after an angle destination" {
+    const cases = [_]AuditCase{
+        .{ .source = "[a](<b>\"t\")\n", .expected = "<p>[a](<b>&quot;t&quot;)</p>\n" },
+        .{ .source = "[a](<b>'t')\n", .expected = "<p>[a](<b>'t')</p>\n" },
+        .{ .source = "[a](<b>(t))\n", .expected = "<p>[a](<b>(t))</p>\n" },
+        // Separating whitespace still produces the link.
+        .{ .source = "[a](<b> \"t\")\n", .expected = "<p><a href=\"b\" title=\"t\">a</a></p>\n" },
+    };
+    try checkAuditCases(&cases, .conformance);
+}
+
+test "parser audit: setext underlines are measured inside the container" {
+    const cases = [_]AuditCase{
+        .{ .source = "> foo\n>  ===\n", .expected = "<blockquote>\n<h1>foo</h1>\n</blockquote>\n" },
+        .{ .source = "> foo\n>    ===\n", .expected = "<blockquote>\n<h1>foo</h1>\n</blockquote>\n" },
+        .{ .source = "- foo\n   ===\n", .expected = "<ul>\n<li>\n<h1>foo</h1>\n</li>\n</ul>\n" },
+        // Four columns is past the three-column limit, so this stays a
+        // paragraph rather than becoming a heading.
+        .{
+            .source = "> foo\n>     ===\n",
+            .expected = "<blockquote>\n<p>foo\n===</p>\n</blockquote>\n",
+        },
+    };
+    try checkAuditCases(&cases, .conformance);
+}
+
+test "parser audit: fenced code indentation inside a container is stripped" {
+    const cases = [_]AuditCase{
+        .{
+            .source = ">   ```\n>   aaa\n>   bbb\n>   ```\n",
+            .expected = "<blockquote>\n<pre><code>aaa\nbbb\n</code></pre>\n</blockquote>\n",
+        },
+        .{
+            .source = "> ```\n> aaa\n> ```\n",
+            .expected = "<blockquote>\n<pre><code>aaa\n</code></pre>\n</blockquote>\n",
+        },
+    };
+    try checkAuditCases(&cases, .conformance);
+}
+
+test "parser audit: link destinations percent-encode the full unsafe set" {
+    const cases = [_]AuditCase{
+        .{ .source = "[a](b^c)\n", .expected = "<p><a href=\"b%5Ec\">a</a></p>\n" },
+        .{ .source = "[a](b{c}d)\n", .expected = "<p><a href=\"b%7Bc%7Dd\">a</a></p>\n" },
+        .{ .source = "[a](b|c)\n", .expected = "<p><a href=\"b%7Cc\">a</a></p>\n" },
+        // The entity decodes to a literal tab, which the renderer must encode.
+        .{ .source = "[a](b&#x09;c)\n", .expected = "<p><a href=\"b%09c\">a</a></p>\n" },
+        // An already percent-encoded destination is passed through unchanged.
+        .{ .source = "[a](foo%20b)\n", .expected = "<p><a href=\"foo%20b\">a</a></p>\n" },
+    };
+    try checkAuditCases(&cases, .conformance);
+}
+
+test "parser audit: image alt text retains escaped raw inline HTML" {
+    const cases = [_]AuditCase{
+        .{
+            .source = "![a<b>c](/d)\n",
+            .expected = "<p><img src=\"/d\" alt=\"a&lt;b&gt;c\" /></p>\n",
+        },
+        .{
+            .source = "![a<!--x-->b](/d)\n",
+            .expected = "<p><img src=\"/d\" alt=\"a&lt;!--x--&gt;b\" /></p>\n",
+        },
+    };
+    try checkAuditCases(&cases, .conformance);
+}
+
+test "parser audit: code fence info words carry at most one language- prefix" {
+    const cases = [_]AuditCase{
+        // Both references compare the first info word against `language-` and
+        // leave the word alone when it already carries the prefix.
+        .{
+            .source = "```language-ruby\nx\n```\n",
+            .expected = "<pre><code class=\"language-ruby\">x\n</code></pre>\n",
+        },
+        .{
+            .source = "```language-\nx\n```\n",
+            .expected = "<pre><code class=\"language-\">x\n</code></pre>\n",
+        },
+        .{ .source = "```ruby\nx\n```\n", .expected = "<pre><code class=\"language-ruby\">x\n</code></pre>\n" },
+        // Only the first word names the language.
+        .{
+            .source = "```language-ruby extra\nx\n```\n",
+            .expected = "<pre><code class=\"language-ruby\">x\n</code></pre>\n",
+        },
+        .{
+            .source = "```foo language-bar\nx\n```\n",
+            .expected = "<pre><code class=\"language-foo\">x\n</code></pre>\n",
+        },
+        // A container does not change which word the prefix is compared against.
+        .{
+            .source = "> ```language-ruby\n> x\n> ```\n",
+            .expected = "<blockquote>\n<pre><code class=\"language-ruby\">x\n</code></pre>\n</blockquote>\n",
+        },
+    };
+    try checkAuditCases(&cases, .conformance);
+}
+
+test "parser audit: attribute values keep the literal apostrophe" {
+    const cases = [_]AuditCase{
+        // `houdini_escape_html` runs with `secure = 0` at every cmark call site
+        // and commonmark.js `escapeXml` handles only `&`, `<`, `>` and `"`, so
+        // an apostrophe reaches the attribute context as the byte it was
+        // written as.
+        .{ .source = "[a](/b \"it's\")\n", .expected = "<p><a href=\"/b\" title=\"it's\">a</a></p>\n" },
+        .{ .source = "![it's](/b)\n", .expected = "<p><img src=\"/b\" alt=\"it's\" /></p>\n" },
+        .{ .source = "![a](b \"it's\")\n", .expected = "<p><img src=\"b\" alt=\"a\" title=\"it's\" /></p>\n" },
+        .{
+            .source = "```it's\nx\n```\n",
+            .expected = "<pre><code class=\"language-it's\">x\n</code></pre>\n",
+        },
+        // Every other byte an attribute must not carry is still escaped.
+        .{ .source = "[a](/b 'a\"b')\n", .expected = "<p><a href=\"/b\" title=\"a&quot;b\">a</a></p>\n" },
+        .{ .source = "[a](/b \"a&amp;b\")\n", .expected = "<p><a href=\"/b\" title=\"a&amp;b\">a</a></p>\n" },
+        .{ .source = "![a<b](/d)\n", .expected = "<p><img src=\"/d\" alt=\"a&lt;b\" /></p>\n" },
+        // The text context already carried the byte through unchanged.
+        .{ .source = "it's\n", .expected = "<p>it's</p>\n" },
+    };
+    try checkAuditCases(&cases, .conformance);
+}
+
+test "parser audit: a list item consumed by a link reference definition renders empty" {
+    const cases = [_]AuditCase{
+        // The definition leaves the item with no block to render, so both
+        // references close the item the way they opened it.
+        .{ .source = "- [a]: /u\n- b\n", .expected = "<ul>\n<li></li>\n<li>b</li>\n</ul>\n" },
+        .{ .source = "- [a]: /u\n", .expected = "<ul>\n<li></li>\n</ul>\n" },
+        // A definition that does not empty the item changes nothing: the block
+        // after it still opens on a line of its own.
+        .{ .source = "- [a]: /u\n  b\n", .expected = "<ul>\n<li>b</li>\n</ul>\n" },
+        .{
+            .source = "- [a]: /u\n  > b\n",
+            .expected = "<ul>\n<li>\n<blockquote>\n<p>b</p>\n</blockquote>\n</li>\n</ul>\n",
+        },
+        // A loose list still opens its paragraph on a line of its own.
+        .{
+            .source = "- [a]: /u\n\n- b\n",
+            .expected = "<ul>\n<li></li>\n<li>\n<p>b</p>\n</li>\n</ul>\n",
+        },
+    };
+    try checkAuditCases(&cases, .conformance);
+}
+
+test "parser audit: HTML blocks end on a blank line of the containing content" {
+    const cases = [_]AuditCase{
+        // A line holding only a block quote marker carries no content, so it is
+        // the blank line that ends a type-6 block.
+        .{
+            .source = "> <div>\n> foo\n>\n> bar\n",
+            .expected = "<blockquote>\n<div>\nfoo\n<p>bar</p>\n</blockquote>\n",
+        },
+        // The tab is the one space the marker may absorb, so the line is blank
+        // for the content of the quote too.
+        .{
+            .source = "> <div>\n> foo\n>\t\n> bar\n",
+            .expected = "<blockquote>\n<div>\nfoo\n<p>bar</p>\n</blockquote>\n",
+        },
+        // The same holds one quote level down.
+        .{
+            .source = "> > <div>\n> > foo\n> >\n> > bar\n",
+            .expected = "<blockquote>\n<blockquote>\n<div>\nfoo\n<p>bar</p>\n</blockquote>\n</blockquote>\n",
+        },
+        // Type 7 ends at the same container blank line.
+        .{
+            .source = "> <a href=\"x\">\n> foo\n>\n> bar\n",
+            .expected = "<blockquote>\n<a href=\"x\">\nfoo\n<p>bar</p>\n</blockquote>\n",
+        },
+    };
+    try checkAuditCases(&cases, .conformance);
+}
+
+test "parser audit: safe rendering keeps the paragraph after a quoted raw HTML block" {
+    const cases = [_]AuditCase{
+        .{
+            .source = "> <div>\n> foo\n>\n> bar\n",
+            .expected = "<blockquote>\n<!-- raw HTML omitted -->\n<p>bar</p>\n</blockquote>\n",
+        },
+        .{
+            .source = "> <a href=\"x\">\n> foo\n>\n> bar\n",
+            .expected = "<blockquote>\n<!-- raw HTML omitted -->\n<p>bar</p>\n</blockquote>\n",
+        },
+    };
+    try checkAuditCases(&cases, .safe);
+}
+
+test "parser audit: the type-6 tag name delimiter accepts a self-closing slash" {
+    const cases = [_]AuditCase{
+        // The type-6 start condition also accepts the string `/>`, and a type-6
+        // block may interrupt a paragraph.
+        .{ .source = "foo\n<div/>\n", .expected = "<p>foo</p>\n<div/>\n" },
+        .{ .source = "foo\n<hr/>\n", .expected = "<p>foo</p>\n<hr/>\n" },
+        .{ .source = "foo\n<link/>\n", .expected = "<p>foo</p>\n<link/>\n" },
+        // Only the delimiter changes; the rest of the line stays raw HTML.
+        .{
+            .source = "<div/>foo\nbar\n\nbaz\n",
+            .expected = "<div/>foo\nbar\n<p>baz</p>\n",
+        },
+    };
+    try checkAuditCases(&cases, .conformance);
+}
+
+test "parser audit: an unterminated reference label falls back to the shortcut" {
+    const cases = [_]AuditCase{
+        // The label scan reaches the end of the text without a `]`, so there is
+        // no full reference and the shortcut reference is retried.
+        .{
+            .source = "[foo]: /url\n\n[foo][bar",
+            .expected = "<p><a href=\"/url\">foo</a>[bar</p>\n",
+        },
+    };
+    try checkAuditCases(&cases, .conformance);
+    try checkAuditCases(&cases, .safe);
+}

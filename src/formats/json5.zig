@@ -1,3 +1,24 @@
+//! JSON5: RFC 8259 JSON extended with the JSON5 grammar — single-quoted
+//! strings, unquoted and escaped identifier keys, trailing commas, hexadecimal
+//! and `Infinity`/`NaN` numbers, `+` signs and bare decimal points, the JSON5
+//! whitespace and line-terminator code points, and `//` and `/* */` comments.
+//!
+//! Reachable as `simd.formats.json5`. `stage2.TokenReader` is the grammar
+//! authority for that list; this module supplies the scanner that finds the
+//! structural bytes and atom starts and never emits a comment delimiter, so a
+//! tape built here navigates like a strict JSON tape over the same input.
+//! Nothing here rewrites bytes or decodes values: every span handed back points
+//! into the caller's input, and value-level reading belongs to `simd.json_value`.
+//!
+//! Nothing here synchronizes concurrent access, so a caller that shares one
+//! index or document across threads serializes it itself.
+//!
+//! The module offers the same three sequences as `simd.formats.json`: the
+//! eager `buildJson5Tape` tape released once with `document.deinit(allocator)`,
+//! a reused `ondemand.Parser` document from `initOnDemandDocument` released
+//! with `document.deinit()`, and `initStreamIndexer` for chunk-fed input. The
+//! first two keep `input` alive for the document, its cursors, and their raw
+//! slices.
 const std = @import("std");
 const simd = @import("../core/simd.zig");
 const stage1 = @import("../core/stage1.zig");
@@ -36,7 +57,17 @@ const IndexSink = struct {
     }
 };
 
-/// Initializes a chunk-fed JSON5 Stage 1 indexer in document mode.
+/// Chunk-fed Stage 1 indexer pinned to the JSON5 dialect in document mode.
+///
+/// The wrapper fixes the mode and dialect; the caller supplies the allocator,
+/// whose interface this indexer stores. That backing state must outlive both
+/// `indexer.deinit()` and the `index.deinit(allocator)` that releases an index
+/// moved out by `take`, because both free into it. Chunk bytes are borrowed
+/// only for the duration of each `feed` call.
+///
+/// The error set is `stream.StreamIndexer.InitError`, which
+/// `stream.StreamIndexer.init` defines; it includes `error.InvalidOptions` for
+/// a mode and dialect pair this wrapper never forms.
 pub fn initStreamIndexer(
     allocator: std.mem.Allocator,
     chunk_len: usize,
@@ -47,7 +78,16 @@ pub fn initStreamIndexer(
         stream.Options{ .dialect = .json5, .mode = .document },
     );
 }
-/// Initializes a lazy JSON5 document over parser-owned indexes.
+/// Builds a lazy JSON5 document over `parser`'s reusable structural storage.
+///
+/// The document borrows `input` and the parser's index buffer, so both must
+/// outlive it, every cursor made from it, and every raw slice those cursors
+/// return. The parser allows one active document: `Document.deinit` releases
+/// that claim and no allocation, and must run before the next document and
+/// before `parser.deinit`. The error set is `ondemand.Error`.
+///
+/// Index storage is reserved before the scan, so an error return leaves the
+/// parser holding the capacity it grew to.
 pub fn initOnDemandDocument(
     parser: *ondemand.Parser,
     input: []const u8,
@@ -57,6 +97,15 @@ pub fn initOnDemandDocument(
     return parser.completeDialectDocument(input, token_count, .json5);
 }
 
+/// Owns the absolute `u32` offsets of every JSON5 structural byte and atom
+/// start in `input`, plus the three trailing sentinel slots.
+///
+/// The result owns its allocation and is released once with
+/// `index.deinit(allocator)`; it holds no bytes of `input`, which may be
+/// released as soon as this returns. A copy names the same allocation and is
+/// not a second owner. Fails with `error.OutOfMemory`,
+/// `error.CapacityOverflow`, or `error.InputTooLarge` when `input` exceeds the
+/// `u32` offset boundary.
 pub fn indexJson5(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -64,7 +113,16 @@ pub fn indexJson5(
     return indexJson5Impl(simd.default_vector_len, allocator, input);
 }
 
-/// Builds an owned, validated JSON5 tape from the Stage1 structural index.
+/// Builds an owned, validated JSON5 tape and releases the structural index it
+/// was built from.
+///
+/// The returned `stage2.Document` owns one tape and stores no allocator, so
+/// release it once with `document.deinit(allocator)` while that backing is
+/// still alive, and keep `input` alive for the document, its cursors, and
+/// their raw slices. No error path leaves the caller owning anything. Stage 1
+/// failures other than `error.OutOfMemory` arrive as `error.TapeTooLarge`,
+/// because Stage 1 cannot represent an input that Stage 2 cannot address on
+/// its tape.
 pub fn buildJson5Tape(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -78,6 +136,12 @@ pub fn buildJson5Tape(
 }
 
 /// Validates JSON5 and returns the first semantic diagnostic, if any.
+///
+/// Allocates one structural index and releases it before returning, so a
+/// successful call leaves nothing to release. `null` means the input is valid
+/// JSON5; a returned `stage2.Diagnostic` borrows `input` for its `snippet` and
+/// reports byte, line, and column positions within it. Stage 1 failures arrive
+/// as `error.TapeTooLarge`, exactly as in `buildJson5Tape`.
 pub fn validateJson5(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -90,6 +154,19 @@ pub fn validateJson5(
     return stage2.validate(input, &structural_index, .json5);
 }
 
+/// Scans `input` for JSON5 offsets, writes them into caller-owned `indexes`,
+/// and returns how many were written.
+///
+/// The slice is the caller's storage: nothing here resizes or frees it, and the
+/// returned count excludes the sentinel slots, which this call does not write.
+/// A caller that owns a `stage1.StructuralIndex` passes its slice minus those
+/// three slots and then calls `stage1.StructuralIndex.finish`.
+///
+/// The checked sink reports `error.CapacityExceeded` the moment `indexes` is
+/// full, so on that error the slice holds an unknown-length prefix of the
+/// offsets and no count is returned; discard or recompute it rather than read a
+/// partial result. `error.InputTooLarge` when `input` exceeds the `u32` offset
+/// boundary. `vlen` is the SIMD width and must be at least 4.
 pub fn indexJson5Into(
     comptime vlen: usize,
     indexes: []u32,
@@ -112,6 +189,11 @@ pub fn indexJson5Into(
     return sink.count;
 }
 
+/// `indexJson5` at an explicit SIMD width.
+///
+/// `vlen` is the bytes-per-vector width the scanner and the bit-index
+/// extractor are instantiated at, and must be at least 4. Ownership, the
+/// sentinel slots, and the errors are `indexJson5`'s.
 pub fn indexJson5Impl(
     comptime vlen: usize,
     allocator: std.mem.Allocator,

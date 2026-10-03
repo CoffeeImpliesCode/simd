@@ -1,3 +1,24 @@
+//! XML lexical indexing, well-formedness validation, tape navigation and
+//! lazy event production.
+//!
+//! The surface is UTF-8 XML only. An `encoding` pseudo-attribute is accepted
+//! only when it names `UTF-8`; no transcoding happens, and an `XmlError` names
+//! a document this module refuses rather than a document it repairs. Document
+//! type definitions are refused as `error.UnsupportedDeclaration` — no
+//! `DOCTYPE` subset is implemented — and namespaces are not resolved:
+//! `XmlQName.split` only separates a prefixed name, and nothing here binds a
+//! prefix to a namespace URI.
+//!
+//! A consumer reaches this module as `simd.formats.xml`, or by importing
+//! `formats/xml.zig` relatively.
+//!
+//! `indexXml`, `buildXmlTape` and `validateXml` read `input` in one call:
+//! `indexXml` copies offsets only, while `buildXmlTape` and `XmlDocument.root`
+//! borrow it, so those bytes must stay alive and unmodified while the
+//! document, its cursors, its decoded values and its diagnostics are read.
+//! Every entry point takes the caller's allocator, allocates nothing from an
+//! ambient source, and opens no file.
+
 const std = @import("std");
 const simd = @import("../core/simd.zig");
 const stage1 = @import("../core/stage1.zig");
@@ -8,6 +29,12 @@ comptime {
     _ = stage1.StructuralIndex;
 }
 
+/// The lexical XML token kinds the Stage 1 scanner records.
+///
+/// `attr_equals` and `attr_quote` are the only kinds that can appear twice
+/// for one element, once per attribute; every other kind appears once per
+/// markup delimiter. These are byte positions, not a parse: a `tag_open`
+/// carries no name and no nesting.
 pub const XmlTokenKind = enum(u8) {
     tag_open,
     tag_close,
@@ -19,11 +46,27 @@ pub const XmlTokenKind = enum(u8) {
     attr_quote,
 };
 
+/// Owned Stage 1 XML output: one offset per lexical token, with its kind.
+///
+/// The index stores offsets only, so the source bytes may be released as soon
+/// as the indexer returns. One index owns `indexes` and `kinds` and releases
+/// both in one `deinit`, from the same allocator the indexer was given.
+/// Copying an index copies the two slice handles, so a copy is not a second
+/// owner and must not be `deinit`'d.
 pub const XmlStructuralIndex = struct {
+    /// Token offsets, strictly increasing, of `indexes[0..count]`. Three
+    /// entries past `count` hold the sentinels
+    /// `stage1.StructuralIndex.finish` writes: the input length twice and
+    /// then `0`.
     indexes: []u32,
+    /// Kind of each of `kinds[0..count]`. Entries past `count` are unused.
     kinds: []XmlTokenKind,
+    /// Number of tokens written. The arrays are longer than this.
     count: usize,
 
+    /// Releases `indexes` and `kinds` into `allocator`, which must be the
+    /// allocator the indexer received. The index is unusable afterward, and a
+    /// second call through any copy is a double free.
     pub fn deinit(self: *XmlStructuralIndex, allocator: std.mem.Allocator) void {
         allocator.free(self.indexes);
         allocator.free(self.kinds);
@@ -31,6 +74,14 @@ pub const XmlStructuralIndex = struct {
     }
 };
 
+/// Where the lexical scanner stopped inside the current input.
+///
+/// `.outside` is the default and the mode that scans for the `<` opening a
+/// token; every other tag means an unfinished construct carries across a chunk
+/// boundary, so the next `feed` resumes inside it rather than restarting.
+/// `.opener` is the distinct case of a `<` whose kind is not yet decided, and
+/// it is why `XmlStreamIndexer.feed` and `finish` both count one extra token
+/// while it is set.
 const XmlLexicalMode = enum {
     outside,
     opener,
@@ -40,6 +91,9 @@ const XmlLexicalMode = enum {
     cdata,
 };
 
+/// What a `<!` opener is turning out to be. `.unknown` is the default and
+/// covers every opener that is not an opaque section; `.comment` and `.cdata`
+/// are only set once the section's literal prefix has matched in full.
 const XmlOpenerKind = enum {
     unknown,
     comment,
@@ -51,16 +105,39 @@ const XmlOpenerKind = enum {
 /// The scanner stores only an unfinished opener, the quote delimiter, and the
 /// previous two bytes needed by opaque-section terminators. It never borrows
 /// or copies input beyond the current call.
+///
+/// The type is published through `XmlStreamIndexer.lexical`, which holds it as
+/// a field, so a consumer reaching that field reads and writes every field
+/// here. It owns nothing, allocates nothing, borrows no input, and `.{}.{}` is
+/// the valid start-of-document state. A copy is a second independent carry,
+/// but only the indexer's own field is the one `feed` and `finish` read, and
+/// `reset` is the only thing that returns it to that state. Nothing here
+/// synchronizes and no method calls back into caller code.
 const XmlLexicalState = struct {
+    /// Where the scan stopped. `.outside` means the next `<` opens a token.
     mode: XmlLexicalMode = .outside,
+    /// The last byte of the previous chunk, so an opaque section's terminator
+    /// can straddle the boundary. Only meaningful at local index `0` of a call.
     previous_byte: u8 = 0,
+    /// The quote byte that opened the attribute value, `'`'`' or `'"'`'. Only
+    /// meaningful while `mode` is `.attribute_quote`.
     attribute_quote: u8 = 0,
+    /// Absolute source offset of the unfinished `<`. Only meaningful while
+    /// `mode` is `.opener`.
     opener_start: usize = 0,
+    /// How many bytes of the section literal have matched, counting from the
+    /// `!`. Only meaningful while `mode` is `.opener`.
     opener_length: u8 = 0,
+    /// What the opener is becoming, when it has decided.
     opener_kind: XmlOpenerKind = .unknown,
+    /// The two bytes before the current one in a `<!--` section, kept so the
+    /// `-->` terminator can straddle a chunk boundary.
     comment_previous_previous: u8 = 0,
+    /// The byte before the current one in a `<!--` section.
     comment_previous: u8 = 0,
+    /// The two bytes before the current one in a `<![CDATA[` section.
     cdata_previous_previous: u8 = 0,
+    /// The byte before the current one in a `<![CDATA[` section.
     cdata_previous: u8 = 0,
 };
 
@@ -484,33 +561,77 @@ fn finishXmlLexical(
 /// Incrementally builds the same XML structural index as `indexXml`.
 ///
 /// The scanner retains only bounded lexical carry and output storage. Input
-/// chunks are consumed before `feed` returns and are never retained.
+/// chunks are consumed before `feed` returns and are never retained, so a
+/// caller may reuse or release the chunk on return.
+///
+/// The indexer owns every array it allocates and stores the `allocator` it was
+/// given; `deinit` releases them and is the only release. One indexer is one
+/// document until `reset`. `take` hands the arrays to the caller and leaves
+/// this indexer owning only the line-free remainder, so `deinit` after `take`
+/// is safe.
 pub const XmlStreamIndexer = struct {
+    /// Retained. Every array this indexer owns, and every later growth of
+    /// them, comes from this allocator, and `deinit` frees into it. It must
+    /// stay valid and unmodified for the indexer's whole lifetime.
     allocator: std.mem.Allocator,
+    /// Structural output. `null` only between `take` and the next `feed`,
+    /// `finish` or `reset`; `deinit` then has nothing to release.
     index: ?stage1.StructuralIndex = null,
+    /// Kind array paired with `index`. `null` on the same window as `index`.
     kinds: ?[]XmlTokenKind = null,
+    /// Bytes accepted so far, terminators included. `finish` writes it as the
+    /// trailing sentinel.
     input_len: usize = 0,
+    /// Lexical carry between chunks: the current mode, the quote delimiter,
+    /// an unfinished `<` opener and the previous bytes an opaque section's
+    /// terminator needs. `reset` clears it.
     lexical: XmlLexicalState = .{},
+    /// Set by a successful `finish`. A later `feed` returns
+    /// `error.AlreadyFinished` and `finish` becomes a no-op.
     finished: bool = false,
 
     const Self = XmlStreamIndexer;
     const initial_output_capacity: usize = 1;
 
+    /// Errors `init` returns: `error.InputTooLarge` for a `chunk_len` beyond
+    /// `u32`, `error.CapacityOverflow` for a reservation that overflows, and
+    /// `error.OutOfMemory` from it.
     pub const InitError = stage1.StructuralIndex.InitError;
+    /// `feed`'s failures. `error.AlreadyFinished` after a successful `finish`,
+    /// and `error.CapacityOverflow` and `error.InputTooLarge`, are decided
+    /// before scanning starts, so no part of the chunk is accepted and the
+    /// prior logical state is intact. `error.CapacityExceeded` is the scanner's
+    /// own refusal once it runs, and leaves emitted tokens and advanced lexical
+    /// state behind; `feed` states the residue.
     pub const FeedError = std.mem.Allocator.Error || error{
         AlreadyFinished,
         CapacityOverflow,
         InputTooLarge,
         CapacityExceeded,
     };
+    /// `finish`'s failures: the sizing and allocator tags from growing the
+    /// output for a pending `<` opener and writing the structural sentinels,
+    /// plus `error.CapacityExceeded` from emitting that opener. A failed call
+    /// leaves the lexical state and every counter as they were, so `finish` may
+    /// be called again.
     pub const FinishError = std.mem.Allocator.Error || error{
         CapacityOverflow,
         InputTooLarge,
         CapacityExceeded,
     };
+    /// `feedFrom`'s failures: every tag of `FeedError` and `FinishError`, plus
+    /// `std.Io.Reader.ShortError`, which is the reader's short-read set rather
+    /// than a tag and contributes exactly one of them, `error.ReadFailed`.
+    /// The other tag `reader.fill` can return, `error.EndOfStream`, is
+    /// consumed here and runs `finish` instead of reaching the caller.
     pub const FeedFromError = FeedError || FinishError || std.Io.Reader.ShortError;
 
     /// Allocates structural storage with `chunk_len` as its initial capacity.
+    ///
+    /// `chunk_len` is a capacity, not a bound: `feed` grows the output as
+    /// needed, and a `chunk_len` of `0` still allocates one entry. On
+    /// `error.OutOfMemory` both arrays are released and the caller owns
+    /// nothing. The allocator must outlive the indexer.
     pub fn init(allocator: std.mem.Allocator, chunk_len: usize) InitError!XmlStreamIndexer {
         const output_capacity = @max(chunk_len, initial_output_capacity);
         var index = try stage1.StructuralIndex.init(allocator, output_capacity);
@@ -523,6 +644,9 @@ pub const XmlStreamIndexer = struct {
         };
     }
 
+    /// Releases the structural output into `self.allocator`. An index already
+    /// returned by `take` is unaffected and stays owned by the caller. The
+    /// indexer is unusable afterward, and a second call is a double free.
     pub fn deinit(self: *Self) void {
         if (self.index) |*index| index.deinit(self.allocator);
         if (self.kinds) |kinds| self.allocator.free(kinds);
@@ -530,6 +654,13 @@ pub const XmlStreamIndexer = struct {
     }
 
     /// Adds a caller-owned chunk without retaining a reference to that chunk.
+    ///
+    /// Size and allocation checks run before scanning and preserve prior logical
+    /// state on failure; no part of `data` is accepted. `error.AlreadyFinished`
+    /// also accepts nothing and requires `reset` before another document.
+    /// Once scanning starts, `error.CapacityExceeded` can leave emitted tokens
+    /// and advanced lexical state, with `input_len` counting the entire chunk.
+    /// Do not feed that chunk again: `reset` to discard the document or `deinit`.
     pub fn feed(self: *Self, data: []const u8) FeedError!void {
         if (self.finished) return error.AlreadyFinished;
         const new_input_len = std.math.add(usize, self.input_len, data.len) catch {
@@ -550,6 +681,18 @@ pub const XmlStreamIndexer = struct {
 
     /// Drains a reader into `feed` and finalizes at EOF. Reader bytes are
     /// borrowed only for each call and are never retained.
+    ///
+    /// `reader` is not retained: it and the provider behind it must stay live
+    /// for the duration of the call, and this indexer stores no `std.Io`.
+    /// The call may block according to the reader's implementation. Provider
+    /// failures return `error.ReadFailed`; cancellation can reach this call
+    /// through that provider failure channel, not a separate cancellation tag.
+    /// `error.EndOfStream` is consumed and runs `finish` instead.
+    ///
+    /// An error from `feed` propagates before `reader.toss`, so the reader
+    /// still holds the chunk that failed. An error from `reader.fill` leaves
+    /// every buffered byte already consumed and fed, and the caller may
+    /// finish or keep feeding from elsewhere.
     pub fn feedFrom(self: *Self, reader: *std.Io.Reader) FeedFromError!void {
         while (true) {
             const data = reader.buffered();
@@ -566,6 +709,13 @@ pub const XmlStreamIndexer = struct {
     }
 
     /// Finalizes pending opener state and writes the structural sentinels.
+    ///
+    /// An unterminated `<` opener becomes a `tag_open` token here, matching
+    /// what `indexXml` records for the same input. On success `take` becomes
+    /// legal and `feed` returns `error.AlreadyFinished`. An
+    /// `error.OutOfMemory` or `error.CapacityOverflow` leaves the lexical
+    /// state and every counter exactly as they were, so `finish` may be called
+    /// again.
     pub fn finish(self: *Self) FinishError!void {
         if (self.finished) return;
         const deferred_opener = if (self.lexical.mode == .opener) @as(usize, 1) else 0;
@@ -581,6 +731,12 @@ pub const XmlStreamIndexer = struct {
     }
 
     /// Transfers the finalized structural index and token kinds to the caller.
+    ///
+    /// Requires a successful `finish`. That precondition is asserted, so
+    /// `ReleaseFast` and `ReleaseSmall` enforce nothing here and an unfinished
+    /// indexer is undefined behaviour rather than a diagnosable error. The
+    /// two arrays leave the indexer with this call; `deinit` afterwards frees
+    /// nothing that this returned.
     pub fn take(self: *Self) XmlStructuralIndex {
         std.debug.assert(self.finished);
         std.debug.assert(self.index != null);
@@ -597,6 +753,13 @@ pub const XmlStreamIndexer = struct {
     }
 
     /// Starts a new document while retaining reusable output capacity.
+    ///
+    /// This is the only recovery from an errored `feed` or `finish`, and it is
+    /// valid before or after `finish` and after `take`: the output capacity
+    /// survives, the token count returns to zero, and the lexical carry is
+    /// cleared. Entries past the new count in `indexes` still hold the
+    /// previous document's sentinels until the next `finish` rewrites them,
+    /// so an unfinished index must not be taken or read.
     pub fn reset(self: *Self) void {
         if (self.index) |*index| index.count = 0;
         self.input_len = 0;
@@ -657,6 +820,15 @@ pub const XmlStreamIndexer = struct {
     }
 };
 
+/// Builds the Stage 1 structural index for `input` at the default vector
+/// width.
+///
+/// This is lexical scanning only: it does not check well-formedness, encoding
+/// or nesting. `input` is read and not retained, so it may be released when
+/// this returns. `error.InputTooLarge` when `input.len` exceeds
+/// `std.math.maxInt(u32)` is decided before the first allocation, and
+/// `error.OutOfMemory` leaves the caller owning nothing. The returned index
+/// owns its two arrays.
 pub fn indexXml(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -664,6 +836,10 @@ pub fn indexXml(
     return indexXmlImpl(simd.default_vector_len, allocator, input);
 }
 
+/// `indexXml` with `vlen` as the SIMD candidate width.
+///
+/// Every width in the supported range produces the same offsets and kinds.
+/// The ownership, error and residue contract is the one `indexXml` documents.
 pub fn indexXmlImpl(
     comptime vlen: usize,
     allocator: std.mem.Allocator,
@@ -1310,8 +1486,32 @@ test "indexXml rejects inputs whose indexes cannot fit u32" {
     }
 }
 
+/// Deepest element nesting this module accepts, in elements. A document that
+/// would nest further fails with `error.DepthExceeded` rather than growing a
+/// stack, because every parser here holds its frames in a fixed
+/// `xml_max_depth` array.
 pub const xml_max_depth: usize = 1024;
 
+/// Every failure this module reports for XML input, one closed set.
+///
+/// The encoding and character tags are `InvalidUtf8` for a malformed UTF-8
+/// sequence and `InvalidCharacter` for a code point XML forbids. The name and
+/// attribute tags are `InvalidName`, `InvalidAttribute` and
+/// `DuplicateAttribute`. `InvalidEntity` covers a reference that is neither
+/// predefined, numeric nor a resolvable character reference. The grammar tags
+/// are `UnexpectedToken`, `EmptyDocument`, `RootNotSingular`, `MismatchedTag`,
+/// `UnclosedElement`, `UnterminatedElement`, `DepthExceeded`,
+/// `UnterminatedComment`, `InvalidComment`, `UnterminatedCdata` and
+/// `UnterminatedProcessingInstruction`. The declaration tags are
+/// `UnsupportedDeclaration` for a `<!` construct this module does not
+/// implement, including a document type definition, and `InvalidDeclaration`
+/// for a malformed XML declaration or an `encoding` other than `UTF-8`. The
+/// navigation tags are `TapeTooLarge`, `TapeOutOfBounds`,
+/// `SourceOutOfBounds`, `SourceMismatch`, `InvalidTapeKind` and
+/// `InvalidTapeOrder`. `CapacityOverflow` and `CapacityExceeded` are sizing
+/// failures, `OverlappingBuffers` rejects a decode whose output overlaps its
+/// own source, and the last four tags are `resident.Error`'s, spelled out so
+/// one set names the whole family.
 pub const XmlError = error{
     InvalidUtf8,
     InvalidCharacter,
@@ -1347,37 +1547,82 @@ pub const XmlError = error{
     OutOfOrderIteration,
 };
 
+/// Errors `buildXmlTape` returns. It allocates the tape, so
+/// `error.OutOfMemory` is reachable, and a grammar or capacity failure leaves
+/// the caller owning nothing.
 pub const XmlBuildError = std.mem.Allocator.Error || XmlError;
+/// Errors `validateXml` returns. It builds no tape and reports the first
+/// failure as an `XmlDiagnostic`, so the tags it hands back as errors are
+/// `error.OutOfMemory` and `error.TapeTooLarge`; the rest of `XmlError` names
+/// what the diagnostic's `err` can carry.
 pub const XmlValidationError = std.mem.Allocator.Error || XmlError;
 
 /// Caller-owned storage for allocation-free XML value decoding.
 ///
 /// `source` must remain alive and unchanged for the event lifetime. `output`
 /// must not overlap `source`; decoding writes only after validation and sizing.
+/// Both slices are borrowed for the call and copied nowhere, so this struct
+/// may be a temporary literal at each `decodeInto` site.
 pub const XmlDecodeOptions = struct {
+    /// The document source the event's `raw`, `name` and `value` must point
+    /// into. The event is checked against it by pointer identity, so a
+    /// different slice of the right length is rejected with
+    /// `error.SourceMismatch`.
     source: []const u8,
+    /// Caller-owned destination for the decoded UTF-8 bytes. Decoding writes
+    /// nothing unless the whole value is validated and known to fit, so an
+    /// error leaves `output` untouched.
     output: []u8,
 };
 
 /// Borrowed XML declaration pseudo-attribute values.
+///
+/// Every field is a sub-slice of the `<?xml ... ?>` raw text the event or
+/// `parseDeclarationInfo` was given, so they share that lifetime and none of
+/// them is NUL-terminated. `parseDeclarationInfo` requires `version`, so
+/// `version` is always present and equals `"1.0"` exactly.
 pub const XmlDeclarationInfo = struct {
+    /// The `version` value, always `"1.0"`.
     version: []const u8,
+    /// The `encoding` value, or `null` when the declaration omits it. Only
+    /// `UTF-8` is accepted, case-insensitively, so a returned value names
+    /// UTF-8 and no transcoding is implied by it.
     encoding: ?[]const u8,
+    /// The `standalone` value, `"yes"` or `"no"`, or `null` when the
+    /// declaration omits it.
     standalone: ?[]const u8,
 };
 
 /// A lexical QName split into borrowed NCName slices.
 ///
-/// This type does not resolve namespace prefixes.
+/// This type does not resolve namespace prefixes. `prefix` is the text before
+/// the single colon and `local_name` the text after it, both borrowed from
+/// the `raw_name` passed to `split`; nothing here looks up a namespace URI,
+/// and an unbound prefix is not an error.
 pub const XmlQName = struct {
+    /// The prefix before the colon, or `null` for an unprefixed name.
     prefix: ?[]const u8,
+    /// The local name after the colon, or the whole name when `prefix` is
+    /// `null`.
     local_name: []const u8,
 
+    /// Splits one QName. Allocates nothing.
+    ///
+    /// `error.InvalidName` for an empty name, a leading or trailing colon, a
+    /// second colon, or a part that is not a valid XML NCName;
+    /// `error.InvalidUtf8` for a malformed UTF-8 sequence inside one. The
+    /// result borrows `raw_name`.
     pub fn split(raw_name: []const u8) XmlError!XmlQName {
         return splitXmlQName(raw_name);
     }
 };
 
+/// The token kinds an XML tape and an `XmlEvent` share.
+///
+/// `xml_declaration` and `processing_instruction` are both `<?...?>` raw
+/// spans; they differ only in the target name. `text` and `cdata` are
+/// character data, differing in whether the span is delimited by CDATA
+/// markers, and only those three decode.
 pub const XmlTapeKind = enum(u8) {
     xml_declaration,
     element_start,
@@ -1390,15 +1635,33 @@ pub const XmlTapeKind = enum(u8) {
     processing_instruction,
 };
 
+/// A compact validated XML token. `payload` stores the token's source span
+/// length.
+///
+/// The fields are public, so a caller may write a word into
+/// `XmlDocument.tape`; every navigation method re-parses the span it points
+/// at and rejects a forged word with `XmlError`.
 pub const XmlTapeWord = packed struct(u64) {
+    /// `std.meta.intToEnum(XmlTapeKind, kind)`. Navigation compares it against
+    /// the enum rather than converting, so a value no tag has gives
+    /// `error.InvalidTapeKind`.
     kind: u8,
+    /// Token span length in bytes. `buildXmlTape` rejects a longer span with
+    /// `error.TapeTooLarge`.
     payload: u24,
+    /// Source offset of the token.
     offset: u32,
 
+    /// `tapeKind` without a check. A `kind` that is not an `XmlTapeKind` tag
+    /// traps in Debug and ReleaseSafe and is undefined behaviour in
+    /// ReleaseFast and ReleaseSmall, so a caller reading an externally
+    /// supplied tape word uses `XmlDocument.word` and the checked navigation
+    /// methods instead.
     pub fn tapeKind(self: XmlTapeWord) XmlTapeKind {
         return @enumFromInt(self.kind);
     }
 
+    /// `payload` widened to `usize`.
     pub fn sourceLength(self: XmlTapeWord) usize {
         return @intCast(self.payload);
     }
@@ -1423,32 +1686,84 @@ comptime {
     std.debug.assert(@sizeOf(XmlTapeWord) == 8);
 }
 
+/// The first failure `validateXml` found in a document.
+///
+/// The value is a view, not an owner: `snippet` is a sub-slice of the `input`
+/// `validateXml` was given, so it stays valid only while those bytes do.
 pub const XmlDiagnostic = struct {
+    /// What failed.
     err: XmlError,
+    /// Byte offset into the input, clamped to `input.len`.
     byte_offset: usize,
+    /// One-based line number of `byte_offset`, clamped to
+    /// `std.math.maxInt(u32)`.
     line: u32,
+    /// One-based column of `byte_offset` inside its line, clamped to
+    /// `std.math.maxInt(u32)`.
     column: u32,
+    /// Up to 16 bytes of the input on each side of `byte_offset`, cut at the
+    /// line boundaries.
     snippet: []const u8,
+    /// Offset of `snippet[0]` in the input, so the snippet can be located
+    /// with it.
     snippet_start: usize,
 };
 
+/// An element start tag or a self-closing tag, borrowed from the source.
+///
+/// `raw`, `name` and `offset` are sub-slices and offsets into the source the
+/// document was opened with, and nothing here owns a byte. `self_closing`
+/// is what separates the two union tags; the field is redundant with the tag
+/// a caller arrived through and is kept so a `XmlElementEvent` taken out of
+/// the union keeps its meaning.
 pub const XmlElementEvent = struct {
+    /// The whole tag, from `<` through the closing `>`.
     raw: []const u8,
+    /// The element name, a sub-slice of `raw`.
     name: []const u8,
+    /// Offset of `raw` in the source.
     offset: u32,
+    /// `true` for `<a/>`, `false` for `<a>`.
     self_closing: bool,
 };
 
+/// One attribute, borrowed from the source. The value is still quoted and
+/// still escaped; `decodedLength` and `decodeInto` are the only ways to read
+/// it as text.
+///
+/// `raw`, `name` and `value` are sub-slices of the source the document was
+/// opened with. `value` excludes the surrounding quotes.
 pub const XmlAttributeEvent = struct {
+    /// The whole `name='value'` or `name="value"` run.
     raw: []const u8,
+    /// The attribute name, a sub-slice of `raw`.
     name: []const u8,
+    /// The quoted value's contents, a sub-slice of `raw`.
     value: []const u8,
+    /// Offset of `raw` in the source.
     offset: u32,
 
+    /// UTF-8 byte length `decodeInto` would write for this value. Allocates
+    /// nothing and writes nothing.
+    ///
+    /// `source` must be the slice `raw` points into, or `error.SourceMismatch`.
+    /// The returned length is exact and is at most `raw.len`, so an output
+    /// buffer of that size always suffices.
     pub fn decodedLength(self: XmlAttributeEvent, source: []const u8) XmlError!usize {
         return decodeXmlAttributeEvent(self, source, null);
     }
 
+    /// Writes the decoded attribute value into `options.output` and returns
+    /// the number of bytes written.
+    ///
+    /// The event is validated against `options.source` and the decoded length
+    /// is computed before anything is written, so `error.SourceMismatch`,
+    /// `error.SourceOutOfBounds`, `error.InvalidTapeOrder` and the grammar
+    /// tags leave `output` untouched. `error.OverlappingBuffers` when
+    /// `output` overlaps `options.source`, and `error.CapacityExceeded` when
+    /// `output` is shorter than `decodedLength`; both also leave it untouched.
+    /// Line ends and tabs normalize to a single space and character
+    /// references resolve; a reference is never normalized twice.
     pub fn decodeInto(
         self: XmlAttributeEvent,
         options: XmlDecodeOptions,
@@ -1457,14 +1772,34 @@ pub const XmlAttributeEvent = struct {
     }
 };
 
+/// Character data between tags, borrowed from the source. The text is still
+/// escaped; `decodedLength` and `decodeInto` are the only ways to read it as
+/// text.
+///
+/// `raw` is a sub-slice of the source the document was opened with. It never
+/// contains `<`, so a text run stops at the next markup delimiter.
 pub const XmlTextEvent = struct {
+    /// The escaped text run.
     raw: []const u8,
+    /// Offset of `raw` in the source.
     offset: u32,
 
+    /// UTF-8 byte length `decodeInto` would write for this text. Allocates
+    /// nothing and writes nothing.
+    ///
+    /// `source` must be the slice `raw` points into, or `error.SourceMismatch`.
+    /// The returned length is exact and is at most `raw.len`.
     pub fn decodedLength(self: XmlTextEvent, source: []const u8) XmlError!usize {
         return decodeXmlTextEvent(self, source, null);
     }
 
+    /// Writes the decoded text into `options.output` and returns the number of
+    /// bytes written.
+    ///
+    /// Validation and sizing happen before any write, so a mismatch, a
+    /// grammar failure, `error.OverlappingBuffers` or `error.CapacityExceeded`
+    /// leaves `output` untouched. A CRLF line end normalizes to a single `\n`;
+    /// a bare CR does too.
     pub fn decodeInto(
         self: XmlTextEvent,
         options: XmlDecodeOptions,
@@ -1473,21 +1808,43 @@ pub const XmlTextEvent = struct {
     }
 };
 
+/// A comment, borrowed from the source. Comment content is never decoded, so
+/// this type has no decoding method.
 pub const XmlCommentEvent = struct {
+    /// The whole `<!--...-->` span.
     raw: []const u8,
+    /// The bytes between `<!--` and `-->`, a sub-slice of `raw`.
     content: []const u8,
+    /// Offset of `raw` in the source.
     offset: u32,
 };
 
+/// Raw CDATA source spans. `content` has neither entity expansion nor line-ending
+/// normalization; the checked value decoders normalize CR and CRLF to LF.
 pub const XmlCdataEvent = struct {
+    /// The whole `<![CDATA[...]]>` span.
     raw: []const u8,
+    /// The bytes between `<![CDATA[` and `]]>`, a sub-slice of `raw`.
     content: []const u8,
+    /// Offset of `raw` in the source.
     offset: u32,
 
+    /// UTF-8 byte length `decodeInto` would write for this section. Allocates
+    /// nothing and writes nothing.
+    ///
+    /// `source` must be the slice `raw` points into, or `error.SourceMismatch`.
+    /// The returned length is exact and is at most `content.len`.
     pub fn decodedLength(self: XmlCdataEvent, source: []const u8) XmlError!usize {
         return decodeXmlCdataEvent(self, source, null);
     }
 
+    /// Writes the CDATA content into `options.output` and returns the number
+    /// of bytes written.
+    ///
+    /// Validation and sizing happen before any write, so a mismatch, a
+    /// grammar failure, `error.OverlappingBuffers` or `error.CapacityExceeded`
+    /// leaves `output` untouched. Entities remain literal; CR and CRLF each
+    /// normalize to one LF, as in decoded text.
     pub fn decodeInto(
         self: XmlCdataEvent,
         options: XmlDecodeOptions,
@@ -1496,17 +1853,34 @@ pub const XmlCdataEvent = struct {
     }
 };
 
+/// A processing instruction, borrowed from the source. `data` is the raw
+/// text between the target name and `?>`, with leading and trailing XML
+/// whitespace trimmed; a PI is never decoded.
 pub const XmlProcessingInstructionEvent = struct {
+    /// The whole `<?target data?>` span.
     raw: []const u8,
+    /// The PI target, a sub-slice of `raw`, excluding `<?`.
     target: []const u8,
+    /// The trimmed instruction data, a sub-slice of `raw`, possibly empty.
     data: []const u8,
+    /// Offset of `raw` in the source.
     offset: u32,
 };
 
+/// An `<?xml ... ?>` declaration, borrowed from the source.
 pub const XmlDeclarationEvent = struct {
+    /// The whole `<?xml ... ?>` span.
     raw: []const u8,
+    /// Offset of `raw` in the source.
     offset: u32,
 
+    /// The declaration's pseudo-attributes, parsed and checked.
+    ///
+    /// `source` must be the slice `raw` points into, or `error.SourceMismatch`.
+    /// `error.InvalidDeclaration` covers a missing or malformed `version`, a
+    /// pseudo-attribute out of order or duplicated, an `encoding` that is not
+    /// `UTF-8` case-insensitively, an unknown pseudo-attribute, and a value
+    /// that is not well-formed XML data. The result borrows `raw`.
     pub fn info(
         self: XmlDeclarationEvent,
         source: []const u8,
@@ -1515,6 +1889,17 @@ pub const XmlDeclarationEvent = struct {
     }
 };
 
+/// One XML event from the resident parser or from a tape cursor.
+///
+/// Every payload borrows the document source: no variant owns a byte, and all
+/// of them become invalid when the caller writes or releases that source. The
+/// union is the checked view — `XmlElementEvent`, `XmlAttributeEvent` and the
+/// rest can be built by hand, and the methods that read or decode them
+/// re-derive every field from `source` rather than trusting the fields.
+///
+/// `element_start` and `self_closing_element` share one payload type, so the
+/// tag is what says which it is; `element_end` has no `self_closing` field
+/// because a close tag cannot be self-closing.
 pub const XmlEvent = union(enum) {
     xml_declaration: XmlDeclarationEvent,
     element_start: XmlElementEvent,
@@ -1526,6 +1911,7 @@ pub const XmlEvent = union(enum) {
     comment: XmlCommentEvent,
     processing_instruction: XmlProcessingInstructionEvent,
 
+    /// The event's raw span, borrowed from the source.
     pub fn raw(self: XmlEvent) []const u8 {
         return switch (self) {
             .xml_declaration => |event| event.raw,
@@ -1539,6 +1925,10 @@ pub const XmlEvent = union(enum) {
             .processing_instruction => |event| event.raw,
         };
     }
+    /// UTF-8 byte length `decodeInto` would write, or
+    /// `error.InvalidTapeOrder` for a tag that is not `attribute`, `text` or
+    /// `cdata`. The rules are the payload's own `decodedLength`.
+    ///
     pub fn decodedLength(self: XmlEvent, source: []const u8) XmlError!usize {
         return switch (self) {
             .attribute => |event| event.decodedLength(source),
@@ -1548,6 +1938,11 @@ pub const XmlEvent = union(enum) {
         };
     }
 
+    /// Writes the decoded value into `options.output`, or
+    /// `error.InvalidTapeOrder` for a tag that is not `attribute`, `text` or
+    /// `cdata`. The rules, including what stays untouched on each failure, are
+    /// the payload's own `decodeInto`.
+    ///
     pub fn decodeInto(self: XmlEvent, options: XmlDecodeOptions) XmlError!usize {
         return switch (self) {
             .attribute => |event| event.decodeInto(options),
@@ -1557,6 +1952,10 @@ pub const XmlEvent = union(enum) {
         };
     }
 
+    /// The declaration's pseudo-attributes, or `error.InvalidTapeOrder` for any
+    /// tag other than `xml_declaration`. The rules are `XmlDeclarationEvent`'s
+    /// `info`.
+    ///
     pub fn declarationInfo(
         self: XmlEvent,
         source: []const u8,
@@ -1568,26 +1967,66 @@ pub const XmlEvent = union(enum) {
     }
 };
 
+/// One tape token, borrowed from the document source.
+///
+/// This is the flat view a cursor hands out: a kind, the raw span and its
+/// offset. It carries no decoded fields, so nothing on it needs a source check
+/// beyond the cursor's own per-token re-parse.
 pub const XmlToken = struct {
+    /// What the span is. The span has already been re-parsed and matched
+    /// against this kind by the cursor that produced the token.
     kind: XmlTapeKind,
+    /// The token's raw span. Borrows the document source.
     raw: []const u8,
+    /// Offset of `raw` in the source.
     offset: u32,
 };
 
+/// An owned XML tape, optionally paired with the source it was built from.
+///
+/// One document owns `tape` and releases it in one `deinit`; `source` is a
+/// borrow the document never frees. `buildXmlTape` records the `input` it was
+/// given, and that recorded source must stay alive and unmodified for as long
+/// as the document, any `XmlTapeCursor` made from it, and any value decoded
+/// from one are used. Copying a document copies the tape handle, so a copy is
+/// not a second owner and must not be `deinit`'d.
 pub const XmlDocument = struct {
+    /// One word per token, in strictly increasing offset order. `buildXmlTape`
+    /// writes it; a caller may also build one by hand, and every navigation
+    /// method then re-parses each span it points at.
     tape: []XmlTapeWord,
+    /// The recorded source, or `null` for a document whose source was never
+    /// recorded or was cleared by the caller. `root` and `declarationInfo`
+    /// require it and return `error.SourceMismatch` when it is `null`; the
+    /// `sourceSpan` family does not consult it.
     source: ?[]const u8 = null,
 
+    /// Releases `tape` into `allocator`, which must be the allocator
+    /// `buildXmlTape` received. The borrowed source is untouched. The document
+    /// and every cursor over it are unusable afterward, and a second call
+    /// through any copy is a double free.
     pub fn deinit(self: *XmlDocument, allocator: std.mem.Allocator) void {
         allocator.free(self.tape);
         self.* = undefined;
     }
 
+    /// The word at `tape_index`, or `error.TapeOutOfBounds`. The `kind` field
+    /// comes back unconverted and unchecked; a word this document did not
+    /// build is only validated once `sourceSpan`, `root` or a cursor reaches
+    /// it.
     pub fn word(self: *const XmlDocument, tape_index: usize) XmlError!XmlTapeWord {
         if (tape_index >= self.tape.len) return error.TapeOutOfBounds;
         return self.tape[tape_index];
     }
 
+    /// The raw span of `tape_index`, re-parsed and matched against its kind.
+    ///
+    /// `input` is not checked against the recorded `source`, so any slice is
+    /// read here; use `root` when a caller needs the tape bound to its own
+    /// source. `error.InvalidTapeOrder` when the span does not parse as its
+    /// kind or when offsets do not strictly increase, and
+    /// `error.SourceOutOfBounds` when offset and length do not fit `input`. The
+    /// result borrows `input`.
     pub fn sourceSpan(
         self: *const XmlDocument,
         input: []const u8,
@@ -1609,6 +2048,14 @@ pub const XmlDocument = struct {
         return input[source_offset .. source_offset + source_length];
     }
 
+    /// The first `<?xml ... ?>` declaration in the tape, or `null` when the
+    /// document has none.
+    ///
+    /// Unlike `sourceSpan` this does require the recorded source:
+    /// `error.SourceMismatch` when `source` is `null` or `input` is not the
+    /// same slice. Every token before the declaration is re-parsed, so the
+    /// result borrows `input` and a `XmlError` can come from any earlier
+    /// token.
     pub fn declarationInfo(
         self: *const XmlDocument,
         input: []const u8,
@@ -1625,6 +2072,18 @@ pub const XmlDocument = struct {
         return null;
     }
 
+    /// A cursor on the first element, after re-validating the whole tape
+    /// against the source.
+    ///
+    /// `input` must be the same slice `source` names — same pointer and length
+    /// — or this returns `error.SourceMismatch`, and `null` source always
+    /// gives the same error. Validation re-parses the document and compares
+    /// every token with it, so it costs a full pass; call it once and walk the
+    /// cursor. Leading declarations, comments and processing instructions are
+    /// skipped; `error.TapeOutOfBounds` for an empty tape or one with no
+    /// element at all, and `error.InvalidTapeOrder` for a token that cannot
+    /// appear in the prologue. The cursor borrows `self` and `input`, so
+    /// neither may be released or `deinit`'d while it is used.
     pub fn root(self: *const XmlDocument, input: []const u8) XmlError!XmlTapeCursor {
         const source = self.source orelse return error.SourceMismatch;
         if (source.ptr != input.ptr or source.len != input.len) return error.SourceMismatch;
@@ -1747,9 +2206,22 @@ fn xmlTapeAttributeMatches(raw: []const u8) bool {
     return true;
 }
 
+/// A positional walk over a validated `XmlDocument` tape.
+///
+/// The cursor stores the document pointer and the source slice `root` was
+/// given, and holds neither: it borrows `document` and `input`, so the
+/// document must outlive every cursor over it and must not be `deinit`'d while
+/// one is used. A cursor is a plain value, so copying one is free and the copy
+/// advances independently. Every method re-checks the source identity and
+/// re-parses the span under the cursor, so a tape edited after `root` is
+/// rejected instead of read.
 pub const XmlTapeCursor = struct {
+    /// The document this cursor walks. Borrowed for the cursor's lifetime.
     document: *const XmlDocument,
+    /// The source slice passed to `XmlDocument.root`. Borrowed.
     input: []const u8,
+    /// Index of the next token in `document.tape`. Equal to
+    /// `document.tape.len` once the walk is exhausted.
     position: usize,
 
     fn ensureSource(self: *const XmlTapeCursor) XmlError!void {
@@ -1759,6 +2231,11 @@ pub const XmlTapeCursor = struct {
         }
     }
 
+    /// The token under the cursor, or `null` once the walk is past the last
+    /// one. Every call re-checks the source identity first, so
+    /// `error.SourceMismatch` is what a cursor over a document whose `source`
+    /// was cleared or no longer matches `input` reports; `peek` never moves
+    /// the cursor.
     pub fn peek(self: *const XmlTapeCursor) XmlError!?XmlToken {
         try self.ensureSource();
         if (self.position >= self.document.tape.len) return null;
@@ -1766,11 +2243,20 @@ pub const XmlTapeCursor = struct {
         return value;
     }
 
+    /// The token under the cursor as an attribute, with its name and value
+    /// split out of `raw`.
+    ///
+    /// `error.TapeOutOfBounds` when the walk is exhausted,
+    /// `error.InvalidTapeOrder` when the token is not an `attribute`, and the
+    /// grammar tags when the attribute itself does not parse. Nothing moves
+    /// on any error. The result borrows `input`.
     pub fn currentAttribute(self: *const XmlTapeCursor) XmlError!XmlAttributeEvent {
         const token = try self.currentTokenOfKind(.attribute);
         return makeXmlAttributeEvent(token.raw, token.offset);
     }
 
+    /// The token under the cursor as text, with the same errors, bounds and
+    /// borrow rules as `currentAttribute`.
     pub fn currentText(self: *const XmlTapeCursor) XmlError!XmlTextEvent {
         const token = try self.currentTokenOfKind(.text);
         return .{
@@ -1779,6 +2265,10 @@ pub const XmlTapeCursor = struct {
         };
     }
 
+    /// The token under the cursor as a CDATA section, with `content` split out
+    /// of `raw`. Same errors, bounds and borrow rules as `currentAttribute`,
+    /// plus `error.InvalidTapeOrder` when the span is not bracketed by
+    /// `<![CDATA[` and `]]>`.
     pub fn currentCdata(self: *const XmlTapeCursor) XmlError!XmlCdataEvent {
         const token = try self.currentTokenOfKind(.cdata);
         if (token.raw.len < "<![CDATA[]]>".len) return error.InvalidTapeOrder;
@@ -1802,12 +2292,27 @@ pub const XmlTapeCursor = struct {
         return token;
     }
 
+    /// The token under the cursor and the position past it, or `null` once the
+    /// walk is exhausted. Nothing moves when `peek` fails.
     pub fn advance(self: *XmlTapeCursor) XmlError!?XmlToken {
         const token = try self.peek() orelse return null;
         self.position += 1;
         return token;
     }
 
+    /// Consumes one whole subtree and leaves the cursor after it.
+    ///
+    /// On an `element_start` this walks to the matching `element_end`, and on a
+    /// `self_closing_element` it consumes the trailing attribute tokens too. On
+    /// any other token it consumes that one token and returns, which is what
+    /// makes the call usable on a text or comment position. An exhausted walk
+    /// is not an error and consumes nothing.
+    ///
+    /// `error.TapeOutOfBounds` when a subtree's `element_end` never arrives,
+    /// and `error.InvalidTapeOrder` for a non-attribute token where the
+    /// skipping rule expects one, or an `element_end` with no open element.
+    /// The cursor is left where the walk stopped, so it can be advanced again
+    /// after the caller inspects that position.
     pub fn skipChild(self: *XmlTapeCursor) XmlError!void {
         const first = try self.peek() orelse return;
         switch (first.kind) {
@@ -1846,6 +2351,16 @@ pub const XmlTapeCursor = struct {
     }
 };
 
+/// Parses `input` as well-formed XML and returns the validated tape.
+///
+/// This is a full grammar pass, not a lexical index: a document that is not
+/// well-formed UTF-8 XML fails here with the `XmlError` that names the first
+/// failure, and no document is returned. `error.TapeTooLarge` covers an input
+/// longer than `u32` offsets and a token longer than the `u24` payload, and
+/// `error.DepthExceeded` a document nested past `xml_max_depth`. On any
+/// failure the caller owns nothing; on success it owns one tape allocation
+/// released by `XmlDocument.deinit`, and it borrows `input`, which must stay
+/// alive and unmodified.
 pub fn buildXmlTape(
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -1895,6 +2410,15 @@ fn validateXmlTape(tape: []const XmlTapeWord, input: []const u8) XmlError!void {
     };
     try output.finish();
 }
+/// Checks `input` for XML well-formedness and returns the first failure, or
+/// `null` when it is well-formed.
+///
+/// Allocates nothing and keeps no reference to `input`, so it is the cheapest
+/// way to reject a document. `error.TapeTooLarge` past `std.math.maxInt(u32)`
+/// is decided before the parse; the diagnostic's `snippet` borrows `input`.
+/// A `DOCTYPE` is `error.UnsupportedDeclaration` and an `encoding` other than
+/// `UTF-8` is `error.InvalidDeclaration`, so this module accepts UTF-8 XML
+/// only and never transcodes.
 pub fn validateXml(input: []const u8) XmlValidationError!?XmlDiagnostic {
     if (input.len > std.math.maxInt(u32)) return error.TapeTooLarge;
 
@@ -1943,10 +2467,26 @@ fn diagnosticAtXml(input: []const u8, err: XmlError, byte_offset: usize) XmlDiag
     };
 }
 
+/// Errors the resident XML parser returns: the allocator tags plus every
+/// `XmlError`. It is the wider of the two parse-shaped sets, because a
+/// resident walk can fail on a grammar rule part-way through a document and
+/// not only on the first byte.
 pub const XmlParseError = std.mem.Allocator.Error || XmlError;
 
+/// One open element in the parser's fixed stack.
+///
+/// The type is published through `Parser.stack`, which holds `xml_max_depth`
+/// of them, and through the `stack` slice an `XmlParser` borrows from it, so a
+/// consumer reaching either reads and writes every field here. `name` is a
+/// sub-slice of the document's `input` rather than a copy, so it stays valid
+/// only while those bytes do, and it must stay alive and unmodified for as
+/// long as the frame is read. A frame owns nothing and needs no teardown; only
+/// the entries below `XmlParser.stack_top` have been written at all, and
+/// copying one is free.
 const XmlFrame = struct {
+    /// The element name, borrowed from the document's `input`.
     name: []const u8,
+    /// Source offset of the `<` that opened the element.
     open_offset: usize,
 };
 
@@ -1955,7 +2495,22 @@ const XmlDecoded = struct {
     length: usize,
 };
 
+/// Where a walk writes each token word: into a tape it is building, or against
+/// a tape it is checking.
+///
+/// The type is published through `XmlParser.output`, which is a borrowed
+/// optional pointer, so a consumer reaching that field reaches this. It owns
+/// no tape of its own in either mode: `.builder` borrows the caller's list and
+/// allocator, `.validator` borrows the tape being checked, and `count` is how
+/// many words have been appended or matched. `XmlParser.output` is `null` for
+/// the lazy resident walk, which produces events and never a tape, so a
+/// consumer reading that field on a document from `initOnDemandDocument` sees
+/// `null` and reaches nothing here. A copy is a second name for the same
+/// borrowed storage and needs no teardown.
 const XmlTapeOutput = struct {
+    /// `.builder` appends to the borrowed list; `.validator` compares each
+    /// appended word against the borrowed tape and fails on the first
+    /// disagreement.
     storage: union(enum) {
         builder: struct {
             allocator: std.mem.Allocator,
@@ -1963,6 +2518,7 @@ const XmlTapeOutput = struct {
         },
         validator: []const XmlTapeWord,
     },
+    /// Words appended or matched so far. `0` until the first `append`.
     count: usize = 0,
 
     fn append(self: *XmlTapeOutput, kind: XmlTapeKind, start: usize, end: usize) XmlParseError!void {
@@ -2100,18 +2656,58 @@ fn findFirstInvalidXmlChar(input: []const u8, limit: usize) ?usize {
     return null;
 }
 
+/// The XML grammar walk, holding the document's position and open elements.
+///
+/// The type is published through `XmlOnDemandDocument.grammar`, which holds it
+/// as a field, and through the `stack` that field borrows from
+/// `XmlOnDemandDocument`'s parser, so a consumer reaching either reads and
+/// writes every field here. It allocates nothing and owns nothing: `input` is
+/// the borrowed document source, `stack` is the parser's fixed frame array
+/// sliced to `xml_max_depth` entries, and `output` is `null` in the stored copy
+/// a lazy walk holds, because that walk produces events rather than a tape.
+/// A copy is a second walk over the same borrowed input and frames; it does
+/// not own a second parser, and the one a reader resumes is
+/// `XmlOnDemandDocument`'s own field. Nothing here
+/// synchronizes and no method calls back into caller code.
+///
+/// Its methods are the grammar's own steps. `XmlOnDemandDocument.eventReader`
+/// and `tokenCursor` claim the document's focus and hand out walks, and
+/// `XmlEventReader.next` and `XmlTokenCursor.advance` are what advance this
+/// value; they advance it under the document's lease and guard, so a consumer
+/// that writes `position`, `stack_top` or `input` by hand moves the walk
+/// without advancing the guard that records its position, and the walk
+/// resumes from the written value.
 const XmlParser = struct {
+    /// The borrowed document source. Every offset below indexes it.
     input: []const u8,
+    /// Where tape words are written, or `null` for a lazy walk, which produces
+    /// events instead of a tape.
     output: ?*XmlTapeOutput,
+    /// The parser's open-element stack, borrowed and `xml_max_depth` long. Only
+    /// `stack[0..stack_top]` has been written.
     stack: []XmlFrame,
+    /// Source offset the walk last failed at, and where a walk made from this
+    /// value reports its failure from.
     failure_offset: usize = 0,
+    /// A whole-source encoding or character failure found before the grammar
+    /// ran, or `null`. `source_failure_offset` is where it was found.
     source_error: ?XmlError = null,
+    /// Source offset of `source_error`, decided once by the source pass.
     source_failure_offset: usize = 0,
+    /// Byte offset in `input` the walk resumes at. A leading byte-order mark
+    /// advances it past itself.
     position: usize = 0,
+    /// Open elements in `stack[0..stack_top]`; the rest is uninitialized.
     stack_top: usize = 0,
+    /// Whether a root element has been opened, and whether it has since closed.
     root_seen: bool = false,
+    /// `true` once the root element's closing tag has been consumed.
     root_closed: bool = false,
+    /// Whether an XML declaration is still legal here. Cleared by the first
+    /// token of any other kind.
     declaration_allowed: bool = true,
+    /// Whether a declaration has already been seen, so a second one is a
+    /// failure rather than a second document.
     declaration_seen: bool = false,
 
     fn run(self: *XmlParser) XmlParseError!void {
@@ -2664,33 +3260,93 @@ const XmlParser = struct {
     }
 };
 
+/// The start tag whose attributes the resident walk has not handed out yet.
+///
+/// The type is published through `XmlOnDemandDocument.pending`, which holds it
+/// as a field, so a consumer reaching that field reads and writes every field
+/// here. It owns nothing: every offset indexes that document's borrowed
+/// `input`, so they stay valid only while those bytes do. `.{}.{}` with
+/// `active` `false` is the valid no-pending-tag state, which is what a fresh
+/// document holds and what `active` returning to `false` restores. A copy is
+/// a second name for the same offsets and advances nothing; only the
+/// document's own field is the one the walk resumes from.
 const XmlPendingOpen = struct {
+    /// Whether a start tag is waiting for its attributes to be handed out.
+    /// `false` is both the initial state and the state that means no tag is
+    /// pending.
     active: bool = false,
+    /// Source offset of the `<` that opened the tag.
     start: usize = 0,
+    /// Start of the element name, just past the `<`.
     name_start: usize = 0,
+    /// End of the element name, exclusive.
     name_end: usize = 0,
+    /// Source offset of the `>` that closes the tag, and of the `/` before it
+    /// when the tag is self-closing. No attribute may be read at or past it.
     close_start: usize = 0,
+    /// Source offset just past the closing `>`.
     close_end: usize = 0,
+    /// Where the next attribute scan resumes. `name_end` at the moment the tag
+    /// is recorded, and advanced past each attribute handed out.
     attribute_cursor: usize = 0,
+    /// Whether the tag was written `<a/>` rather than `<a>`, recorded when the
+    /// tag was parsed.
     self_closing: bool = false,
 };
 
+/// A reusable resident XML parser: it walks one borrowed document at a time
+/// and allocates nothing.
+///
+/// The parser holds a fixed `xml_max_depth` frame array and one document
+/// lease; it owns no heap allocation, which is why `init` ignores its
+/// `allocator` argument entirely and `deinit` frees nothing. It holds at most
+/// one active document — `initOnDemandDocument` returns
+/// `error.DocumentActive` while another is open — so it is not threadsafe and
+/// its own methods must not be reentered from one another. Copying a parser
+/// copies the frame array, so a copy is a second parser with its own state and
+/// both may be `deinit`'d.
 pub const Parser = struct {
+    /// Largest `input` accepted, in bytes. `0` means no ceiling beyond the
+    /// `std.math.maxInt(u32)` offset limit the tape and events require.
     max_capacity: usize,
-    // SAFETY: every frame is written before `stack_top` exposes it, so no slot
-    // is read while uninitialized. The storage stays uninitialized to avoid
-    // clearing the fixed stack for each parse.
+    /// The open-element stack, inline and fixed at `xml_max_depth` frames. It
+    /// is the array an `XmlOnDemandDocument`'s `grammar.stack` borrows, and
+    /// both are reachable by a consumer holding either value.
+    ///
+    /// SAFETY: every frame is written before `stack_top` exposes it, so no slot
+    /// is read while uninitialized. The storage stays uninitialized to avoid
+    /// clearing the fixed stack for each parse, which is also why only the
+    /// entries below `XmlParser.stack_top` may be read. The array owns no
+    /// memory; each frame borrows the document's `input` for its `name`.
     stack: [xml_max_depth]XmlFrame = undefined,
+    /// The single-document lease. Its generation advances on every document, so
+    /// a reader held across two documents fails instead of reading the newer
+    /// one's events.
     state: resident.State = .{},
 
+    /// Errors `init` returns: `error.InputTooLarge` for a `max_capacity` beyond
+    /// `u32`. There is no allocator error because `init` allocates nothing.
     pub const InitError = error{InputTooLarge};
 
+    /// Builds a parser with no heap storage.
+    ///
+    /// `allocator` is accepted so a caller can use one parser-construction
+    /// shape across formats, and it is discarded: this parser allocates
+    /// nothing, stores nothing from it, and must not be paired with a `free`.
+    /// `max_capacity` above `std.math.maxInt(u32)` returns
+    /// `error.InputTooLarge`.
     pub fn init(allocator: std.mem.Allocator, max_capacity: usize) InitError!Parser {
         _ = allocator;
         if (max_capacity > std.math.maxInt(u32)) return error.InputTooLarge;
         return .{ .max_capacity = max_capacity };
     }
 
+    /// Releases nothing and asserts that no document is open.
+    ///
+    /// The assertion is what diagnoses a missing `XmlOnDemandDocument.deinit`:
+    /// Debug and ReleaseSafe trap, ReleaseFast and ReleaseSmall do not. Every
+    /// document, `XmlEventReader` and `XmlTokenCursor` made from this parser is
+    /// unusable afterward, and a second call is invalid.
     pub fn deinit(self: *Parser) void {
         std.debug.assert(!self.state.active);
         self.state.deinit();
@@ -2703,6 +3359,15 @@ pub const Parser = struct {
         }
     }
 
+    /// Opens `input` for a lazy walk and returns a document that borrows it.
+    ///
+    /// Nothing is parsed here beyond skipping a leading byte-order mark, so
+    /// this is cheap and a malformed document is reported by the walk, not by
+    /// this call. `error.DocumentActive` while another document is open;
+    /// `error.TapeTooLarge` past `std.math.maxInt(u32)` and, when
+    /// `max_capacity` is nonzero, `error.CapacityExceeded` past it are decided
+    /// before the document exists. `input` is not copied: it must stay alive
+    /// and unmodified while the document and every walk made from it are used.
     pub fn initOnDemandDocument(
         self: *Parser,
         input: []const u8,
@@ -2723,18 +3388,62 @@ pub const Parser = struct {
         };
     }
 };
+
+/// The failure a resident walk decided on once and then repeats forever.
+///
+/// The type is published through `XmlOnDemandDocument.failure`, which is `null`
+/// until a walk fails and holds one of these from then on, so a consumer
+/// reaching that field reads and writes every field here. `offset` indexes the
+/// document's borrowed `input`. The value owns nothing, a copy is a second
+/// name for the same verdict, and only the document's own field is the one
+/// later readers and cursors return.
 const XmlResidentFailure = struct {
+    /// What failed, as an `XmlError`.
     err: XmlError,
+    /// Source offset the failure is reported at, in the document's `input`.
     offset: usize,
 };
 
+/// A borrowed resident XML document: one unparsed source plus the state a lazy
+/// walk accumulates over it.
+///
+/// The document owns nothing and borrows the parser's fixed frame array
+/// through its lease. `input` must stay alive and unmodified, and
+/// `grammar.stack` points into the parser, so the parser must outlive the
+/// document and must not be `deinit`'d while it is open. Only one walk exists
+/// at a time — `eventReader` and `tokenCursor` return
+/// `error.FocusAlreadyClaimed` to a second caller — and any walk made from
+/// this document returns `error.DocumentReleased` once `deinit` runs or
+/// another document is opened.
 pub const XmlOnDemandDocument = struct {
+    /// The borrowed source. Every `XmlEvent` slice points into it.
     input: []const u8,
+    /// The document lease, released by `deinit`.
     lease: resident.Lease,
+    /// The parser state the walk advances: its input pointer, position, stack
+    /// depth and its own failure offset. Its `stack` is the parser's fixed
+    /// frame array, so the parser must outlive this document.
+    ///
+    /// This field is what every walk made from this document resumes from, so
+    /// writing `grammar.position`, `grammar.stack_top` or `grammar.input` moves
+    /// the walk without advancing the guard that records its position, and the
+    /// walk then continues from the written value.
     grammar: XmlParser,
+    /// The start tag whose attributes have not been handed out yet, for the
+    /// case where the walk stopped between an element and its attributes.
     pending: XmlPendingOpen = .{},
+    /// The first failure this walk found, once one has. It is sticky: every
+    /// later call returns the same tag and offset, through any number of
+    /// copied readers and cursors. The tag is not necessarily the one the
+    /// walk hit first — when the lazy walk finds a failure it compares it
+    /// against an eager whole-document validation and reports whichever
+    /// failure is earlier in the source — but either way it is decided once
+    /// and never changes.
     failure: ?XmlResidentFailure = null,
 
+    /// Releases the lease, which frees no memory. The document is unusable
+    /// afterward, and every walk made from it starts returning
+    /// `error.DocumentReleased`.
     pub fn deinit(self: *XmlOnDemandDocument) void {
         self.lease.release();
         self.* = undefined;
@@ -2744,6 +3453,10 @@ pub const XmlOnDemandDocument = struct {
         return self.lease.claim();
     }
 
+    /// A reader over the document's events. Claims the document's single
+    /// focus, so `error.FocusAlreadyClaimed` when another walk is open; on that
+    /// error the existing walk is unaffected. The reader borrows this document
+    /// and its `input`, so both must stay live and unmodified while it is used.
     pub fn eventReader(self: *XmlOnDemandDocument) XmlError!XmlEventReader {
         const guard = try self.claim();
         return .{
@@ -2752,6 +3465,8 @@ pub const XmlOnDemandDocument = struct {
         };
     }
 
+    /// A cursor over the document's events, with the same focus claim and
+    /// borrows as `eventReader`.
     pub fn tokenCursor(self: *XmlOnDemandDocument) XmlError!XmlTokenCursor {
         const guard = try self.claim();
         return .{
@@ -3063,14 +3778,37 @@ fn xmlEventToken(event: XmlEvent) XmlToken {
     };
 }
 
+/// A sequential reader over one `XmlOnDemandDocument`'s events.
+///
+/// The reader owns nothing: it borrows the document and its `input`, so both
+/// must stay live and unmodified while it is used, and every `XmlEvent` it
+/// returns borrows that `input`. It holds the document's single focus and its
+/// position, which a copied reader shares: a copy that lags returns
+/// `error.OutOfOrderIteration`, and both return `error.DocumentReleased` once
+/// the document closes. Once the walk has found a failure, the document
+/// caches it and every reader returns that same error from then on, so a
+/// reader is not a way to retry a document that failed.
 pub const XmlEventReader = struct {
+    /// The document being walked. Its `input` is what every event borrows.
+    ///
+    /// The walk reads and advances `document.grammar` and `document.pending`
+    /// through this pointer, so the document must stay at the same address for
+    /// as long as the reader is used; moving or copying it leaves the reader
+    /// walking a document the lease and guard do not cover.
     document: *XmlOnDemandDocument,
+    /// The document focus and position. Copies of a reader share it.
     guard: resident.Guard,
 
     fn ensureFocused(self: *const XmlEventReader) XmlError!void {
         try self.guard.check();
     }
 
+    /// The next `XmlEvent` and the position past it, or `null` at the end of
+    /// the document. The position does not move on an error or at the end.
+    ///
+    /// `error.DocumentReleased`, `error.OutOfOrderIteration` and the cached
+    /// failure come first; otherwise the grammar tags `XmlParseError` names,
+    /// reported at the offset the walk stopped on.
     pub fn next(self: *XmlEventReader) XmlParseError!?XmlEvent {
         try self.ensureFocused();
         const event = try self.document.nextEventCore();
@@ -3078,10 +3816,23 @@ pub const XmlEventReader = struct {
         return event;
     }
 
+    /// The next `XmlEvent` without consuming it, or `null` at the end, with
+    /// the same errors as `next`. The walk's state is saved and restored, so a
+    /// failed `peek` still caches the document's failure the way `next` does.
     pub fn peek(self: *const XmlEventReader) XmlParseError!?XmlEvent {
         try self.ensureFocused();
         return self.document.peekEventCore();
     }
+    /// Consumes one whole element and its trailing attribute events.
+    ///
+    /// On an `element_start` this walks to the matching `element_end`; on a
+    /// `self_closing_element` it consumes the attributes the parser has not
+    /// handed out yet, because an attribute event belongs to the element that
+    /// precedes it. Any other first event is consumed on its own. An exhausted
+    /// document is not an error and consumes nothing.
+    ///
+    /// `error.UnclosedElement` when the matching `element_end` never arrives.
+    /// The reader is left where the walk stopped.
     pub fn skip(self: *XmlEventReader) XmlParseError!void {
         const first = try self.next() orelse return;
         switch (first) {
@@ -3105,20 +3856,35 @@ pub const XmlEventReader = struct {
     }
 };
 
+/// A sequential cursor over one `XmlOnDemandDocument`'s events, flattened to
+/// `XmlToken`.
+///
+/// It borrows exactly what `XmlEventReader` borrows and reports the same
+/// staleness and cached-failure errors. Every event's slices are dropped
+/// except `raw`, so a token costs less to hold than an event.
 pub const XmlTokenCursor = struct {
+    /// The document being walked. Its `input` is what every token borrows. The
+    /// address obligation `XmlEventReader.document` carries applies here
+    /// unchanged, because this cursor advances the same `grammar` and `pending`
+    /// through the same pointer.
     document: *XmlOnDemandDocument,
+    /// The document focus and position. Copies of a cursor share it.
     guard: resident.Guard,
 
     fn ensureFocused(self: *const XmlTokenCursor) XmlError!void {
         try self.guard.check();
     }
 
+    /// The next `XmlToken` without consuming it, or `null` at the end, with the
+    /// same errors as `EventReader.peek`.
     pub fn peek(self: *const XmlTokenCursor) XmlParseError!?XmlToken {
         try self.ensureFocused();
         const event = try self.document.peekEventCore() orelse return null;
         return xmlEventToken(event);
     }
 
+    /// The next `XmlToken` and the position past it, or `null` at the end. The
+    /// position does not move on an error or at the end.
     pub fn advance(self: *XmlTokenCursor) XmlParseError!?XmlToken {
         try self.ensureFocused();
         const event = try self.document.nextEventCore() orelse return null;
@@ -3126,6 +3892,11 @@ pub const XmlTokenCursor = struct {
         return xmlEventToken(event);
     }
 
+    /// Consumes one whole element subtree, with the same element rules,
+    /// attribute handling and `error.UnclosedElement` as `EventReader.skip`.
+    ///
+    /// `error.UnexpectedToken` when an `element_end` arrives with no open
+    /// element, which the resident walk would also have rejected.
     pub fn skipChild(self: *XmlTokenCursor) XmlParseError!void {
         const first = try self.peek() orelse return;
         switch (first.kind) {
@@ -3158,12 +3929,20 @@ pub const XmlTokenCursor = struct {
     }
 };
 
+/// `XmlOnDemandDocument`.
 pub const OnDemandDocument = XmlOnDemandDocument;
+/// `XmlEvent`.
 pub const Event = XmlEvent;
+/// `XmlEventReader`.
 pub const EventReader = XmlEventReader;
+/// `XmlTokenCursor`.
 pub const TokenCursor = XmlTokenCursor;
+/// `XmlToken`.
 pub const Token = XmlToken;
 
+/// `Parser.initOnDemandDocument` for a caller that would only name this
+/// constructor. The returned document borrows `input` and owns only its
+/// lease, which `XmlOnDemandDocument.deinit` releases.
 pub fn initOnDemandDocument(
     parser: *Parser,
     input: []const u8,
@@ -3171,6 +3950,10 @@ pub fn initOnDemandDocument(
     return parser.initOnDemandDocument(input);
 }
 
+/// `XmlStreamIndexer.init` for a caller that would only name this constructor.
+/// The returned value owns the output it allocated and is released by
+/// `XmlStreamIndexer.deinit`; `chunk_len` is an initial capacity only, and the
+/// allocator must outlive the indexer.
 pub fn initStreamIndexer(
     allocator: std.mem.Allocator,
     chunk_len: usize,
@@ -3402,6 +4185,13 @@ const XmlEntityDecoded = struct {
     codepoint: u21,
 };
 
+/// The code point a predefined entity reference names, or `null`.
+///
+/// `body` is the text between `&` and `;`: `lt`, `gt`, `amp`, `apos` and
+/// `quot`, matched case-sensitively and exactly. Allocates nothing and does
+/// not accept the numeric or `&#...;` forms, which only the XML value decoders
+/// resolve. A caller that holds a whole reference can slice out the body
+/// first; nothing here scans for `&` or `;`.
 pub fn parsePredefinedEntity(body: []const u8) ?u21 {
     if (body.len < 2 or body.len > 4) return null;
     return switch (body.len) {
@@ -3844,6 +4634,19 @@ fn declarationInfoForEvent(
     return parseDeclarationInfo(raw);
 }
 
+/// Parses one `<?xml ... ?>` declaration's pseudo-attributes. Allocates
+/// nothing.
+///
+/// `raw` is the whole declaration span including `<?` and `?>`, as it appears
+/// in the source; it is not a prefix match and it is not NUL-terminated. The
+/// declaration must carry `version="1.0"` first; `encoding` and `standalone`
+/// are optional, must follow in that order, and must not repeat. Only
+/// `UTF-8` is accepted as an encoding, case-insensitively, because this module
+/// does not transcode. `error.InvalidDeclaration` covers a missing or
+/// out-of-order `version`, an unknown or duplicated pseudo-attribute, a
+/// missing separator, an unquoted value, an `encoding` other than `UTF-8`, a
+/// `standalone` other than `yes` or `no`, and any value that is not
+/// well-formed XML data. The result's slices borrow `raw`.
 pub fn parseDeclarationInfo(raw: []const u8) XmlError!XmlDeclarationInfo {
     if (raw.len < "<?xml?>".len) return error.InvalidDeclaration;
     try validateXmlRawData(raw, false, false, false);
