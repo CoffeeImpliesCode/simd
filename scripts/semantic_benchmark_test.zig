@@ -191,7 +191,7 @@ const Capture = struct {
     }
 
     fn append(self: *Capture, comptime fmt: []const u8, args: anytype) !usize {
-        const line = try std.fmt.allocPrint(self.allocator, fmt, args);
+        const line = try self.allocator.print(fmt, args);
         errdefer self.allocator.free(line);
         const index = self.lines.items.len;
         try self.lines.append(self.allocator, line);
@@ -200,7 +200,7 @@ const Capture = struct {
 
     /// Rewrites the tracked line `index` in place.
     fn replaceLine(self: *Capture, comptime fmt: []const u8, index: usize, args: anytype) !void {
-        const line = try std.fmt.allocPrint(self.allocator, fmt, args);
+        const line = try self.allocator.print(fmt, args);
         self.allocator.free(self.lines.items[index]);
         self.lines.items[index] = line;
     }
@@ -225,7 +225,7 @@ const Capture = struct {
     /// Inserts one line before the tracked line `index`; every tracked line at
     /// or after it moves down.
     fn insertLine(self: *Capture, comptime fmt: []const u8, index: usize, args: anytype) !void {
-        const line = try std.fmt.allocPrint(self.allocator, fmt, args);
+        const line = try self.allocator.print(fmt, args);
         errdefer self.allocator.free(line);
         try self.lines.insert(self.allocator, index, line);
         for (self.rows.items) |*row| {

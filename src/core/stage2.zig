@@ -130,7 +130,7 @@ pub const TapeWord = packed struct(u64) {
     /// a word this package produced, or on one a `TapeCursor` has already
     /// accepted; every word a cursor method reads is checked for you.
     pub fn tapeKind(self: TapeWord) TapeKind {
-        return @enumFromInt(self.kind);
+        return @fromBackingInt(@intCast(self.kind));
     }
 };
 
@@ -563,16 +563,16 @@ pub const TapeCursor = struct {
 
 fn checkedTapeKind(word: TapeWord) NavigationError!TapeKind {
     return switch (word.kind) {
-        @intFromEnum(TapeKind.object_start) => .object_start,
-        @intFromEnum(TapeKind.array_start) => .array_start,
-        @intFromEnum(TapeKind.object_end) => .object_end,
-        @intFromEnum(TapeKind.array_end) => .array_end,
-        @intFromEnum(TapeKind.string) => .string,
-        @intFromEnum(TapeKind.key) => .key,
-        @intFromEnum(TapeKind.number) => .number,
-        @intFromEnum(TapeKind.true_literal) => .true_literal,
-        @intFromEnum(TapeKind.false_literal) => .false_literal,
-        @intFromEnum(TapeKind.null_literal) => .null_literal,
+        @backingInt(TapeKind.object_start) => .object_start,
+        @backingInt(TapeKind.array_start) => .array_start,
+        @backingInt(TapeKind.object_end) => .object_end,
+        @backingInt(TapeKind.array_end) => .array_end,
+        @backingInt(TapeKind.string) => .string,
+        @backingInt(TapeKind.key) => .key,
+        @backingInt(TapeKind.number) => .number,
+        @backingInt(TapeKind.true_literal) => .true_literal,
+        @backingInt(TapeKind.false_literal) => .false_literal,
+        @backingInt(TapeKind.null_literal) => .null_literal,
         else => error.InvalidTapeKind,
     };
 }
@@ -1723,7 +1723,7 @@ pub const TokenReader = struct {
         if (offset > std.math.maxInt(u32)) return error.TapeTooLarge;
         self.pending = .{
             .word = .{
-                .kind = @intFromEnum(kind),
+                .kind = @backingInt(kind),
                 .payload = payload,
                 .offset = @intCast(offset),
             },
@@ -1759,7 +1759,7 @@ pub const TokenReader = struct {
         if (self.tape) |tape| {
             if (tape.items.len == tape.capacity) return error.TapeTooLarge;
             tape.appendAssumeCapacity(.{
-                .kind = @intFromEnum(kind),
+                .kind = @backingInt(kind),
                 .payload = payload,
                 .offset = @intCast(offset),
             });
@@ -3467,7 +3467,7 @@ test "JSON5 accepts escaped Unicode line continuations" {
 test "TapeCursor rejects unquoted source for forged JSON5 string words" {
     const input = "foo";
     var tape = [_]TapeWord{.{
-        .kind = @intFromEnum(TapeKind.string),
+        .kind = @backingInt(TapeKind.string),
         .payload = @intCast(input.len),
         .offset = 0,
     }};
@@ -3598,9 +3598,9 @@ test "TapeCursor returns escaped strings keys numbers and literals without copyi
 
 test "TapeCursor matchingStart validates only the local backlink" {
     var tape = [_]TapeWord{
-        .{ .kind = @intFromEnum(TapeKind.array_start), .payload = 1, .offset = 0 },
-        .{ .kind = @intFromEnum(TapeKind.key), .payload = 0, .offset = 0 },
-        .{ .kind = @intFromEnum(TapeKind.array_end), .payload = 0, .offset = 1 },
+        .{ .kind = @backingInt(TapeKind.array_start), .payload = 1, .offset = 0 },
+        .{ .kind = @backingInt(TapeKind.key), .payload = 0, .offset = 0 },
+        .{ .kind = @backingInt(TapeKind.array_end), .payload = 0, .offset = 1 },
     };
     const document: Document = .{ .tape = tape[0..], .dialect = .json };
     var cursor = try document.root("[]");
@@ -3625,7 +3625,7 @@ test "TapeCursor raw strings validate source and exact tape extent" {
 
     for (cases) |case| {
         var tape = [_]TapeWord{.{
-            .kind = @intFromEnum(case.kind),
+            .kind = @backingInt(case.kind),
             .payload = case.payload,
             .offset = 0,
         }};
@@ -3645,32 +3645,32 @@ test "TapeCursor rejects malformed kinds order bounds counts and source ranges" 
     try testing.expectError(error.InvalidTapeKind, invalid_kind_document.root("0"));
 
     var wrong_end_tape = [_]TapeWord{
-        .{ .kind = @intFromEnum(TapeKind.array_start), .payload = 0, .offset = 0 },
-        .{ .kind = @intFromEnum(TapeKind.object_end), .payload = 0, .offset = 1 },
+        .{ .kind = @backingInt(TapeKind.array_start), .payload = 0, .offset = 0 },
+        .{ .kind = @backingInt(TapeKind.object_end), .payload = 0, .offset = 1 },
     };
     const wrong_end_document: Document = .{ .tape = wrong_end_tape[0..], .dialect = .json };
     var wrong_end_cursor = try wrong_end_document.root("[]");
     try testing.expectError(error.InvalidTapeOrder, wrong_end_cursor.skipValue());
 
     var unclosed_tape = [_]TapeWord{
-        .{ .kind = @intFromEnum(TapeKind.array_start), .payload = 0, .offset = 0 },
+        .{ .kind = @backingInt(TapeKind.array_start), .payload = 0, .offset = 0 },
     };
     const unclosed_document: Document = .{ .tape = unclosed_tape[0..], .dialect = .json };
     var unclosed_cursor = try unclosed_document.root("[");
     try testing.expectError(error.TapeOutOfBounds, unclosed_cursor.skipValue());
 
     var wrong_count_tape = [_]TapeWord{
-        .{ .kind = @intFromEnum(TapeKind.array_start), .payload = 2, .offset = 0 },
-        .{ .kind = @intFromEnum(TapeKind.number), .payload = 0, .offset = 1 },
-        .{ .kind = @intFromEnum(TapeKind.array_end), .payload = 0, .offset = 2 },
+        .{ .kind = @backingInt(TapeKind.array_start), .payload = 2, .offset = 0 },
+        .{ .kind = @backingInt(TapeKind.number), .payload = 0, .offset = 1 },
+        .{ .kind = @backingInt(TapeKind.array_end), .payload = 0, .offset = 2 },
     };
     const wrong_count_document: Document = .{ .tape = wrong_count_tape[0..], .dialect = .json };
     var wrong_count_cursor = try wrong_count_document.root("[0]");
     try testing.expectError(error.InvalidTapeOrder, wrong_count_cursor.skipValue());
 
     var bad_start_tape = [_]TapeWord{
-        .{ .kind = @intFromEnum(TapeKind.array_start), .payload = 0, .offset = 0 },
-        .{ .kind = @intFromEnum(TapeKind.array_end), .payload = 2, .offset = 1 },
+        .{ .kind = @backingInt(TapeKind.array_start), .payload = 0, .offset = 0 },
+        .{ .kind = @backingInt(TapeKind.array_end), .payload = 2, .offset = 1 },
     };
     const bad_start_document: Document = .{ .tape = bad_start_tape[0..], .dialect = .json };
     var bad_start_cursor = try bad_start_document.root("[]");
@@ -3678,7 +3678,7 @@ test "TapeCursor rejects malformed kinds order bounds counts and source ranges" 
     try testing.expectError(error.TapeOutOfBounds, bad_start_cursor.matchingStart());
 
     var string_tape = [_]TapeWord{.{
-        .kind = @intFromEnum(TapeKind.string),
+        .kind = @backingInt(TapeKind.string),
         .payload = 4,
         .offset = 0,
     }};
@@ -3687,7 +3687,7 @@ test "TapeCursor rejects malformed kinds order bounds counts and source ranges" 
     try testing.expectError(error.SourceOutOfBounds, string_cursor.rawValue());
 
     var number_tape = [_]TapeWord{.{
-        .kind = @intFromEnum(TapeKind.number),
+        .kind = @backingInt(TapeKind.number),
         .payload = 0,
         .offset = 0,
     }};

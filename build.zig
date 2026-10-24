@@ -1,4 +1,4 @@
-//! Build and publication routes for the native Zig `simd` package on Zig 0.16.0.
+//! Build and publication routes for the native Zig `simd` package on Zig 0.17.0.
 //! `dependency.module("simd")` carries its generated width options; installed artifacts
 //! are the build-only `simd-static` archive and the `simd` sample visualizer.
 
@@ -69,18 +69,15 @@ fn gateScratchDir(b: *std.Build, scratch_root: []const u8) []const u8 {
 /// local cache and the absolute project root instead; zig-gate checks the
 /// resolved volume when the step runs, and cross-test creates the directory
 /// then rather than at configure time. Cache cleanup can remove its logs.
-fn gateCrossOutputDir(b: *std.Build) []const u8 {
-    const cache_root = b.cache_root.path orelse @panic(
-        "zig build supplied no local cache directory, so no approved cross output can be derived",
-    );
-    const project_root = b.pathResolve(&.{ b.graph.cache.cwd, b.build_root.path orelse "." });
+fn gateCrossOutputDir(b: *std.Build) std.Build.LazyPath {
+    const project_root = b.root.toString(b.allocator) catch @panic("OOM");
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(project_root, &digest, .{});
     // Eight digest bytes render as sixteen lowercase hex digits: enough to keep
     // a project's namespace compact, not a guarantee that two projects cannot
     // land on the same one. A truncated hash still collides.
     const namespace = b.fmt("{s}-{x}", .{ std.fs.path.basename(project_root), digest[0..8] });
-    return b.pathResolve(&.{ b.graph.cache.cwd, cache_root, "zig-gate-cross", namespace });
+    return std.Build.LazyPath.cache_root.path(b, b.pathJoin(&.{ "zig-gate-cross", namespace }));
 }
 
 /// The analyzers accept files, not the format check's mixed file/directory list.
@@ -94,12 +91,16 @@ fn addAnalysisSources(b: *std.Build, zbc: *std.Build.Step.Run, zwanzig: *std.Bui
             continue;
         }
 
-        const dir = b.build_root.handle.openDir(b.graph.io, path, .{ .iterate = true }) catch
+        b.dependOnDirectoryContents(b.path(path));
+        const dir_path = b.root.joinString(b.allocator, path) catch @panic("OOM");
+        const dir = std.Io.Dir.cwd().openDir(b.graph.io, dir_path, .{ .iterate = true }) catch
             @panic("unable to open analysis source directory");
         defer dir.close(b.graph.io);
         var walker = dir.walk(b.allocator) catch @panic("OOM");
         defer walker.deinit();
         while (walker.next(b.graph.io) catch @panic("unable to walk analysis sources")) |entry| {
+            if (entry.kind == .directory)
+                b.dependOnDirectoryContents(b.path(b.pathJoin(&.{ path, entry.path })));
             if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".zig")) continue;
             const source = b.path(b.pathJoin(&.{ path, entry.path }));
             zbc.addFileArg(source);
@@ -139,7 +140,7 @@ fn addTestRoot(
     artifact_name: []const u8,
     root: TestRoot,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     options: *std.Build.Step.Options,
     lib_module: *std.Build.Module,
     seed: u32,
@@ -170,7 +171,7 @@ fn addWidthMatrix(
     b: *std.Build,
     check_step: *std.Build.Step,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     selected_vector_len: ?usize,
 ) void {
     for (check_vector_lens) |width| {
@@ -220,7 +221,7 @@ fn addWidthMatrix(
 fn addBenchmarkOptions(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     vector_len: ?usize,
     semantic_mode: bool,
 ) *std.Build.Step.Options {
@@ -250,7 +251,7 @@ fn addBenchmarkOptions(
 fn addSemanticContract(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 ) *std.Build.Module {
     return b.createModule(.{
         .root_source_file = b.path("scripts/semantic_contract.zig"),
@@ -431,9 +432,7 @@ pub fn build(b: *std.Build) void {
 
     // This allows the user to pass arguments to the application in the build
     // command itself, like this: `zig build run -- arg1 arg2 etc`
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     // This creates a build step. It will be visible in the `zig build --help` menu,
     // and can be selected like this: `zig build run`
@@ -499,27 +498,21 @@ pub fn build(b: *std.Build) void {
         .root_module = bench_mod,
     });
     const bench_cmd = b.addRunArtifact(bench_exe);
-    if (b.args) |args| {
-        bench_cmd.addArgs(args);
-    }
+    bench_cmd.addPassthruArgs();
 
     const kernel_bench_exe = b.addExecutable(.{
         .name = "simd-kernel-bench",
         .root_module = kernel_bench_mod,
     });
     const run_kernel_bench = b.addRunArtifact(kernel_bench_exe);
-    if (b.args) |args| {
-        run_kernel_bench.addArgs(args);
-    }
+    run_kernel_bench.addPassthruArgs();
 
     const string_bench_exe = b.addExecutable(.{
         .name = "simd-string-bench",
         .root_module = string_bench_mod,
     });
     const run_string_bench = b.addRunArtifact(string_bench_exe);
-    if (b.args) |args| {
-        run_string_bench.addArgs(args);
-    }
+    run_string_bench.addPassthruArgs();
 
     // The benchmark runner drives `simd-bench`, so it executes on the host even
     // under a cross `-Dtarget`, while the executable it launches keeps the
@@ -552,11 +545,9 @@ pub fn build(b: *std.Build) void {
     // argv: runner, the bench executable this build produced, the repository
     // root, then the operation and its arguments exactly as typed after `--`.
     const bench_runner = b.addRunArtifact(bench_runner_exe);
-    bench_runner.addArtifactArg(bench_exe);
-    bench_runner.addDirectoryArg(b.path("."));
-    if (b.args) |args| {
-        bench_runner.addArgs(args);
-    }
+    bench_runner.addArtifactArg2(bench_exe, .{});
+    bench_runner.addDirectoryArg2(b.path("."), .{});
+    bench_runner.addPassthruArgs();
 
     const bench_script_tests = b.addTest(.{
         .name = "benchmark-script",
@@ -570,9 +561,7 @@ pub fn build(b: *std.Build) void {
         .root_module = semantic_bench_mod,
     });
     const semantic_bench_cmd = b.addRunArtifact(semantic_bench_exe);
-    if (b.args) |args| {
-        semantic_bench_cmd.addArgs(args);
-    }
+    semantic_bench_cmd.addPassthruArgs();
 
     // The semantic archive runner is the same `scripts/benchmark.zig` source
     // compiled again with `semantic_mode` true. The implementation is not
@@ -600,11 +589,9 @@ pub fn build(b: *std.Build) void {
     // after `--`. The captured artifact path differs in semantic mode, so the
     // executable is named to match what the archive stores.
     const semantic_bench_runner = b.addRunArtifact(semantic_bench_runner_exe);
-    semantic_bench_runner.addArtifactArg(semantic_bench_exe);
-    semantic_bench_runner.addDirectoryArg(b.path("."));
-    if (b.args) |args| {
-        semantic_bench_runner.addArgs(args);
-    }
+    semantic_bench_runner.addArtifactArg2(semantic_bench_exe, .{});
+    semantic_bench_runner.addDirectoryArg2(b.path("."), .{});
+    semantic_bench_runner.addPassthruArgs();
 
     // `scripts/benchmark.zig` compiles twice, so its tests compile twice: the
     // legacy root above reaches `legacy_tests` and this one reaches
@@ -711,7 +698,7 @@ pub fn build(b: *std.Build) void {
     // directories are listed out by name so the shared `.zig-cache` symlink is
     // never walked.
     const fmt_check = b.addFmt(.{
-        .paths = &fmt_paths,
+        .paths = b.pathList(&fmt_paths),
         .check = true,
     });
 
@@ -736,7 +723,9 @@ pub fn build(b: *std.Build) void {
     const scratch_make = b.addSystemCommand(&.{ "mkdir", "-p", scratch_dir });
     scratch_make.has_side_effects = true;
 
-    const zig_gate = b.addSystemCommand(&.{ "zig-gate", "--no-zbc" });
+    const zig_gate = b.addSystemCommand(&.{"env"});
+    zig_gate.addDirectoryArg2(gateCrossOutputDir(b), .{ .prefix = "GATE_CROSS_OUTPUT=", .make_absolute = true });
+    zig_gate.addArgs(&.{ "zig-gate", "--no-zbc" });
     const zbc = b.addSystemCommand(&.{ "zbc", "--no-color" });
     const zwanzig = b.addSystemCommand(&.{ "zwanzig", "--threads", "2" });
     const cross_test = b.addSystemCommand(&.{ "cross-test", "--jobs", "2", "--build-jobs", "1" });
@@ -755,7 +744,6 @@ pub fn build(b: *std.Build) void {
     // `cross_test` step above keeps cross-test's own default of
     // `zig-out/cross-test`, so the two full runs write separate trees and
     // stay independent steps rather than being serialized behind one prefix.
-    zig_gate.setEnvironmentVariable("GATE_CROSS_OUTPUT", gateCrossOutputDir(b));
 
     const check_step = b.step(
         "check",

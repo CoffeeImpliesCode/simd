@@ -64,8 +64,8 @@ pub const Domain = struct {
     segments: []const DomainSegment,
 };
 
-const workload_count = @typeInfo(Workload).@"enum".fields.len;
-const stage_count = @typeInfo(Stage).@"enum".fields.len;
+const workload_count = @typeInfo(Workload).@"enum".field_names.len;
+const stage_count = @typeInfo(Stage).@"enum".field_names.len;
 
 /// At most one segment per format.
 const max_domain_segments = 2;
@@ -102,14 +102,14 @@ fn countDomain(domain: Domain) BenchReportError!DomainCounts {
 
         var seen_workloads: [workload_count]bool = @splat(false);
         for (segment.fixtures) |*fixture| {
-            const workload_slot = @intFromEnum(fixture.workload);
+            const workload_slot = @backingInt(fixture.workload);
             if (seen_workloads[workload_slot]) return error.DuplicateWorkload;
             seen_workloads[workload_slot] = true;
 
             if (fixture.stages.len == 0) return error.EmptyStageList;
             var seen_stages: [stage_count]bool = @splat(false);
             for (fixture.stages) |stage| {
-                const stage_slot = @intFromEnum(stage);
+                const stage_slot = @backingInt(stage);
                 if (seen_stages[stage_slot]) return error.DuplicateStage;
                 seen_stages[stage_slot] = true;
             }
@@ -246,22 +246,22 @@ const DomainCursor = struct {
 };
 
 fn formatFromName(text: []const u8) ?Format {
-    inline for (@typeInfo(Format).@"enum".fields) |field| {
-        if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
+    inline for (@typeInfo(Format).@"enum".field_names) |name| {
+        if (std.mem.eql(u8, text, name)) return @field(Format, name);
     }
     return null;
 }
 
 fn workloadFromName(text: []const u8) ?Workload {
-    inline for (@typeInfo(Workload).@"enum".fields) |field| {
-        if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
+    inline for (@typeInfo(Workload).@"enum".field_names) |name| {
+        if (std.mem.eql(u8, text, name)) return @field(Workload, name);
     }
     return null;
 }
 
 fn stageFromName(text: []const u8) ?Stage {
-    inline for (@typeInfo(Stage).@"enum".fields) |field| {
-        if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
+    inline for (@typeInfo(Stage).@"enum".field_names) |name| {
+        if (std.mem.eql(u8, text, name)) return @field(Stage, name);
     }
     return null;
 }
@@ -1641,8 +1641,7 @@ test "text, line, and sample bounds are enforced" {
     @memset(many_lines, '\n');
     try expectReportError(many_lines, options, error.TooManyLines);
 
-    const long_outcome = try std.fmt.allocPrint(
-        testing.allocator,
+    const long_outcome = try testing.allocator.print(
         "commonmark,cm_blocks,parse,{s},{d},3,1000,5000,4,512",
         .{ "TooManyNodesTooManyNodesTooManyNodesTooManyNodesTooManyNodesTooManyNodes", cm_blocks_source.len },
     );
@@ -1962,8 +1961,7 @@ test "a full-width checksum is decoded without narrowing" {
     const text = try synthReport(testing.allocator, options);
     defer testing.allocator.free(text);
 
-    const wide = try std.fmt.allocPrint(
-        testing.allocator,
+    const wide = try testing.allocator.print(
         "commonmark,cm_blocks,parse,accepted,{d},{d},1000,{d},4,512",
         .{ cm_blocks_source.len, options.iterations, std.math.maxInt(u64) },
     );

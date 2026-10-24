@@ -1658,7 +1658,7 @@ pub const XmlTapeWord = packed struct(u64) {
     /// supplied tape word uses `XmlDocument.word` and the checked navigation
     /// methods instead.
     pub fn tapeKind(self: XmlTapeWord) XmlTapeKind {
-        return @enumFromInt(self.kind);
+        return @fromBackingInt(@intCast(self.kind));
     }
 
     /// `payload` widened to `usize`.
@@ -1668,15 +1668,15 @@ pub const XmlTapeWord = packed struct(u64) {
 };
 fn checkedXmlTapeKind(word: XmlTapeWord) XmlError!XmlTapeKind {
     return switch (word.kind) {
-        @intFromEnum(XmlTapeKind.xml_declaration) => .xml_declaration,
-        @intFromEnum(XmlTapeKind.element_start) => .element_start,
-        @intFromEnum(XmlTapeKind.element_end) => .element_end,
-        @intFromEnum(XmlTapeKind.self_closing_element) => .self_closing_element,
-        @intFromEnum(XmlTapeKind.attribute) => .attribute,
-        @intFromEnum(XmlTapeKind.text) => .text,
-        @intFromEnum(XmlTapeKind.cdata) => .cdata,
-        @intFromEnum(XmlTapeKind.comment) => .comment,
-        @intFromEnum(XmlTapeKind.processing_instruction) => .processing_instruction,
+        @backingInt(XmlTapeKind.xml_declaration) => .xml_declaration,
+        @backingInt(XmlTapeKind.element_start) => .element_start,
+        @backingInt(XmlTapeKind.element_end) => .element_end,
+        @backingInt(XmlTapeKind.self_closing_element) => .self_closing_element,
+        @backingInt(XmlTapeKind.attribute) => .attribute,
+        @backingInt(XmlTapeKind.text) => .text,
+        @backingInt(XmlTapeKind.cdata) => .cdata,
+        @backingInt(XmlTapeKind.comment) => .comment,
+        @backingInt(XmlTapeKind.processing_instruction) => .processing_instruction,
         else => error.InvalidTapeKind,
     };
 }
@@ -2525,7 +2525,7 @@ const XmlTapeOutput = struct {
         switch (self.storage) {
             .builder => |builder| {
                 try builder.tape.append(builder.allocator, .{
-                    .kind = @intFromEnum(kind),
+                    .kind = @backingInt(kind),
                     .payload = @intCast(end - start),
                     .offset = @intCast(start),
                 });
@@ -2563,13 +2563,13 @@ const XmlTapeOutput = struct {
     ) XmlParseError!void {
         switch (self.storage) {
             .builder => |builder| {
-                builder.tape.items[tape_index].kind = @intFromEnum(kind);
+                builder.tape.items[tape_index].kind = @backingInt(kind);
                 builder.tape.items[tape_index].payload = @intCast(length);
             },
             .validator => |expected| {
                 if (tape_index >= expected.len) return error.InvalidTapeOrder;
                 const word = expected[tape_index];
-                if (word.kind != @intFromEnum(kind) or word.sourceLength() != length) {
+                if (word.kind != @backingInt(kind) or word.sourceLength() != length) {
                     return error.InvalidTapeOrder;
                 }
             },
@@ -4094,7 +4094,7 @@ fn parseXmlName(input: []const u8, start: usize) ?usize {
 }
 
 const ascii_name_char_table: [256]bool = blk: {
-    var table = [_]bool{false} ** 256;
+    var table: [256]bool = @splat(false);
     for (0..256) |i| {
         const b: u8 = @intCast(i);
         if (b < 0x80 and isAsciiXmlNameChar(b)) {
@@ -4123,7 +4123,7 @@ fn isAsciiXmlNameChar(byte: u8) bool {
 
 // Positive Bloom hits always fall back to exact name equality.
 const XmlAttributeNameFilter = struct {
-    bits: [128]u8 = [_]u8{0} ** 128,
+    bits: [128]u8 = @splat(0),
 
     fn maybeSeenAndInsert(self: *XmlAttributeNameFilter, name: []const u8) bool {
         const hash = hashXmlAttributeName(name);
@@ -5038,7 +5038,7 @@ test "XmlDocument rejects forged spans and kinds during navigation" {
     defer nested.deinit(testing.allocator);
     var nested_cursor = try nested.root(nested_input);
     _ = try nested_cursor.advance();
-    nested.tape[1].kind = @intFromEnum(XmlTapeKind.element_end);
+    nested.tape[1].kind = @backingInt(XmlTapeKind.element_end);
     try testing.expectError(error.InvalidTapeOrder, nested_cursor.skipChild());
 }
 
@@ -5117,7 +5117,7 @@ const XmlFaultingReader = struct {
         if (self.offset >= self.fail_at) return error.ReadFailed;
 
         const available = self.fail_at - self.offset;
-        const count = @min(available, @intFromEnum(limit));
+        const count = @min(available, @backingInt(limit));
         if (count == 0) return 0;
         try writer.writeAll(self.input[self.offset..][0..count]);
         self.offset += count;

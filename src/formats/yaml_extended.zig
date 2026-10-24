@@ -634,14 +634,14 @@ fn diagnosticAt(
 
 fn checkedKind(word: basic.YamlTapeWord) Error!basic.YamlTokenKind {
     return switch (word.kind) {
-        @intFromEnum(basic.YamlTokenKind.document_start) => .document_start,
-        @intFromEnum(basic.YamlTokenKind.document_end) => .document_end,
-        @intFromEnum(basic.YamlTokenKind.mapping_start) => .mapping_start,
-        @intFromEnum(basic.YamlTokenKind.mapping_end) => .mapping_end,
-        @intFromEnum(basic.YamlTokenKind.sequence_start) => .sequence_start,
-        @intFromEnum(basic.YamlTokenKind.sequence_end) => .sequence_end,
-        @intFromEnum(basic.YamlTokenKind.key) => .key,
-        @intFromEnum(basic.YamlTokenKind.scalar) => .scalar,
+        @backingInt(basic.YamlTokenKind.document_start) => .document_start,
+        @backingInt(basic.YamlTokenKind.document_end) => .document_end,
+        @backingInt(basic.YamlTokenKind.mapping_start) => .mapping_start,
+        @backingInt(basic.YamlTokenKind.mapping_end) => .mapping_end,
+        @backingInt(basic.YamlTokenKind.sequence_start) => .sequence_start,
+        @backingInt(basic.YamlTokenKind.sequence_end) => .sequence_end,
+        @backingInt(basic.YamlTokenKind.key) => .key,
+        @backingInt(basic.YamlTokenKind.scalar) => .scalar,
         else => error.InvalidTapeKind,
     };
 }
@@ -861,7 +861,7 @@ const Parser = struct {
         }
         const event_index = self.tape.items.len;
         try self.tape.append(self.allocator, .{
-            .kind = @intFromEnum(kind),
+            .kind = @backingInt(kind),
             .payload = @intCast(length),
             .offset = @intCast(offset),
         });

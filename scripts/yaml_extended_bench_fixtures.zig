@@ -200,7 +200,7 @@ pub fn checksumSkeleton(events: []const Event) u64 {
     contract.mix(&checksum, event_count);
     var depth: u64 = 0;
     for (events) |event| {
-        contract.mix(&checksum, @intFromEnum(event.kind));
+        contract.mix(&checksum, @backingInt(event.kind));
         contract.mix(&checksum, depth);
         switch (event.kind) {
             .mapping_start, .sequence_start => depth += 1,
@@ -226,16 +226,16 @@ pub fn checksumSemantics(events: []const Event) u64 {
     var checksum: u64 = contract.fnv_offset_basis;
     var depth: u64 = 0;
     for (events) |event| {
-        contract.mix(&checksum, @intFromEnum(event.kind));
+        contract.mix(&checksum, @backingInt(event.kind));
         contract.mix(&checksum, depth);
         switch (event.kind) {
             .mapping_start, .sequence_start => depth += 1,
             .mapping_end, .sequence_end => depth -= 1,
             .document_start, .document_end => {},
             .key, .scalar => {
-                contract.mix(&checksum, @intFromEnum(event.ownership));
-                contract.mix(&checksum, @intFromEnum(event.style));
-                contract.mix(&checksum, @intFromEnum(event.chomping));
+                contract.mix(&checksum, @backingInt(event.ownership));
+                contract.mix(&checksum, @backingInt(event.style));
+                contract.mix(&checksum, @backingInt(event.chomping));
                 contract.mix(&checksum, event.indentation_width);
                 contract.mixBytes(&checksum, event.bytes);
             },

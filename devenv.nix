@@ -1,22 +1,11 @@
-{ pkgs, ... }:
-
-let
-  zig = pkgs.zig_0_16;
-in
-rec {
-  # The library has no package dependencies. Pin its compiler here; the
-  # external gate tools (zig-gate, zbc, zwanzig, cross-test) come from PATH.
-  # Keep the compiler aligned with build.zig.zon's minimum_zig_version.
-  packages = [
-    (assert zig.version == "0.16.0"; zig)
-  ];
-
-  env = {
-    PATH = "${zig}/bin:zig-out/bin:$PATH";
-  };
-
-  # https://devenv.sh/basics/
+{ ... }:
+{
+  # Use the compiler on PATH. anyzig selects the version from build.zig.zon.
   enterShell = ''
-    export PATH="${zig}/bin:zig-out/bin:$PATH"
+    if [ "$(zig version)" != "0.17.0" ]; then
+      echo "simd requires Zig 0.17.0 on PATH" >&2
+      return 1
+    fi
+    export PATH="zig-out/bin:$PATH"
   '';
 }

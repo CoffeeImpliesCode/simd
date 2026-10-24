@@ -325,7 +325,7 @@ fn joinPath(allocator: Allocator, parts: []const []const u8) ![]u8 {
 }
 
 fn sampleName(allocator: Allocator, kind: []const u8, index: u16) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/sample-{d:0>2}.{s}", .{ samples_subdir, index, kind });
+    return allocator.print("{s}/sample-{d:0>2}.{s}", .{ samples_subdir, index, kind });
 }
 
 /// Rejects anything that is not a plain archive-relative file path: no
@@ -573,8 +573,8 @@ fn fieldOptionalUint(object: JsonObject, name: []const u8) ArchiveError!?u64 {
 /// than seven file formats - so it resolves a name the way the semantic
 /// decoder resolves a report row: the exact field name, or nothing.
 fn enumFromName(comptime T: type, text: []const u8) ?T {
-    inline for (@typeInfo(T).@"enum".fields) |candidate| {
-        if (std.mem.eql(u8, text, candidate.name)) return @enumFromInt(candidate.value);
+    inline for (@typeInfo(T).@"enum".field_names) |name| {
+        if (std.mem.eql(u8, text, name)) return @field(T, name);
     }
     return null;
 }
@@ -879,7 +879,7 @@ fn collectArchiveFiles(
         const child = if (prefix.len == 0)
             try allocator.dupe(u8, entry.name)
         else
-            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name });
+            try allocator.print("{s}/{s}", .{ prefix, entry.name });
         if (child.len > max_path_bytes or !isSafeRelativePath(child)) {
             allocator.free(child);
             return error.UnsafeArchivePath;
@@ -967,7 +967,7 @@ const zig_suffix = ".zig";
 /// `src/coresimd.zig`.
 fn joinRelative(allocator: Allocator, prefix: []const u8, name: []const u8) ![]u8 {
     if (prefix.len == 0) return allocator.dupe(u8, name);
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, name });
+    return allocator.print("{s}/{s}", .{ prefix, name });
 }
 
 fn collectLibrarySources(
@@ -1098,8 +1098,7 @@ fn formatUtc(allocator: Allocator, io: Io) !struct { unix_ns: i128, text: []u8 }
     const hour = seconds_of_day / 3600;
     const minute = (seconds_of_day - hour * 3600) / 60;
     const second = seconds_of_day - hour * 3600 - minute * 60;
-    const text = try std.fmt.allocPrint(
-        allocator,
+    const text = try allocator.print(
         "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z",
         .{ year, date.month, date.day, hour, minute, second },
     );
@@ -1413,8 +1412,8 @@ const TermKind = enum {
     }
 
     fn fromName(text: []const u8) ?TermKind {
-        inline for (@typeInfo(TermKind).@"enum".fields) |variant| {
-            if (std.mem.eql(u8, text, variant.name)) return @enumFromInt(variant.value);
+        inline for (@typeInfo(TermKind).@"enum".field_names) |field_name| {
+            if (std.mem.eql(u8, text, field_name)) return @field(TermKind, field_name);
         }
         return null;
     }
@@ -2447,7 +2446,7 @@ fn verifyArchive(ctx: *Context, dir: Io.Dir, loaded: *const LoadedArchive) Archi
 // Recording.
 // ---------------------------------------------------------------------------
 
-const zero_digest: [64]u8 = [_]u8{'0'} ** 64;
+const zero_digest: [64]u8 = @splat('0');
 
 fn emptyManifest(options: report.Options) Manifest {
     return .{
@@ -2533,7 +2532,7 @@ fn runBenchSample(
     // own index, so the caller never has to hand over an ordinal whose "minus
     // one" is the slot it already had.
     const ordinal: u16 = @intCast(slot + 1);
-    const iterations_text = try std.fmt.allocPrint(ctx.arena, "{d}", .{options.iterations});
+    const iterations_text = try ctx.arena.print("{d}", .{options.iterations});
     // The invocation is the mode's own. Semantic mode passes the iteration
     // count and nothing else: its bench takes one optional positional value,
     // so passing a stream chunk would be a flag it refuses, and passing a
@@ -2546,7 +2545,7 @@ fn runBenchSample(
                 bench_path,
                 iterations_text,
                 "--stream-chunk-size",
-                try std.fmt.allocPrint(ctx.arena, "{d}", .{options.stream_chunk_size}),
+                try ctx.arena.print("{d}", .{options.stream_chunk_size}),
             },
         .stdout_limit = .limited(max_stdout_bytes),
         .stderr_limit = .limited(max_stderr_bytes),
@@ -2560,8 +2559,8 @@ fn runBenchSample(
 
     const term: Termination = switch (result.term) {
         .exited => |code| .{ .kind = .exited, .value = code },
-        .signal => |number| .{ .kind = .signal, .value = @intFromEnum(number) },
-        .stopped => |number| .{ .kind = .stopped, .value = @intFromEnum(number) },
+        .signal => |number| .{ .kind = .signal, .value = @backingInt(number) },
+        .stopped => |number| .{ .kind = .stopped, .value = @backingInt(number) },
         else => return error.BenchTerminated,
     };
 
@@ -2874,11 +2873,11 @@ fn synthMix(a: u64, b: u64) u64 {
 }
 
 fn synthInputHash(format: report.Format, workload: report.Workload) u64 {
-    return synthMix(@intFromEnum(format), @intFromEnum(workload));
+    return synthMix(@backingInt(format), @backingInt(workload));
 }
 
 fn synthChecksum(format: report.Format, workload: report.Workload, stage: report.Stage) u64 {
-    return synthMix(synthInputHash(format, workload), @intFromEnum(stage));
+    return synthMix(synthInputHash(format, workload), @backingInt(stage));
 }
 
 // A synthetic capture is described by its inputs, not by a product of axes.
@@ -2962,7 +2961,7 @@ fn fillSynthInputs(out: []SynthInput) void {
                     .format = format,
                     .workload = workload,
                     .input_hash = synthInputHash(format, workload),
-                    .input_bytes = 128 + @as(u64, @intFromEnum(format)) * 16 + @as(u64, @intFromEnum(workload)),
+                    .input_bytes = 128 + @as(u64, @backingInt(format)) * 16 + @as(u64, @backingInt(workload)),
                     .stages = &report.stages,
                     .outcome = "",
                 };
@@ -3155,8 +3154,7 @@ fn firstRow(
 ) ![]u8 {
     if (comptime semantic_mode) {
         const input = firstSynthInput();
-        return std.fmt.allocPrint(
-            allocator,
+        return allocator.print(
             "{s},{s},{s},{s},{d},{d},{d},{d},{d},{d}\n",
             .{
                 @tagName(input.format),
@@ -3172,8 +3170,7 @@ fn firstRow(
             },
         );
     } else {
-        return std.fmt.allocPrint(
-            allocator,
+        return allocator.print(
             "json,fixture,index,{d},{d},{d},{d},{d},512\n",
             .{ input_bytes, options.iterations, elapsed_ns, checksum, allocation_count },
         );
@@ -3835,9 +3832,9 @@ test "a per-case timing that contradicts the archived capture is refused" {
     // own capture can catch it. The array below is the first case's.
     const analysis = manifest.analysis orelse return error.MissingAnalysis;
     const recorded = analysis.cases[0].elapsed_ns[0];
-    const honest = try std.fmt.allocPrint(ctx.gpa, "[{d}]", .{recorded});
+    const honest = try ctx.gpa.print("[{d}]", .{recorded});
     defer ctx.gpa.free(honest);
-    const forged = try std.fmt.allocPrint(ctx.gpa, "[{d}]", .{recorded + 1});
+    const forged = try ctx.gpa.print("[{d}]", .{recorded + 1});
     defer ctx.gpa.free(forged);
     try writeForgedManifest(&ctx, tmp.dir, &manifest, honest, forged);
 
@@ -3860,9 +3857,9 @@ test "a per-case timing array that is not one entry per sample is refused" {
     // timings it claims are not observations of that many captures.
     const analysis = manifest.analysis orelse return error.MissingAnalysis;
     const recorded = analysis.cases[0].elapsed_ns[0];
-    const honest = try std.fmt.allocPrint(ctx.gpa, "[{d}]", .{recorded});
+    const honest = try ctx.gpa.print("[{d}]", .{recorded});
     defer ctx.gpa.free(honest);
-    const padded = try std.fmt.allocPrint(ctx.gpa, "[{d},{d}]", .{ recorded, recorded });
+    const padded = try ctx.gpa.print("[{d},{d}]", .{ recorded, recorded });
     defer ctx.gpa.free(padded);
     try writeForgedManifest(&ctx, tmp.dir, &manifest, honest, padded);
 
@@ -3934,8 +3931,7 @@ test "an existing archive directory is refused and left untouched" {
     defer tmp.cleanup();
 
     const suffix_len = std.base64.url_safe.Encoder.calcSize(12);
-    const nested = try std.fmt.allocPrint(
-        testing.allocator,
+    const nested = try testing.allocator.print(
         ".zig-cache/tmp/{s}/a/b/archive",
         .{tmp.sub_path[0..suffix_len]},
     );
@@ -3977,8 +3973,7 @@ test "a failed recording persists its status and reason" {
     defer tmp.cleanup();
 
     const suffix_len = std.base64.url_safe.Encoder.calcSize(12);
-    const out_dir = try std.fmt.allocPrint(
-        ctx.arena,
+    const out_dir = try ctx.arena.print(
         ".zig-cache/tmp/{s}/failed-record",
         .{tmp.sub_path[0..suffix_len]},
     );
@@ -4113,14 +4108,12 @@ const SemanticTests = if (semantic_mode) struct {
         text: []const u8,
     ) !void {
         try overwrite(ctx, dir, "samples/sample-01.stdout", text);
-        const honest = try std.fmt.allocPrint(
-            ctx.gpa,
+        const honest = try ctx.gpa.print(
             "\"stdout_bytes\":{d},\"stdout_sha256\":\"{s}\"",
             .{ manifest.samples[0].stdout_bytes, &manifest.samples[0].stdout_sha256 },
         );
         defer ctx.gpa.free(honest);
-        const forged = try std.fmt.allocPrint(
-            ctx.gpa,
+        const forged = try ctx.gpa.print(
             "\"stdout_bytes\":{d},\"stdout_sha256\":\"{s}\"",
             .{ text.len, &sha256Hex(text) },
         );
@@ -4332,7 +4325,14 @@ const SemanticTests = if (semantic_mode) struct {
     }
 
     test "a semantic archive load releases what it already took at every allocation failure point" {
-        try testing.checkAllAllocationFailures(testing.allocator, loadVerifyAndRelease, .{});
+        // SafeAllocator can remap depending on address layout. Force allocation
+        // fallback so the failure sweep visits the same allocation count each run.
+        var vtable = testing.allocator.vtable.*;
+        vtable.resize = Allocator.noResize;
+        vtable.remap = Allocator.noRemap;
+        var backing = testing.allocator;
+        backing.vtable = &vtable;
+        try testing.checkAllAllocationFailures(backing, loadVerifyAndRelease, .{});
     }
 } else struct {};
 

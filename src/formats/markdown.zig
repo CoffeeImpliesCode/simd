@@ -137,7 +137,7 @@ const MarkdownTapeSink = struct {
             };
         }
         self.tape.appendAssumeCapacity(.{
-            .kind = @intFromEnum(kind),
+            .kind = @backingInt(kind),
             .payload = @intCast(length),
             .offset = @intCast(offset),
         });
@@ -1055,7 +1055,7 @@ pub const MarkdownTapeWord = packed struct(u64) {
     /// For an untrusted word, use `std.enums.fromInt(MarkdownTokenKind, kind)`
     /// and handle `null` before calling this method.
     pub fn tapeKind(self: MarkdownTapeWord) MarkdownTokenKind {
-        return @enumFromInt(self.kind);
+        return @fromBackingInt(@intCast(self.kind));
     }
 
     /// `payload` widened to `usize`.
@@ -1091,14 +1091,14 @@ pub const MarkdownNavigationError = error{
 
 fn checkedMarkdownTapeKind(word: MarkdownTapeWord) MarkdownNavigationError!MarkdownTokenKind {
     return switch (word.kind) {
-        @intFromEnum(MarkdownTokenKind.heading) => .heading,
-        @intFromEnum(MarkdownTokenKind.code_fence) => .code_fence,
-        @intFromEnum(MarkdownTokenKind.list_item) => .list_item,
-        @intFromEnum(MarkdownTokenKind.blockquote) => .blockquote,
-        @intFromEnum(MarkdownTokenKind.inline_code) => .inline_code,
-        @intFromEnum(MarkdownTokenKind.link_open) => .link_open,
-        @intFromEnum(MarkdownTokenKind.link_close) => .link_close,
-        @intFromEnum(MarkdownTokenKind.thematic_break) => .thematic_break,
+        @backingInt(MarkdownTokenKind.heading) => .heading,
+        @backingInt(MarkdownTokenKind.code_fence) => .code_fence,
+        @backingInt(MarkdownTokenKind.list_item) => .list_item,
+        @backingInt(MarkdownTokenKind.blockquote) => .blockquote,
+        @backingInt(MarkdownTokenKind.inline_code) => .inline_code,
+        @backingInt(MarkdownTokenKind.link_open) => .link_open,
+        @backingInt(MarkdownTokenKind.link_close) => .link_close,
+        @backingInt(MarkdownTokenKind.thematic_break) => .thematic_break,
         else => error.InvalidTapeKind,
     };
 }
@@ -2566,7 +2566,7 @@ fn expectMarkdownLineTerminatorsAtWidth(comptime vlen: usize) !void {
 }
 
 test "Markdown line scanning stays exact at narrow and unaligned widths" {
-    const prefix = ("abcdefghijklmnopqrstuvwxyz" ** 12) ++ "\r\n";
+    const prefix = @as([26 * 12]u8, @bitCast(@as([12][26]u8, @splat("abcdefghijklmnopqrstuvwxyz".*)))) ++ "\r\n";
     const input = prefix ++
         "# heading\r\n" ++
         "- item [link](target)\n" ++
@@ -3057,7 +3057,7 @@ test "parser audit: markdown diagnostic snippets exclude line-ending bytes" {
 }
 
 test "parser audit: markdown diagnostic bounds snippets at sixteen bytes each side" {
-    const long_line = "a" ** 40;
+    const long_line = &@as([40]u8, @splat('a'));
     try expectDiagnosticAt(long_line, 0, 1, 1, long_line[0..16], 0);
     try expectDiagnosticAt(long_line, 4, 1, 5, long_line[0..20], 0);
     try expectDiagnosticAt(long_line, 20, 1, 21, long_line[4..36], 4);
@@ -3131,7 +3131,7 @@ test "Markdown tape root and cursor validate source bounds and raw spans" {
     document.tape[0].payload = 0;
     try testing.expectError(error.InvalidTapeOrder, document.root(input));
     document.tape[0].payload = 1;
-    document.tape[0].kind = @intFromEnum(MarkdownTokenKind.code_fence);
+    document.tape[0].kind = @backingInt(MarkdownTokenKind.code_fence);
     try testing.expectError(error.InvalidTapeKind, document.root(input));
 }
 

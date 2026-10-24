@@ -1,6 +1,6 @@
 //! Native Zig byte primitives, structural indexes and parsing over caller-owned input.
 //!
-//! Zig 0.16.0 is the development compiler. Import this root through the registered
+//! Zig 0.17.0 is the development compiler. Import this root through the registered
 //! `simd` module: add `dependency.module("simd")` to the consumer's import table.
 //! `simd`, `stage1`, `stage2`, `json_value`, `ondemand`, `stream` and `debug` expose
 //! the core contracts; `formats` selects each format without changing its dialect.

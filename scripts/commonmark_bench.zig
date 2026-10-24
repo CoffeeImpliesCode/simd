@@ -186,11 +186,11 @@ fn collectRecords(
 fn consumeSmall(document: *const commonmark.CommonMarkDocument) u64 {
     var checksum: u64 = 0;
     const root = document.node(document.root()) orelse return checksum;
-    contract.mix(&checksum, @intFromEnum(root.kind));
+    contract.mix(&checksum, @backingInt(root.kind));
     const first = document.node(root.first_child) orelse return checksum;
-    contract.mix(&checksum, @intFromEnum(first.kind));
+    contract.mix(&checksum, @backingInt(first.kind));
     const last = document.node(root.last_child) orelse return checksum;
-    contract.mix(&checksum, @intFromEnum(last.kind));
+    contract.mix(&checksum, @backingInt(last.kind));
     return checksum;
 }
 

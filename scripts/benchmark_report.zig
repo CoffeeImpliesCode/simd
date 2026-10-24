@@ -31,9 +31,9 @@ pub const Format = enum {
     yaml,
 
     pub fn fromName(text: []const u8) ?Format {
-        inline for (@typeInfo(Format).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) {
-                return @enumFromInt(field.value);
+        inline for (@typeInfo(Format).@"enum".field_names) |name| {
+            if (std.mem.eql(u8, text, name)) {
+                return @field(Format, name);
             }
         }
         return null;
@@ -48,9 +48,9 @@ pub const Workload = enum {
     unicode,
 
     pub fn fromName(text: []const u8) ?Workload {
-        inline for (@typeInfo(Workload).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) {
-                return @enumFromInt(field.value);
+        inline for (@typeInfo(Workload).@"enum".field_names) |name| {
+            if (std.mem.eql(u8, text, name)) {
+                return @field(Workload, name);
             }
         }
         return null;
@@ -66,9 +66,9 @@ pub const Stage = enum {
     traverse_prefix8,
 
     pub fn fromName(text: []const u8) ?Stage {
-        inline for (@typeInfo(Stage).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) {
-                return @enumFromInt(field.value);
+        inline for (@typeInfo(Stage).@"enum".field_names) |name| {
+            if (std.mem.eql(u8, text, name)) {
+                return @field(Stage, name);
             }
         }
         return null;

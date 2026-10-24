@@ -744,12 +744,12 @@ test "public JSON cursor rejects malformed borrowed source and public tape" {
 
     var wrong_end_tape = [_]lib.stage2.TapeWord{
         .{
-            .kind = @intFromEnum(lib.stage2.TapeKind.array_start),
+            .kind = @backingInt(lib.stage2.TapeKind.array_start),
             .payload = 0,
             .offset = 0,
         },
         .{
-            .kind = @intFromEnum(lib.stage2.TapeKind.object_end),
+            .kind = @backingInt(lib.stage2.TapeKind.object_end),
             .payload = 0,
             .offset = 1,
         },
@@ -763,17 +763,17 @@ test "public JSON cursor rejects malformed borrowed source and public tape" {
 
     var malformed_interior_tape = [_]lib.stage2.TapeWord{
         .{
-            .kind = @intFromEnum(lib.stage2.TapeKind.array_start),
+            .kind = @backingInt(lib.stage2.TapeKind.array_start),
             .payload = 0,
             .offset = 0,
         },
         .{
-            .kind = @intFromEnum(lib.stage2.TapeKind.number),
+            .kind = @backingInt(lib.stage2.TapeKind.number),
             .payload = 0,
             .offset = 1,
         },
         .{
-            .kind = @intFromEnum(lib.stage2.TapeKind.array_end),
+            .kind = @backingInt(lib.stage2.TapeKind.array_end),
             .payload = 0,
             .offset = 2,
         },

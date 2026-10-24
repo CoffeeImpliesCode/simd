@@ -172,8 +172,8 @@ fn expectBorrowedByteSpans(
             }
         },
         .@"struct" => |struct_info| {
-            inline for (struct_info.fields) |field| {
-                try expectBorrowedByteSpans(input, @field(value, field.name), count);
+            inline for (struct_info.field_names) |field_name| {
+                try expectBorrowedByteSpans(input, @field(value, field_name), count);
             }
         },
         .@"union" => |union_info| {
@@ -400,7 +400,7 @@ const FaultingReader = struct {
         if (self.offset >= self.fail_at) return error.ReadFailed;
 
         const available = self.fail_at - self.offset;
-        const count = @min(available, @intFromEnum(limit));
+        const count = @min(available, @backingInt(limit));
         if (count == 0) return 0;
 
         try writer.writeAll(self.input[self.offset..][0..count]);

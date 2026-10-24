@@ -456,7 +456,7 @@ pub const CommonMarkDocument = struct {
     /// `null` result says only that the id is out of range: an id inside the
     /// table names a node even when the child links no longer reach it.
     pub fn node(self: *const CommonMarkDocument, id: NodeId) ?*const Node {
-        const index = @intFromEnum(id);
+        const index = @backingInt(id);
         if (index >= self.nodes.len) return null;
         return &self.nodes[index];
     }
@@ -484,7 +484,7 @@ pub const CommonMarkDocument = struct {
     /// finished, so no later call resizes the arena. These are the cooked bytes
     /// recorded for a node, not a byte range of `source`.
     pub fn text(self: *const CommonMarkDocument, id: TextId) ?[]const u8 {
-        const index = @intFromEnum(id);
+        const index = @backingInt(id);
         if (index >= self.texts.len) return null;
         const record = self.texts[index];
         const start: usize = record.start;
@@ -622,7 +622,7 @@ const Builder = struct {
             .start = @intCast(start),
             .len = @intCast(bytes.len),
         }) catch return error.OutOfMemory;
-        return @enumFromInt(@as(u32, @intCast(index)));
+        return @fromBackingInt(@intCast(@as(u32, @intCast(index))));
     }
 
     fn appendTextNormalized(self: *Builder, bytes: []const u8) ParseError!TextId {
@@ -637,7 +637,7 @@ const Builder = struct {
             .start = @intCast(start),
             .len = @intCast(grown),
         }) catch return error.OutOfMemory;
-        return @enumFromInt(@as(u32, @intCast(index)));
+        return @fromBackingInt(@intCast(@as(u32, @intCast(index))));
     }
 
     fn appendNormalizedBytes(self: *Builder, bytes: []const u8) ParseError!void {
@@ -702,7 +702,7 @@ const Builder = struct {
     ) ParseError!NodeId {
         if (self.nodes.items.len >= self.options.max_nodes) return error.TooManyNodes;
         if (@as(usize, std.math.maxInt(u32)) <= self.nodes.items.len) return error.TooManyNodes;
-        const id: NodeId = @enumFromInt(@as(u32, @intCast(self.nodes.items.len)));
+        const id: NodeId = @fromBackingInt(@intCast(@as(u32, @intCast(self.nodes.items.len))));
         self.nodes.append(self.gpa, .{
             .kind = kind,
             .parent = parent,
@@ -717,22 +717,22 @@ const Builder = struct {
     }
 
     fn addChild(self: *Builder, parent: NodeId, child: NodeId) !void {
-        const parent_index = @intFromEnum(parent);
-        const child_index = @intFromEnum(child);
+        const parent_index = @backingInt(parent);
+        const child_index = @backingInt(child);
         if (parent_index >= self.nodes.items.len or child_index >= self.nodes.items.len) return error.InvalidDocument;
         if (self.nodes.items[parent_index].last_child == .none) {
             self.nodes.items[parent_index].first_child = child;
         } else {
-            const last = @intFromEnum(self.nodes.items[parent_index].last_child);
+            const last = @backingInt(self.nodes.items[parent_index].last_child);
             self.nodes.items[last].next_sibling = child;
         }
         self.nodes.items[parent_index].last_child = child;
     }
 
     fn insertAfter(self: *Builder, parent: NodeId, after: NodeId, child: NodeId) !void {
-        const parent_index = @intFromEnum(parent);
-        const after_index = @intFromEnum(after);
-        const child_index = @intFromEnum(child);
+        const parent_index = @backingInt(parent);
+        const after_index = @backingInt(after);
+        const child_index = @backingInt(child);
         if (parent_index >= self.nodes.items.len or
             after_index >= self.nodes.items.len or
             child_index >= self.nodes.items.len)
@@ -747,12 +747,12 @@ const Builder = struct {
     }
 
     fn updateSpan(self: *Builder, id: NodeId, end: u32) void {
-        const index = @intFromEnum(id);
+        const index = @backingInt(id);
         if (index < self.nodes.items.len) self.nodes.items[index].source.end = end;
     }
 
     fn rawText(self: *const Builder, id: TextId) []const u8 {
-        const index = @intFromEnum(id);
+        const index = @backingInt(id);
         if (index >= self.texts.items.len) return "";
         const record = self.texts.items[index];
         return self.text_bytes.items[record.start .. record.start + record.len];
@@ -765,11 +765,11 @@ fn validateTreeDepth(builder: *const Builder) ParseError!void {
     }
     for (1..builder.nodes.items.len) |index| {
         if (builder.nodes.items[index].parent == .none) continue;
-        var current: NodeId = @enumFromInt(@as(u32, @intCast(index)));
+        var current: NodeId = @fromBackingInt(@intCast(@as(u32, @intCast(index))));
         var depth: usize = 0;
         while (current != .root) {
             if (depth >= builder.options.max_depth) return error.NestingTooDeep;
-            const current_index = @intFromEnum(current);
+            const current_index = @backingInt(current);
             if (current_index >= builder.nodes.items.len) return error.InvalidDocument;
             const parent = builder.nodes.items[current_index].parent;
             if (parent == .none) return error.InvalidDocument;
@@ -1090,7 +1090,7 @@ fn retainedListDepthForIndent(
 
 fn parseBlocks(builder: *Builder) ParseError!void {
     const root = NodeId.root;
-    var container_nodes: [prefix_depth]NodeId = .{.none} ** prefix_depth;
+    var container_nodes: [prefix_depth]NodeId = @splat(.none);
     var container_prefixes: [prefix_depth]Prefix = undefined;
     var container_len: u32 = 0;
     var active: ?ActiveBlock = null;
@@ -1100,7 +1100,7 @@ fn parseBlocks(builder: *Builder) ParseError!void {
         const line = builder.lines.items[line_index];
         var prefixes: Prefixes = .{};
         if (active) |block| {
-            const block_node = builder.nodes.items[@intFromEnum(block.node)];
+            const block_node = builder.nodes.items[@backingInt(block.node)];
             if (block_node.kind == .html_block or
                 (block_node.kind == .code_block and block.code_fence != 0))
             {
@@ -1120,7 +1120,7 @@ fn parseBlocks(builder: *Builder) ParseError!void {
             prefixes.items[0].kind == .list and
             prefixes.items[0].ordered and
             prefixes.items[0].list_start != 1 and
-            active != null and builder.nodes.items[@intFromEnum(active.?.node)].kind == .paragraph)
+            active != null and builder.nodes.items[@backingInt(active.?.node)].kind == .paragraph)
         {
             prefixes.clear();
             prefixes.content_start = line.start;
@@ -1140,7 +1140,7 @@ fn parseBlocks(builder: *Builder) ParseError!void {
             if (container_len != 0) {
                 const last_prefix = container_prefixes[container_len - 1];
                 const active_is_paragraph = if (active) |b|
-                    builder.nodes.items[@intFromEnum(b.node)].kind == .paragraph
+                    builder.nodes.items[@backingInt(b.node)].kind == .paragraph
                 else
                     false;
                 const is_setext = line.indent >= last_prefix.continuation_indent and
@@ -1157,14 +1157,14 @@ fn parseBlocks(builder: *Builder) ParseError!void {
                     next_len = container_len;
                 } else if (last_prefix.kind == .list and line.indent >= last_prefix.continuation_indent and
                     !(blank_line_pending and
-                        builder.nodes.items[@intFromEnum(container_nodes[container_len - 1])].first_child == .none))
+                        builder.nodes.items[@backingInt(container_nodes[container_len - 1])].first_child == .none))
                 {
                     next_len = container_len;
                 } else {
                     const retained = retainedListDepthForIndent(&container_prefixes, container_len, line.indent);
                     if (retained != 0 and
                         !(blank_line_pending and
-                            builder.nodes.items[@intFromEnum(container_nodes[retained - 1])].first_child == .none))
+                            builder.nodes.items[@backingInt(container_nodes[retained - 1])].first_child == .none))
                     {
                         next_len = retained;
                     }
@@ -1315,7 +1315,7 @@ fn parseBlocks(builder: *Builder) ParseError!void {
             }
             var retain_lazy_quotes = false;
             if (active) |block| {
-                if (builder.nodes.items[@intFromEnum(block.node)].kind == .paragraph and prefixes.len != 0 and
+                if (builder.nodes.items[@backingInt(block.node)].kind == .paragraph and prefixes.len != 0 and
                     prefix_index == prefixes.len and depth < container_len)
                 {
                     retain_lazy_quotes = true;
@@ -1333,7 +1333,7 @@ fn parseBlocks(builder: *Builder) ParseError!void {
                 const last_prefix = container_prefixes[container_len - 1];
                 const interrupts = !line.blank and isInterruptingBlock(builder.source[line.start..line.end]);
                 const active_is_paragraph = if (active) |b|
-                    builder.nodes.items[@intFromEnum(b.node)].kind == .paragraph
+                    builder.nodes.items[@backingInt(b.node)].kind == .paragraph
                 else
                     false;
                 if (active_is_paragraph and !interrupts) {
@@ -1350,7 +1350,7 @@ fn parseBlocks(builder: *Builder) ParseError!void {
             }
         } else if (next_len == 0 and line.blank) {
             if (active) |block| {
-                const kind = builder.nodes.items[@intFromEnum(block.node)].kind;
+                const kind = builder.nodes.items[@backingInt(block.node)].kind;
                 if (kind != .code_block and kind != .html_block) {
                     trimTrailingBlankLinesInCode(builder, block.node);
                     active = null;
@@ -1393,8 +1393,8 @@ fn parseBlocks(builder: *Builder) ParseError!void {
             builder.updateSpan(container_nodes[depth - 1], @intCast(line.end));
         }
         const active_is_code_or_html = if (active) |b|
-            builder.nodes.items[@intFromEnum(b.node)].kind == .code_block or
-                builder.nodes.items[@intFromEnum(b.node)].kind == .html_block
+            builder.nodes.items[@backingInt(b.node)].kind == .code_block or
+                builder.nodes.items[@backingInt(b.node)].kind == .html_block
         else
             false;
         blank_line_pending = line.blank and prefixes.len == 0 and container_len != 0 and !active_is_code_or_html;
@@ -1430,7 +1430,7 @@ fn processBlockLine(
         }
     }
     if (active.*) |block| {
-        const node = &builder.nodes.items[@intFromEnum(block.node)];
+        const node = &builder.nodes.items[@backingInt(block.node)];
         switch (node.kind) {
             .code_block => {
                 if (block.code_fence != 0 and isFenceClose(content, block.code_fence, block.code_fence_length)) {
@@ -1499,7 +1499,7 @@ fn processBlockLine(
                             .raw => |id| id,
                             else => return error.InvalidDocument,
                         };
-                        const raw_index = @intFromEnum(raw_id);
+                        const raw_index = @backingInt(raw_id);
                         while (builder.texts.items[raw_index].len > 0) {
                             const text_end = builder.texts.items[raw_index].start +
                                 builder.texts.items[raw_index].len - 1;
@@ -1654,13 +1654,13 @@ fn appendBlockLine(builder: *Builder, node: NodeId, content: []const u8, is_code
 }
 
 fn appendCodeToNode(builder: *Builder, node: NodeId, content: []const u8) ParseError!void {
-    const index = @intFromEnum(node);
+    const index = @backingInt(node);
     if (index >= builder.nodes.items.len) return error.InvalidDocument;
     const raw_id = switch (builder.nodes.items[index].data) {
         .code_block => |code| code.raw,
         else => return error.InvalidDocument,
     };
-    const raw_index = @intFromEnum(raw_id);
+    const raw_index = @backingInt(raw_id);
     if (raw_index >= builder.texts.items.len) return error.InvalidDocument;
     const start = builder.text_bytes.items.len;
     try builder.appendNormalizedBytes(content);
@@ -1674,13 +1674,13 @@ fn appendCodeLineWithIndent(
     source_end: usize,
     strip_columns: usize,
 ) ParseError!void {
-    const node_index = @intFromEnum(node);
+    const node_index = @backingInt(node);
     if (node_index >= builder.nodes.items.len or source_start > source_end) return error.InvalidDocument;
     const raw_id = switch (builder.nodes.items[node_index].data) {
         .code_block => |code| code.raw,
         else => return error.InvalidDocument,
     };
-    const raw_index = @intFromEnum(raw_id);
+    const raw_index = @backingInt(raw_id);
     if (raw_index >= builder.texts.items.len) return error.InvalidDocument;
 
     var cursor = source_start;
@@ -1715,13 +1715,13 @@ fn appendCodeLineWithIndent(
 }
 
 fn trimTrailingBlankLinesInCode(builder: *Builder, node: NodeId) void {
-    const index = @intFromEnum(node);
+    const index = @backingInt(node);
     if (index >= builder.nodes.items.len) return;
     const raw_id = switch (builder.nodes.items[index].data) {
         .code_block => |code| code.raw,
         else => return,
     };
-    const raw_index = @intFromEnum(raw_id);
+    const raw_index = @backingInt(raw_id);
     if (raw_index >= builder.texts.items.len) return;
     var record = &builder.texts.items[raw_index];
     while (record.len > 0) {
@@ -1747,7 +1747,7 @@ fn trimTrailingBlankLinesInCode(builder: *Builder, node: NodeId) void {
     }
 }
 fn appendRawToNode(builder: *Builder, node: NodeId, content: []const u8) ParseError!void {
-    const index = @intFromEnum(node);
+    const index = @backingInt(node);
     if (index >= builder.nodes.items.len) return error.InvalidDocument;
     const raw_id = switch (builder.nodes.items[index].data) {
         .heading => |heading| heading.raw,
@@ -1756,7 +1756,7 @@ fn appendRawToNode(builder: *Builder, node: NodeId, content: []const u8) ParseEr
         .none => return error.InvalidDocument,
         else => return error.InvalidDocument,
     };
-    const raw_index = @intFromEnum(raw_id);
+    const raw_index = @backingInt(raw_id);
     if (raw_index >= builder.texts.items.len) return error.InvalidDocument;
     const record = builder.texts.items[raw_index];
     const separator_len: usize = if (record.len > 0) 1 else 0;
@@ -2011,7 +2011,7 @@ fn parseAllInlines(builder: *Builder) ParseError!void {
             else => continue,
         };
         const raw = builder.rawText(raw_id);
-        try parseInlineText(builder, @enumFromInt(@as(u32, @intCast(index))), raw);
+        try parseInlineText(builder, @fromBackingInt(@intCast(@as(u32, @intCast(index)))), raw);
     }
 }
 
@@ -2235,7 +2235,7 @@ fn extractReferences(builder: *Builder) ParseError!void {
                 scan = line_end + 1;
             }
             if (found_heading) {
-                builder.texts.items[@intFromEnum(remainder)].len = @intCast(heading_end);
+                builder.texts.items[@backingInt(remainder)].len = @intCast(heading_end);
                 builder.nodes.items[index].kind = .heading;
                 builder.nodes.items[index].data = .{ .heading = .{ .level = heading_level, .raw = remainder } };
                 if (tail_start < remainder_bytes.len and
@@ -2249,7 +2249,7 @@ fn extractReferences(builder: *Builder) ParseError!void {
                         builder.nodes.items[index].source,
                         .{ .raw = tail },
                     );
-                    try builder.insertAfter(parent, @enumFromInt(@as(u32, @intCast(index))), tail_node);
+                    try builder.insertAfter(parent, @fromBackingInt(@intCast(@as(u32, @intCast(index)))), tail_node);
                 }
             } else {
                 builder.nodes.items[index].data = .{ .raw = remainder };
@@ -2386,9 +2386,9 @@ fn parseInlineText(builder: *Builder, block: NodeId, raw: []const u8) ParseError
                     const data: LinkData = .{ .destination = link.destination, .title = link.title };
                     try processEmphasis(builder, &delimiters, frame.delimiter_position);
                     if (frame.image) {
-                        builder.nodes.items[@intFromEnum(frame.node)].data = .{ .image = data };
+                        builder.nodes.items[@backingInt(frame.node)].data = .{ .image = data };
                     } else {
-                        builder.nodes.items[@intFromEnum(frame.node)].data = .{ .link = data };
+                        builder.nodes.items[@backingInt(frame.node)].data = .{ .link = data };
                         for (brackets.items) |*b| {
                             if (!b.image) b.active = false;
                         }
@@ -2399,10 +2399,10 @@ fn parseInlineText(builder: *Builder, block: NodeId, raw: []const u8) ParseError
                     continue;
                 }
             }
-            const target = if (builder.nodes.items[@intFromEnum(frame.node)].first_child != .none)
-                builder.nodes.items[@intFromEnum(frame.node)].first_child
+            const target = if (builder.nodes.items[@backingInt(frame.node)].first_child != .none)
+                builder.nodes.items[@backingInt(frame.node)].first_child
             else
-                builder.nodes.items[@intFromEnum(frame.node)].next_sibling;
+                builder.nodes.items[@backingInt(frame.node)].next_sibling;
             unwrapNode(builder, frame.node, frame.parent);
             if (target != .none) {
                 try insertTextNodeBefore(builder, frame.parent, target, if (frame.image) "![" else "[");
@@ -2458,10 +2458,10 @@ fn parseInlineText(builder: *Builder, block: NodeId, raw: []const u8) ParseError
     if (final_end > text_start) try appendTextNode(builder, parent, raw[text_start..final_end]);
     while (brackets.items.len > 0) {
         const frame = brackets.pop() orelse unreachable;
-        const target = if (builder.nodes.items[@intFromEnum(frame.node)].first_child != .none)
-            builder.nodes.items[@intFromEnum(frame.node)].first_child
+        const target = if (builder.nodes.items[@backingInt(frame.node)].first_child != .none)
+            builder.nodes.items[@backingInt(frame.node)].first_child
         else
-            builder.nodes.items[@intFromEnum(frame.node)].next_sibling;
+            builder.nodes.items[@backingInt(frame.node)].next_sibling;
         unwrapNode(builder, frame.node, frame.parent);
         if (target != .none) {
             try insertTextNodeBefore(builder, frame.parent, target, if (frame.image) "![" else "[");
@@ -2502,23 +2502,23 @@ fn insertTextNodeBefore(builder: *Builder, parent: NodeId, target: NodeId, bytes
     if (bytes.len == 0) return;
     const text = try builder.appendTextNormalized(bytes);
     const inserted = try builder.appendNode(.text, .none, .{ .start = 0, .end = 0 }, .{ .raw = text });
-    const parent_index = @intFromEnum(parent);
-    const target_index = @intFromEnum(target);
+    const parent_index = @backingInt(parent);
+    const target_index = @backingInt(target);
     if (parent_index >= builder.nodes.items.len or
         target_index >= builder.nodes.items.len) return error.InvalidDocument;
     var previous: NodeId = .none;
     var current = builder.nodes.items[parent_index].first_child;
     while (current != .none and current != target) {
         previous = current;
-        current = builder.nodes.items[@intFromEnum(current)].next_sibling;
+        current = builder.nodes.items[@backingInt(current)].next_sibling;
     }
     if (current == .none) return error.InvalidDocument;
-    builder.nodes.items[@intFromEnum(inserted)].parent = parent;
-    builder.nodes.items[@intFromEnum(inserted)].next_sibling = target;
+    builder.nodes.items[@backingInt(inserted)].parent = parent;
+    builder.nodes.items[@backingInt(inserted)].next_sibling = target;
     if (previous == .none) {
         builder.nodes.items[parent_index].first_child = inserted;
     } else {
-        builder.nodes.items[@intFromEnum(previous)].next_sibling = inserted;
+        builder.nodes.items[@backingInt(previous)].next_sibling = inserted;
     }
 }
 
@@ -2541,8 +2541,8 @@ fn processEmphasis(builder: *Builder, delimiters: *std.ArrayList(InlineFrame), b
             if ((opener.can_close or closer.can_open) and
                 (opener.length + closer.length) % 3 == 0 and
                 (opener.length % 3 != 0 or closer.length % 3 != 0)) continue;
-            if (builder.nodes.items[@intFromEnum(opener.node)].parent !=
-                builder.nodes.items[@intFromEnum(closer.node)].parent) continue;
+            if (builder.nodes.items[@backingInt(opener.node)].parent !=
+                builder.nodes.items[@backingInt(closer.node)].parent) continue;
             try wrapEmphasis(builder, opener, closer);
             for (delimiters.items[opener_index + 1 .. closer_index]) |*inner| {
                 try builder.charge(1);
@@ -2558,8 +2558,8 @@ fn processEmphasis(builder: *Builder, delimiters: *std.ArrayList(InlineFrame), b
 
 fn wrapEmphasis(builder: *Builder, opener: *InlineFrame, closer: *InlineFrame) ParseError!void {
     const consumed: u32 = if (opener.length >= 2 and closer.length >= 2) 2 else 1;
-    const open_index = @intFromEnum(opener.node);
-    const close_index = @intFromEnum(closer.node);
+    const open_index = @backingInt(opener.node);
+    const close_index = @backingInt(closer.node);
     const parent = builder.nodes.items[open_index].parent;
     const first = builder.nodes.items[open_index].next_sibling;
     if (first == .none or first == closer.node) return error.InvalidDocument;
@@ -2569,24 +2569,24 @@ fn wrapEmphasis(builder: *Builder, opener: *InlineFrame, closer: *InlineFrame) P
         .{ .start = 0, .end = 0 },
         .none,
     );
-    const wrapper_index = @intFromEnum(wrapper);
+    const wrapper_index = @backingInt(wrapper);
     var current = first;
     var last: NodeId = .none;
     while (current != closer.node) {
         try builder.charge(1);
         if (current == .none) return error.InvalidDocument;
         last = current;
-        builder.nodes.items[@intFromEnum(current)].parent = wrapper;
-        current = builder.nodes.items[@intFromEnum(current)].next_sibling;
+        builder.nodes.items[@backingInt(current)].parent = wrapper;
+        current = builder.nodes.items[@backingInt(current)].next_sibling;
     }
     builder.nodes.items[wrapper_index].parent = parent;
     builder.nodes.items[wrapper_index].first_child = first;
     builder.nodes.items[wrapper_index].last_child = last;
     builder.nodes.items[wrapper_index].next_sibling = closer.node;
     builder.nodes.items[open_index].next_sibling = wrapper;
-    builder.nodes.items[@intFromEnum(last)].next_sibling = .none;
-    const open_text = @intFromEnum(builder.nodes.items[open_index].data.raw);
-    const close_text = @intFromEnum(builder.nodes.items[close_index].data.raw);
+    builder.nodes.items[@backingInt(last)].next_sibling = .none;
+    const open_text = @backingInt(builder.nodes.items[open_index].data.raw);
+    const close_text = @backingInt(builder.nodes.items[close_index].data.raw);
     builder.texts.items[open_text].len -= consumed;
     builder.texts.items[close_text].start += consumed;
     builder.texts.items[close_text].len -= consumed;
@@ -2597,15 +2597,15 @@ fn wrapEmphasis(builder: *Builder, opener: *InlineFrame, closer: *InlineFrame) P
 }
 
 fn unwrapNode(builder: *Builder, node: NodeId, parent: NodeId) void {
-    const node_index = @intFromEnum(node);
-    const parent_index = @intFromEnum(parent);
+    const node_index = @backingInt(node);
+    const parent_index = @backingInt(parent);
     if (node_index >= builder.nodes.items.len or parent_index >= builder.nodes.items.len) return;
     const next = builder.nodes.items[node_index].next_sibling;
     var previous: NodeId = .none;
     var current = builder.nodes.items[parent_index].first_child;
     while (current != .none and current != node) {
         previous = current;
-        current = builder.nodes.items[@intFromEnum(current)].next_sibling;
+        current = builder.nodes.items[@backingInt(current)].next_sibling;
     }
     if (current == .none) return;
     const first = builder.nodes.items[node_index].first_child;
@@ -2614,22 +2614,22 @@ fn unwrapNode(builder: *Builder, node: NodeId, parent: NodeId) void {
         if (previous == .none) {
             builder.nodes.items[parent_index].first_child = first;
         } else {
-            builder.nodes.items[@intFromEnum(previous)].next_sibling = first;
+            builder.nodes.items[@backingInt(previous)].next_sibling = first;
         }
-        builder.nodes.items[@intFromEnum(last)].next_sibling = next;
+        builder.nodes.items[@backingInt(last)].next_sibling = next;
         if (builder.nodes.items[parent_index].last_child == node) {
             builder.nodes.items[parent_index].last_child = last;
         }
         var child = first;
         while (child != .none and child != next) {
-            builder.nodes.items[@intFromEnum(child)].parent = parent;
-            child = builder.nodes.items[@intFromEnum(child)].next_sibling;
+            builder.nodes.items[@backingInt(child)].parent = parent;
+            child = builder.nodes.items[@backingInt(child)].next_sibling;
         }
     } else {
         if (previous == .none) {
             builder.nodes.items[parent_index].first_child = next;
         } else {
-            builder.nodes.items[@intFromEnum(previous)].next_sibling = next;
+            builder.nodes.items[@backingInt(previous)].next_sibling = next;
         }
         if (builder.nodes.items[parent_index].last_child == node) {
             builder.nodes.items[parent_index].last_child = previous;
@@ -2731,7 +2731,7 @@ fn parseEntity(raw: []const u8) ?Entity {
         var encoded: [4]u8 = undefined;
         const encoded_len = std.unicode.utf8Encode(@intCast(codepoint), &encoded) catch return null;
         var result: Entity = .{
-            .value = .{0} ** entity_value_max,
+            .value = @splat(0),
             .len = @intCast(encoded_len),
             .consumed = index + 1,
         };
@@ -2755,7 +2755,7 @@ fn parseEntity(raw: []const u8) ?Entity {
         } else if (order == .gt) {
             left = middle + 1;
         } else {
-            var result: Entity = .{ .value = .{0} ** entity_value_max, .len = 0, .consumed = index + 1 };
+            var result: Entity = .{ .value = @splat(0), .len = 0, .consumed = index + 1 };
             for (entry.value, 0..) |byte, value_index| result.value[value_index] = byte;
             result.len = @intCast(entry.value.len);
             return result;
@@ -3131,7 +3131,7 @@ fn finalizeLists(builder: *Builder) ParseError!void {
         var item_id = list.first_child;
         while (item_id != .none) {
             try builder.charge(1);
-            const item = builder.nodes.items[@intFromEnum(item_id)];
+            const item = builder.nodes.items[@backingInt(item_id)];
             if (previous_item != .none and
                 try blocksHaveBlankBetween(builder, previous_item, item_id)) tight = false;
             var previous_block: NodeId = .none;
@@ -3141,7 +3141,7 @@ fn finalizeLists(builder: *Builder) ParseError!void {
                 if (previous_block != .none and
                     try blocksHaveBlankBetween(builder, previous_block, block_id)) tight = false;
                 previous_block = block_id;
-                block_id = builder.nodes.items[@intFromEnum(block_id)].next_sibling;
+                block_id = builder.nodes.items[@backingInt(block_id)].next_sibling;
             }
             previous_item = item_id;
             item_id = item.next_sibling;
@@ -3154,7 +3154,7 @@ fn blocksHaveBlankBetween(builder: *Builder, previous: NodeId, next: NodeId) Par
     var terminal = previous;
     while (true) {
         try builder.charge(1);
-        const node = builder.nodes.items[@intFromEnum(terminal)];
+        const node = builder.nodes.items[@backingInt(terminal)];
         switch (node.kind) {
             .list, .list_item, .block_quote => {
                 if (node.last_child != .none) {
@@ -3166,23 +3166,23 @@ fn blocksHaveBlankBetween(builder: *Builder, previous: NodeId, next: NodeId) Par
         }
         break;
     }
-    var end: usize = builder.nodes.items[@intFromEnum(terminal)].source.end;
-    const start = builder.nodes.items[@intFromEnum(terminal)].source.start;
+    var end: usize = builder.nodes.items[@backingInt(terminal)].source.end;
+    const start = builder.nodes.items[@backingInt(terminal)].source.start;
     while (end > start and std.ascii.isWhitespace(builder.source[end - 1])) {
         try builder.charge(1);
         end -= 1;
     }
-    const next_start = builder.nodes.items[@intFromEnum(next)].source.start;
+    const next_start = builder.nodes.items[@backingInt(next)].source.start;
     if (end >= next_start) return false;
     const gap = builder.source[end..next_start];
     try builder.charge(@intCast(gap.len));
     var line_start = (std.mem.indexOfScalar(u8, gap, '\n') orelse return false) + 1;
     while (std.mem.findScalarPos(u8, gap, line_start, '\n')) |line_end| {
         var content = std.mem.trim(u8, gap[line_start..line_end], " \t\r");
-        var ancestor = builder.nodes.items[@intFromEnum(previous)].parent;
+        var ancestor = builder.nodes.items[@backingInt(previous)].parent;
         while (ancestor != .none) {
             try builder.charge(1);
-            const node = builder.nodes.items[@intFromEnum(ancestor)];
+            const node = builder.nodes.items[@backingInt(ancestor)];
             if (node.kind == .block_quote and content.len != 0 and content[0] == '>') {
                 content = std.mem.trimStart(u8, content[1..], " \t");
             }

@@ -5,7 +5,7 @@ const xml = lib.formats.xml;
 
 fn findTapeKind(document: *const xml.XmlDocument, kind: xml.XmlTapeKind) usize {
     for (document.tape, 0..) |word, index| {
-        if (word.kind == @intFromEnum(kind)) return index;
+        if (word.kind == @backingInt(kind)) return index;
     }
     unreachable;
 }
@@ -16,7 +16,7 @@ fn appendXmlIndexedAttribute(
     index: usize,
 ) !void {
     var number: [20]u8 = undefined;
-    const number_text = try std.fmt.bufPrint(&number, "{d}", .{index});
+    const number_text = try std.mem.print(&number, "{d}", .{index});
     try input.appendSlice(allocator, " a");
     try input.appendSlice(allocator, number_text);
     try input.appendSlice(allocator, "='x'");
@@ -119,7 +119,7 @@ test "XML CDATA value access normalizes EOL without decoding entities" {
     const count = try cdata.decodeInto(.{ .source = input, .output = output[0..] });
     try testing.expectEqualStrings("a\n&amp;\nb", output[0..count]);
     const needed = try cdata.decodedLength(input);
-    var short_output = [_]u8{0xC3} ** 16;
+    var short_output: [16]u8 = @splat(0xC3);
     const short_before = short_output;
     try testing.expectError(
         error.CapacityExceeded,
@@ -141,7 +141,7 @@ test "XML decoding rejects short and overlapping output before writes" {
     const attribute = try cursor.currentAttribute();
     const needed = try attribute.decodedLength(input);
 
-    var short_output = [_]u8{0xA5} ** 16;
+    var short_output: [16]u8 = @splat(0xA5);
     const short_before = short_output;
     try testing.expectError(
         error.CapacityExceeded,
@@ -154,7 +154,7 @@ test "XML decoding rejects short and overlapping output before writes" {
     _ = try cursor.advance();
     const text = try cursor.currentText();
     const text_needed = try text.decodedLength(input);
-    var short_text_output = [_]u8{0x5A} ** 16;
+    var short_text_output: [16]u8 = @splat(0x5A);
     const short_text_before = short_text_output;
     try testing.expectError(
         error.CapacityExceeded,
@@ -307,7 +307,7 @@ test "XML decoder validates Unicode references entities characters and UTF-8" {
 
     const invalid_utf8 = [_]u8{ 0xC0, 0xAF };
     const utf8_event: xml.XmlTextEvent = .{ .raw = invalid_utf8[0..], .offset = 0 };
-    var invalid_output = [_]u8{0xA5} ** 16;
+    var invalid_output: [16]u8 = @splat(0xA5);
     const invalid_before = invalid_output;
     const invalid_raw = "&unknown;";
     const invalid_event: xml.XmlTextEvent = .{ .raw = invalid_raw, .offset = 0 };

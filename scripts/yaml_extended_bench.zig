@@ -73,14 +73,14 @@ fn parseLimits(limits: data.Limits) yaml.Limits {
 /// an error instead of a silent `@enumFromInt`.
 fn eventKind(word: anytype) !data.EventKind {
     return switch (word.kind) {
-        @intFromEnum(basic.YamlTokenKind.document_start) => .document_start,
-        @intFromEnum(basic.YamlTokenKind.document_end) => .document_end,
-        @intFromEnum(basic.YamlTokenKind.mapping_start) => .mapping_start,
-        @intFromEnum(basic.YamlTokenKind.mapping_end) => .mapping_end,
-        @intFromEnum(basic.YamlTokenKind.sequence_start) => .sequence_start,
-        @intFromEnum(basic.YamlTokenKind.sequence_end) => .sequence_end,
-        @intFromEnum(basic.YamlTokenKind.key) => .key,
-        @intFromEnum(basic.YamlTokenKind.scalar) => .scalar,
+        @backingInt(basic.YamlTokenKind.document_start) => .document_start,
+        @backingInt(basic.YamlTokenKind.document_end) => .document_end,
+        @backingInt(basic.YamlTokenKind.mapping_start) => .mapping_start,
+        @backingInt(basic.YamlTokenKind.mapping_end) => .mapping_end,
+        @backingInt(basic.YamlTokenKind.sequence_start) => .sequence_start,
+        @backingInt(basic.YamlTokenKind.sequence_end) => .sequence_end,
+        @backingInt(basic.YamlTokenKind.key) => .key,
+        @backingInt(basic.YamlTokenKind.scalar) => .scalar,
         else => error.UnknownEventKind,
     };
 }
@@ -132,7 +132,7 @@ fn consumeSkeleton(document: *const yaml.Document) !u64 {
     var depth: u64 = 0;
     for (document.tape) |word| {
         const kind = try eventKind(word);
-        contract.mix(&checksum, @intFromEnum(kind));
+        contract.mix(&checksum, @backingInt(kind));
         contract.mix(&checksum, depth);
         switch (kind) {
             .mapping_start, .sequence_start => depth += 1,
@@ -158,7 +158,7 @@ fn consumeSemantics(document: *const yaml.Document, input: []const u8) !u64 {
     var depth: u64 = 0;
     for (document.tape, 0..) |word, index| {
         const kind = try eventKind(word);
-        contract.mix(&checksum, @intFromEnum(kind));
+        contract.mix(&checksum, @backingInt(kind));
         contract.mix(&checksum, depth);
         switch (kind) {
             .mapping_start, .sequence_start => depth += 1,
@@ -167,9 +167,9 @@ fn consumeSemantics(document: *const yaml.Document, input: []const u8) !u64 {
             .key, .scalar => {
                 const value = try document.value(input, index);
                 const info = try document.scalarInfo(index);
-                contract.mix(&checksum, @intFromEnum(mapOwnership(value.ownership())));
-                contract.mix(&checksum, @intFromEnum(mapStyle(info.style)));
-                contract.mix(&checksum, @intFromEnum(mapChomping(info.chomping)));
+                contract.mix(&checksum, @backingInt(mapOwnership(value.ownership())));
+                contract.mix(&checksum, @backingInt(mapStyle(info.style)));
+                contract.mix(&checksum, @backingInt(mapChomping(info.chomping)));
                 contract.mix(&checksum, @intCast(info.indentation_width));
                 contract.mixBytes(&checksum, value.bytes());
             },

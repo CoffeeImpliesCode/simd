@@ -233,7 +233,7 @@ pub fn checksumRecords(records: []const Record) u64 {
     const record_count: u64 = records.len;
     contract.mix(&checksum, record_count);
     for (records) |record| {
-        contract.mix(&checksum, @intFromEnum(record.kind));
+        contract.mix(&checksum, @backingInt(record.kind));
         contract.mix(&checksum, record.depth);
         contract.mix(&checksum, record.child_index);
         contract.mix(&checksum, record.child_count);
@@ -273,11 +273,11 @@ pub fn checksumRecords(records: []const Record) u64 {
 pub fn smallChecksumExpected(records: []const Record) u64 {
     var checksum: u64 = 0;
     if (records.len == 0) return checksum;
-    contract.mix(&checksum, @intFromEnum(records[0].kind));
+    contract.mix(&checksum, @backingInt(records[0].kind));
     // With no top-level block there is no first or last block to mix: the real
     // consumption returns right after the root kind there, so this does too.
     if (records[0].child_count == 0 or records.len < 2) return checksum;
-    contract.mix(&checksum, @intFromEnum(records[1].kind));
+    contract.mix(&checksum, @backingInt(records[1].kind));
     // Preorder finishes a top-level block before starting the next one, so the
     // last depth-1 record is the last top-level block. Its own children follow
     // it and are deeper, which is what makes this the last block and not
@@ -286,7 +286,7 @@ pub fn smallChecksumExpected(records: []const Record) u64 {
     while (index > 1) {
         index -= 1;
         if (records[index].depth != 1) continue;
-        contract.mix(&checksum, @intFromEnum(records[index].kind));
+        contract.mix(&checksum, @backingInt(records[index].kind));
         break;
     }
     return checksum;

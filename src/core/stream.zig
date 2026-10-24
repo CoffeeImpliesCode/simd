@@ -639,7 +639,7 @@ const FaultingReader = struct {
         if (self.offset >= self.fail_at) return error.ReadFailed;
 
         const available = self.fail_at - self.offset;
-        const count = @min(available, @intFromEnum(limit));
+        const count = @min(available, @backingInt(limit));
         if (count == 0) return 0;
 
         try writer.writeAll(self.input[self.offset..][0..count]);

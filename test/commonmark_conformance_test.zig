@@ -239,7 +239,7 @@ test "CommonMark child iteration stops on malformed sibling cycle" {
     defer document.deinit();
     var root_children = document.nodeChildren(.root);
     const first = root_children.nextChild() orelse return error.InvalidDocument;
-    document.nodes[@intFromEnum(first)].next_sibling = first;
+    document.nodes[@backingInt(first)].next_sibling = first;
 
     var children = document.nodeChildren(.root);
     var count: usize = 0;
@@ -262,7 +262,7 @@ test "CommonMark rendering rejects cyclic sibling chains before allocation exhau
     var document = try commonmark.parseCommonMark(testing.allocator, "a", .{});
     defer document.deinit();
     const first = document.nodes[0].first_child;
-    document.nodes[@intFromEnum(first)].next_sibling = first;
+    document.nodes[@backingInt(first)].next_sibling = first;
     var bounded = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 2 });
     try testing.expectError(error.InvalidDocument, commonmark.renderCommonMarkHtml(
         bounded.allocator(),
@@ -296,10 +296,12 @@ test "CommonMark configured parser resources return explicit limits" {
 }
 
 test "CommonMark long delimiter runs retain pairing and depth limits" {
-    const source = "*" ** 300 ++ "x" ++ "*" ** 300;
+    const source = @as([300]u8, @splat('*')) ++ "x" ++ @as([300]u8, @splat('*'));
     var document = try commonmark.parseCommonMark(testing.allocator, source, .{});
     defer document.deinit();
-    const expected = "<p>" ++ "<strong>" ** 150 ++ "x" ++ "</strong>" ** 150 ++ "</p>\n";
+    const expected = "<p>" ++
+        @as([150 * 8]u8, @bitCast(@as([150][8]u8, @splat("<strong>".*)))) ++ "x" ++
+        @as([150 * 9]u8, @bitCast(@as([150][9]u8, @splat("</strong>".*)))) ++ "</p>\n";
     const html = try commonmark.renderCommonMarkHtml(testing.allocator, &document, .{
         .mode = .conformance,
         .max_output_bytes = expected.len,
@@ -340,16 +342,16 @@ test "CommonMark wide indentation and marker padding preserve code content" {
     const Case = struct { source: []const u8, expected: []const u8 };
     const cases = [_]Case{
         .{
-            .source = "-" ++ " " ** 256 ++ "x\n",
-            .expected = "<ul>\n<li>\n<pre><code>" ++ " " ** 251 ++ "x\n</code></pre>\n</li>\n</ul>\n",
+            .source = "-" ++ @as([256]u8, @splat(' ')) ++ "x\n",
+            .expected = "<ul>\n<li>\n<pre><code>" ++ @as([251]u8, @splat(' ')) ++ "x\n</code></pre>\n</li>\n</ul>\n",
         },
         .{
-            .source = "1." ++ " " ** 256 ++ "x\n",
-            .expected = "<ol>\n<li>\n<pre><code>" ++ " " ** 251 ++ "x\n</code></pre>\n</li>\n</ol>\n",
+            .source = "1." ++ @as([256]u8, @splat(' ')) ++ "x\n",
+            .expected = "<ol>\n<li>\n<pre><code>" ++ @as([251]u8, @splat(' ')) ++ "x\n</code></pre>\n</li>\n</ol>\n",
         },
         .{
-            .source = " " ** 65536 ++ "x\n",
-            .expected = "<pre><code>" ++ " " ** 65532 ++ "x\n</code></pre>\n",
+            .source = @as([65536]u8, @splat(' ')) ++ "x\n",
+            .expected = "<pre><code>" ++ @as([65532]u8, @splat(' ')) ++ "x\n</code></pre>\n",
         },
     };
     for (cases) |case| {
@@ -376,12 +378,13 @@ test "CommonMark autolinks enforce email grammar and decode URI entities" {
         .{ .source = "<foo@-example.com>", .expected = "<p>&lt;foo@-example.com&gt;</p>\n" },
         .{ .source = "<foo@example-.com>", .expected = "<p>&lt;foo@example-.com&gt;</p>\n" },
         .{
-            .source = "<foo@" ++ "a" ** 64 ++ ".com>",
-            .expected = "<p>&lt;foo@" ++ "a" ** 64 ++ ".com&gt;</p>\n",
+            .source = "<foo@" ++ @as([64]u8, @splat('a')) ++ ".com>",
+            .expected = "<p>&lt;foo@" ++ @as([64]u8, @splat('a')) ++ ".com&gt;</p>\n",
         },
         .{
-            .source = "<" ++ "a" ** 32 ++ ":x>",
-            .expected = "<p><a href=\"" ++ "a" ** 32 ++ ":x\">" ++ "a" ** 32 ++ ":x</a></p>\n",
+            .source = "<" ++ @as([32]u8, @splat('a')) ++ ":x>",
+            .expected = "<p><a href=\"" ++ @as([32]u8, @splat('a')) ++
+                ":x\">" ++ @as([32]u8, @splat('a')) ++ ":x</a></p>\n",
         },
         .{ .source = "<ab:\x01>", .expected = "<p>&lt;ab:\x01&gt;</p>\n" },
     };
@@ -406,8 +409,14 @@ test "CommonMark numeric references distinguish lexical limits from invalid scal
 test "CommonMark overlong reference candidates remain literal text" {
     const Case = struct { source: []const u8, expected: []const u8 };
     const cases = [_]Case{
-        .{ .source = "[" ++ "a" ** 1000 ++ "]\n", .expected = "<p>[" ++ "a" ** 1000 ++ "]</p>\n" },
-        .{ .source = "[" ++ "a" ** 1000 ++ "]: /target\n", .expected = "<p>[" ++ "a" ** 1000 ++ "]: /target</p>\n" },
+        .{
+            .source = "[" ++ @as([1000]u8, @splat('a')) ++ "]\n",
+            .expected = "<p>[" ++ @as([1000]u8, @splat('a')) ++ "]</p>\n",
+        },
+        .{
+            .source = "[" ++ @as([1000]u8, @splat('a')) ++ "]: /target\n",
+            .expected = "<p>[" ++ @as([1000]u8, @splat('a')) ++ "]: /target</p>\n",
+        },
     };
     for (cases) |case| {
         var document = try commonmark.parseCommonMark(testing.allocator, case.source, .{ .max_reference_count = 0 });
@@ -416,7 +425,7 @@ test "CommonMark overlong reference candidates remain literal text" {
         defer testing.allocator.free(rendered);
         try testing.expectEqualStrings(case.expected, rendered);
     }
-    const label = "é" ** 999;
+    const label = @as([999 * 2]u8, @bitCast(@as([999][2]u8, @splat("é".*))));
     var document = try commonmark.parseCommonMark(
         testing.allocator,
         "[" ++ label ++ "]: /target\n\n[" ++ label ++ "]\n",
@@ -450,13 +459,13 @@ test "CommonMark renderer rejects malformed root ancestry before sibling travers
     var item: commonmark.NodeId = .none;
     var paragraph: commonmark.NodeId = .none;
     for (document.nodes, 0..) |node, index| {
-        if (node.kind == .list_item) item = @enumFromInt(@as(u32, @intCast(index)));
-        if (node.kind == .paragraph) paragraph = @enumFromInt(@as(u32, @intCast(index)));
+        if (node.kind == .list_item) item = @fromBackingInt(@intCast(@as(u32, @intCast(index))));
+        if (node.kind == .paragraph) paragraph = @fromBackingInt(@intCast(@as(u32, @intCast(index))));
     }
     try testing.expect(item != .none);
     try testing.expect(paragraph != .none);
     document.nodes[0].parent = item;
-    document.nodes[@intFromEnum(paragraph)].next_sibling = paragraph;
+    document.nodes[@backingInt(paragraph)].next_sibling = paragraph;
     try testing.expectError(error.InvalidDocument, commonmark.renderCommonMarkHtml(testing.allocator, &document, .{}));
 }
 

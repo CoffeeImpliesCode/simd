@@ -954,7 +954,7 @@ fn expectUtf8ValidSequenceAtBoundary(
     sequence: []const u8,
     start: usize,
 ) !void {
-    var input: [68]u8 = [_]u8{'a'} ** 68;
+    var input: [68]u8 = @splat('a');
     @memcpy(input[start..][0..sequence.len], sequence);
     const expected: Utf8Result = .valid;
     try testing.expectEqual(
@@ -967,7 +967,7 @@ fn expectUtf8ValidSequenceInsideBlock(
     comptime width: usize,
     sequence: []const u8,
 ) !void {
-    var input: [width + 1]u8 = [_]u8{'a'} ** (width + 1);
+    var input: [width + 1]u8 = @splat('a');
     @memcpy(input[1..][0..sequence.len], sequence);
     const expected: Utf8Result = .valid;
     try testing.expectEqual(expected, validateUtf8WithWidth(width, &input));
@@ -980,7 +980,7 @@ fn expectUtf8InvalidSequenceAtBoundary(
     kind: Utf8ErrorKind,
     error_relative_offset: usize,
 ) !void {
-    var input: [68]u8 = [_]u8{'a'} ** 68;
+    var input: [68]u8 = @splat('a');
     @memcpy(input[start..][0..sequence.len], sequence);
     const expected: Utf8Result = .{ .invalid = .{
         .kind = kind,
@@ -1018,7 +1018,7 @@ test "UTF-8 accepts ASCII and valid sequences at every SIMD width" {
     };
 
     inline for ([_]usize{ 16, 32, 64 }) |width| {
-        var ascii: [width * 2 + 3]u8 = [_]u8{'x'} ** (width * 2 + 3);
+        var ascii: [width * 2 + 3]u8 = @splat('x');
         const expected: Utf8Result = .valid;
         try testing.expectEqual(expected, validateUtf8WithWidth(width, &ascii));
 
@@ -1073,7 +1073,7 @@ test "UTF-8 reports truncation at block edges and tails" {
         for (prefixes) |prefix| {
             inline for ([_]usize{ width - 1, width, width + 1 }) |start| {
                 if (start + prefix.len <= 68) {
-                    var input: [68]u8 = [_]u8{'z'} ** 68;
+                    var input: [68]u8 = @splat('z');
                     @memcpy(input[start..][0..prefix.len], prefix);
                     const expected: Utf8Result = .{ .invalid = .{
                         .kind = .truncated_sequence,

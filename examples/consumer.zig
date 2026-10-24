@@ -75,7 +75,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Malformed escaped input fails without modifying caller-owned output.
     {
-        var output = [_]u8{0xaa} ** 4;
+        var output: [4]u8 = @splat(0xaa);
         if (simd.json_value.decodeString("bad\\q", &output)) |_| {
             return error.UnexpectedValue;
         } else |err| {

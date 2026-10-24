@@ -235,7 +235,7 @@ pub const YamlTapeWord = packed struct(u64) {
     /// An invalid tag is diagnosed in Debug and ReleaseSafe; ReleaseFast and
     /// ReleaseSmall treat it as unchecked illegal behavior, not a returned error.
     pub fn tapeKind(self: YamlTapeWord) YamlTokenKind {
-        return @enumFromInt(self.kind);
+        return @fromBackingInt(@intCast(self.kind));
     }
 
     /// `payload` widened to `usize`.
@@ -246,27 +246,27 @@ pub const YamlTapeWord = packed struct(u64) {
 
 fn checkedYamlTapeKind(word: YamlTapeWord) YamlNavigationError!YamlTokenKind {
     return switch (word.kind) {
-        @intFromEnum(YamlTokenKind.document_start) => .document_start,
-        @intFromEnum(YamlTokenKind.document_end) => .document_end,
-        @intFromEnum(YamlTokenKind.mapping_start) => .mapping_start,
-        @intFromEnum(YamlTokenKind.mapping_end) => .mapping_end,
-        @intFromEnum(YamlTokenKind.sequence_start) => .sequence_start,
-        @intFromEnum(YamlTokenKind.sequence_end) => .sequence_end,
-        @intFromEnum(YamlTokenKind.key) => .key,
-        @intFromEnum(YamlTokenKind.scalar) => .scalar,
+        @backingInt(YamlTokenKind.document_start) => .document_start,
+        @backingInt(YamlTokenKind.document_end) => .document_end,
+        @backingInt(YamlTokenKind.mapping_start) => .mapping_start,
+        @backingInt(YamlTokenKind.mapping_end) => .mapping_end,
+        @backingInt(YamlTokenKind.sequence_start) => .sequence_start,
+        @backingInt(YamlTokenKind.sequence_end) => .sequence_end,
+        @backingInt(YamlTokenKind.key) => .key,
+        @backingInt(YamlTokenKind.scalar) => .scalar,
         else => error.InvalidTapeKind,
     };
 }
 fn checkedYamlTokenKind(kind: YamlTokenKind) YamlNavigationError!YamlTokenKind {
-    return switch (@intFromEnum(kind)) {
-        @intFromEnum(YamlTokenKind.document_start) => .document_start,
-        @intFromEnum(YamlTokenKind.document_end) => .document_end,
-        @intFromEnum(YamlTokenKind.mapping_start) => .mapping_start,
-        @intFromEnum(YamlTokenKind.mapping_end) => .mapping_end,
-        @intFromEnum(YamlTokenKind.sequence_start) => .sequence_start,
-        @intFromEnum(YamlTokenKind.sequence_end) => .sequence_end,
-        @intFromEnum(YamlTokenKind.key) => .key,
-        @intFromEnum(YamlTokenKind.scalar) => .scalar,
+    return switch (@backingInt(kind)) {
+        @backingInt(YamlTokenKind.document_start) => .document_start,
+        @backingInt(YamlTokenKind.document_end) => .document_end,
+        @backingInt(YamlTokenKind.mapping_start) => .mapping_start,
+        @backingInt(YamlTokenKind.mapping_end) => .mapping_end,
+        @backingInt(YamlTokenKind.sequence_start) => .sequence_start,
+        @backingInt(YamlTokenKind.sequence_end) => .sequence_end,
+        @backingInt(YamlTokenKind.key) => .key,
+        @backingInt(YamlTokenKind.scalar) => .scalar,
         else => error.InvalidTapeKind,
     };
 }
@@ -2146,7 +2146,7 @@ pub fn buildYamlTape(
         // `emit` rejects any longer span with `error.TapeTooLarge` before the
         // event is published, so the payload length is representable.
         try tape.append(allocator, .{
-            .kind = @intFromEnum(value.kind),
+            .kind = @backingInt(value.kind),
             .payload = @intCast(value.raw.len),
             .offset = value.offset,
         });

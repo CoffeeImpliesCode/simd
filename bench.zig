@@ -294,19 +294,19 @@ fn mixNativeValue(checksum: *u64, value: anytype) void {
             const bits: unsigned = @bitCast(value);
             mix(checksum, @intCast(bits));
         },
-        .@"enum" => mixNativeValue(checksum, @intFromEnum(value)),
+        .@"enum" => mixNativeValue(checksum, @backingInt(value)),
         .@"struct" => |info| {
-            mix(checksum, @intCast(info.fields.len));
-            inline for (info.fields, 0..) |field, field_index| {
+            mix(checksum, @intCast(info.field_names.len));
+            inline for (info.field_names, 0..) |field_name, field_index| {
                 mix(checksum, @intCast(field_index));
-                mixNativeValue(checksum, @field(value, field.name));
+                mixNativeValue(checksum, @field(value, field_name));
             }
         },
         .@"union" => |info| {
             if (info.tag_type == null) {
                 @compileError("resident event payload union must have a tag");
             }
-            mixNativeValue(checksum, @intFromEnum(std.meta.activeTag(value)));
+            mixNativeValue(checksum, @backingInt(std.meta.activeTag(value)));
             switch (value) {
                 inline else => |payload| mixNativeValue(checksum, payload),
             }
@@ -376,9 +376,9 @@ fn consumeResidentEvents(
 
 fn stageSeed(input: Input, stage: Stage) u64 {
     var checksum = input.hash;
-    mix(&checksum, @intFromEnum(input.format));
-    mix(&checksum, @intFromEnum(input.workload));
-    mix(&checksum, @intFromEnum(stage));
+    mix(&checksum, @backingInt(input.format));
+    mix(&checksum, @backingInt(input.workload));
+    mix(&checksum, @backingInt(stage));
     return checksum;
 }
 
@@ -405,7 +405,7 @@ fn consumeMarkdownIndex(
     ) |token_index, offset, kind| {
         if (!sampleToken(token_index, index.count)) continue;
         mix(checksum, offset);
-        mix(checksum, @intFromEnum(kind));
+        mix(checksum, @backingInt(kind));
     }
     std.mem.doNotOptimizeAway(index);
 }
@@ -423,7 +423,7 @@ fn consumeYamlIndex(
     ) |token_index, offset, kind, length| {
         if (!sampleToken(token_index, index.count)) continue;
         mix(checksum, offset);
-        mix(checksum, @intFromEnum(kind));
+        mix(checksum, @backingInt(kind));
         mix(checksum, length);
     }
     std.mem.doNotOptimizeAway(index);
@@ -596,7 +596,7 @@ fn runIndexOnce(
             ) |token_index, offset, kind| {
                 if (!sampleToken(token_index, index.count)) continue;
                 mix(checksum, offset);
-                mix(checksum, @intFromEnum(kind));
+                mix(checksum, @backingInt(kind));
             }
             std.mem.doNotOptimizeAway(&index);
             index.deinit(allocator);
@@ -791,7 +791,7 @@ fn runStreamOnce(
             ) |token_index, offset, kind| {
                 if (!sampleToken(token_index, index.count)) continue;
                 mix(checksum, offset);
-                mix(checksum, @intFromEnum(kind));
+                mix(checksum, @backingInt(kind));
             }
             std.mem.doNotOptimizeAway(&index);
             index.deinit(allocator);

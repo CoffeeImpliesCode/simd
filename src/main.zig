@@ -103,7 +103,7 @@ pub fn main(init: std.process.Init) !void {
         };
 
         var note_buffer: [64]u8 = undefined;
-        const note = try std.fmt.bufPrint(&note_buffer, "chunk [{d}/{d}]", .{ chunk_idx + 1, chunk_count });
+        const note = try std.mem.print(&note_buffer, "chunk [{d}/{d}]", .{ chunk_idx + 1, chunk_count });
         try debug.highlightMulti(vlen, bytes, &layers, note, writer);
     }
     assert(chunk_iterator.next() == null);
