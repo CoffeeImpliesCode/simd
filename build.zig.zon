@@ -64,6 +64,8 @@
         "build.zig",
         "build.zig.zon",
         "README.md",
+        "LICENSE",
+        "THIRD_PARTY_NOTICES.md",
         "examples",
         "cross-test.profile.sh",
         "library_test.zig",

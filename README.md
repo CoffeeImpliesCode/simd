@@ -115,3 +115,7 @@ An anyzig installation selects the compiler from `build.zig.zon`.
 - [2312.17149: On-Demand JSON: A Better Way to Parse Documents?](https://arxiv.org/abs/2312.17149).
 - [2010.03090: Validating UTF-8 In Less Than One Instruction Per Byte](https://arxiv.org/abs/2010.03090).
 - [2011.08313: IR-improved DGLAP parton shower effects for associated production of a W boson and jets in pp collisions at √s = 8 and 13 TeV](https://arxiv.org/abs/2011.08313).
+
+## License
+
+MIT, see [LICENSE](LICENSE). Third-party components keep their own licenses: see THIRD_PARTY_NOTICES.md
